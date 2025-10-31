@@ -31,7 +31,7 @@ class DefectPublisher(Node):
     """ROS2 node that publishes Detection messages."""
 
     def __init__(self):
-        super().__init__('wx_folder_streamer_publisher')
+        super().__init__('magician_vision_classifier_publisher')
         self.publisher_ = self.create_publisher(Detection, 'detections', 10)
 
     def publish_detection(self, x, y, w, h, det_type, det_class, probability):
