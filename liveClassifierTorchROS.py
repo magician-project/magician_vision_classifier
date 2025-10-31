@@ -6,6 +6,7 @@ Copyright : "2025 Foundation of Research and Technology, Computer Science Depart
 License : "FORTH" 
 """
 
+#--------------------------------------------------------
 import os
 import sys
 import time
@@ -15,14 +16,15 @@ import cv2
 import numpy as np
 import torch
 from torch.nn import functional as F
-
+#--------------------------------------------------------
 from trainClassifierTorch import Classifier
 from liveClassifierTorch import ClassifierPnm, runSingle
 from SharedMemoryManager import SharedMemoryManager
-
+#--------------------------------------------------------
 import rclpy
 from rclpy.node import Node
 from magician_classifier.msg import Detection  # Custom ROS message
+#--------------------------------------------------------
 
 
 class DefectPublisher(Node):
@@ -34,12 +36,12 @@ class DefectPublisher(Node):
 
     def publish_detection(self, x, y, w, h, det_type, det_class, probability):
         msg = Detection()
-        msg.x = int(x)
-        msg.y = int(y)
-        msg.w = int(w)
-        msg.h = int(h)
-        msg.type   = det_type
-        msg.class_ = det_class  # 'class' is reserved in Python
+        msg.x           = int(x)
+        msg.y           = int(y)
+        msg.w           = int(w)
+        msg.h           = int(h)
+        msg.type        = det_type
+        msg.class_      = det_class  # 'class' is reserved in Python
         msg.probability = float(probability)
         self.publisher_.publish(msg)
         self.get_logger().info(f"Published detection: ({x},{y},{w},{h}) {det_type}:{det_class} p={probability:.2f}")
@@ -94,7 +96,7 @@ def main():
             #print("Responses:", responses)
 
             # Publish detections
-            points  = responses.get('points', [])
+            points  = responses.get('points',  [])
             classes = responses.get('classes', [])
 
             for (x, y), det_type in zip(points, classes):
