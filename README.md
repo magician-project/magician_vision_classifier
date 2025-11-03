@@ -1,8 +1,7 @@
 # Magician Vision Classifier System
 
-**Authors:** Ammar Qammaz, Nikos Vasilikopoulos  
-**Copyright:** © 2025 Foundation of Research and Technology – Hellas (FORTH), Computer Science Department, Greece  
-**License:** FORTH License (see `license.txt`)  
+**Authors:** Ammar Qammaz, Nikos Vasilikopoulos
+**Copyright:** © 2025 Foundation of Research and Technology – Hellas (FORTH), Computer Science Department, Greece
 
 ---
 
@@ -17,6 +16,16 @@ It consists of:
 ---
 
 ## 📦 Components
+
+
+### 0. Setup
+Please place the repository in your ROS package directory.
+To get its python requirements use:
+
+```
+python3 -m venv venv && source venv/bin/activate && python3 -m pip install -r requirements.txt
+```
+
 
 ### 1. `trainClassifierTorch.py` — Model Training & Evaluation
 
@@ -61,35 +70,53 @@ All networks support **4-channel RGBA inputs**.
 #### ⚙️ Example Configuration (config.json)
 ```
 {
-  "name": "defect_detector",
-  "model": "resnet18",
-  "loss": "focal",
-  "hparams": {
-    "batch_size": 32,
-    "training_epochs": 50,
-    "dropout_rate": 0.2,
-    "tile_size": 64,
-    "gradient_clip_value": 0.5,
-    "seed": 42
-  },
-  "dataloader": {
-    "validation_split": 0.2,
-    "num_workers": 4
-  },
-  "optimizer": {
-    "learning_rate": 0.0001
-  },
-  "class_weight": true,
-  "penalize_false_clean": 0.1,
-  "wandb": {
-    "use_wandb": false,
-    "project": "magician-vision",
-    "name": "run_"
-  },
-  "accelerator": "gpu",
-  "devices": 1,
-  "directory": "dataset/"
-}
+    "hparams":{
+      "tile_size": 48,
+      "batch_size": 64,
+      "training_epochs": 25,
+      "dropout_rate": 0.25,
+      "seed": 42,
+      "gradient_clip_value": 1.0,
+      "AoLP": false, 
+      "DoLP": false,
+      "unpolarized": false
+    },
+    "early_stopping": {
+        "monitor":"loss",
+        "mode": "min",
+        "patience": 16,
+        "min_delta": 0.0005,
+        "verbose": 1,
+        "restore_best_weights": true
+    },
+    "optimizer": {
+        "type": "AdamW",
+        "learning_rate": 5e-4
+    },
+    "dataloader": {
+        "seed": 42,
+        "validation_split": 0.05,
+        "shuffle": false,
+        "label_mode": "categorical",
+        "num_workers": 12
+        
+    },
+    "wandb": {
+        "project": "Classifier",
+        "name": "AmmarConfig",
+        "use_wandb": false
+    },
+    "tensorboard_log_dir": "tile_classifier/tensorboard/",
+    "directory": "keras_dataset/",
+    "class_weight": false,
+    "loss": "focal",
+    "penalize_false_clean": 0.0,
+    "accelerator": "auto",
+    "name": "allclass",
+    "model": "custom",
+    "devices": 1,
+    "selected_classes": [ ]
+  }
 ```
 
 #### 🚀 Run Training
@@ -152,11 +179,6 @@ video_frames.shm
 └── license.txt
 ```
 
-
-#### 🧾 License
-
-This project is licensed under the FORTH License.
-See license.txt for full details.
 
 #### ✉️ Contact
 

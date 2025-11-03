@@ -765,27 +765,52 @@ if __name__ == "__main__":
     classifier.eval()
     trainer.validate(classifier, val_loader)
 
-    #Print confusion matrix numpy
-    #------------------------------------------------------------------
-    y_true = []
-    y_pred = []
-    for x, y in val_loader:
+
+
+    try:
+      print("Removing previous confusion matrix data..")
+      os.system("rm %s_confusion.json %s*.png" % (model_name,model_name) ) #Create zip of models
+
+      print("Generating new confusion matrix data..")
+      #Print confusion matrix numpy
+      #------------------------------------------------------------------
+      y_true = []
+      y_pred = []
+      for x, y in val_loader:
         y_true.extend(y.numpy())
         y_pred.extend(classifier(x).argmax(dim=1).numpy())
 
-    num_classes = len(set(y_true))  # or classifier(x).shape[1]
-    confusion_matrix = np.zeros((num_classes+1, num_classes+1), dtype=int)
+      #num_classes = len(set(y_true))+1  # or classifier(x).shape[1]
+      num_classes = len(dataset.classes)
+      confusion_matrix = np.zeros((num_classes, num_classes), dtype=int)
 
-    for true, pred in zip(y_true, y_pred):
+      for true, pred in zip(y_true, y_pred):
         confusion_matrix[true, pred] += 1
-    print(confusion_matrix)
-    #------------------------------------------------------------------
+      print(confusion_matrix)
+      #------------------------------------------------------------------
 
-    # Convert confusion matrix and classes to JSON-serializable form
-    #------------------------------------------------------------------
-    config_json["confusion_matrix"] = confusion_matrix.tolist()
-    config_json["classes_int"] = [int(c) for c in set(y_true)]  # force Python ints
-    config_json["classes"] = dataset.classes
+      # Convert confusion matrix and classes to JSON-serializable form
+      #------------------------------------------------------------------
+      config_json["confusion_matrix"] = confusion_matrix.tolist()
+      config_json["classes_int"] = [int(c) for c in set(y_true)]  # force Python ints
+      config_json["classes"] = dataset.classes
+
+
+      # Create extra summary JSON 
+      #------------------------------------------------------------------
+      print("Generating confusion matrix plot")
+      confusion_json = {
+                        "title": "%s / Tile Size = %u / Epochs = %u " % (model_name,tile_size,epochs),
+                        "labels": dataset.classes, 
+                        "matrix": confusion_matrix.tolist() 
+                       }
+      with open('%s_confusion.json' % model_name, 'w') as f:
+       json.dump(confusion_json, f, indent=2)
+      os.system("python3 plotTool.py %s_confusion.json" % model_name)
+    except Exception as e:
+      print("Failed generating a confusion matrix : ",e)
+      os.system("echo \"Failed\" > %s_confusion.json" % model_name)
+
 
     #Save the JSON 
     #------------------------------------------------------------------
@@ -797,17 +822,6 @@ if __name__ == "__main__":
     #Update symbolic links 
     #------------------------------------------------------------------
     os.system("rm last.pth last.json && ln -s %s.pth last.pth && ln -s %s.json last.json" % (model_name,model_name) )
-
-    # Create extra summary JSON 
-    #------------------------------------------------------------------
-    print("Generating confusion matrix plot")
-    confusion_json = {
-    "title": "%s / Tile Size = %u / Epochs = %u " % (model_name,tile_size,epochs),
-    "labels": dataset.classes, 
-    "matrix": confusion_matrix.tolist() }
-    with open('%s_confusion.json' % model_name, 'w') as f:
-       json.dump(confusion_json, f, indent=2)
-    os.system("python3 plotTool.py %s_confusion.json" % model_name)
 
     # Build zip filename with timestamp
     #------------------------------------------------------------------
