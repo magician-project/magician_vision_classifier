@@ -2,7 +2,7 @@
     "hparams":{
       "tile_size": 48,
       "batch_size": 64,
-      "training_epochs": 5,
+      "training_epochs": 15,
       "dropout_rate": 0.25,
       "seed": 42,
       "gradient_clip_value": 1.0,
@@ -36,7 +36,7 @@
         "use_wandb": false
     },
     "tensorboard_log_dir": "tile_classifier/tensorboard/",
-    "directory": "keras_dataset_merged/",
+    "directory": "binary_dataset/",
     "class_weight": false,
     "loss": "focal",
     "penalize_false_clean": 16.0,

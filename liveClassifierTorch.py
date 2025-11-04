@@ -750,6 +750,7 @@ class ClassifierPnm:
 
         self.step = step
         self.model_path = model_path
+        self.maxProbabilityThreshold = 0.0
 
         print("Classes : ",self.tile_classes)
         print("Tile Size : ",self.tile_size)
@@ -783,6 +784,45 @@ class ClassifierPnm:
         model.eval()
         return model
 
+    @staticmethod
+    def model_scan(directoryPath):
+        """Return list of base names for matching .pth and .json pairs in directory."""
+        if not os.path.isdir(directoryPath):
+            print(f"Directory not found: {directoryPath}")
+            return []
+
+        files = os.listdir(directoryPath)
+        pth_files = {os.path.splitext(f)[0] for f in files if f.endswith('.pth')}
+        json_files = {os.path.splitext(f)[0] for f in files if f.endswith('.json')}
+        matches = sorted(pth_files.intersection(json_files))
+        return matches
+ 
+    def reload_model(self, directoryPath, name):
+        """Unload previous model and reload a new model + config from given name."""
+        model_path = os.path.join(directoryPath, f"{name}.pth")
+        cfg_path   = os.path.join(directoryPath, f"{name}.json")
+
+        if not (os.path.exists(model_path) and os.path.exists(cfg_path)):
+            print(f"Missing model or config for '{name}' in {directoryPath}")
+            return False
+
+        try:
+            with open(cfg_path, "r") as f:
+                self.cfg = json.load(f)
+                self.tile_classes = self.cfg["classes"]
+                self.classes      = self.cfg["classes"]
+                self.tile_size    = self.cfg["hparams"]["tile_size"]
+        except Exception as e:
+            print("Failed reading config:", repr(e))
+            return False
+
+        self.model_path = model_path
+        print(f"Reloading model '{name}' from {directoryPath} ...")
+        self.model = self.load_model()
+        self.class_colors = getNDifferentColors(len(self.tile_classes))
+        print(f"Reload complete: {name}")
+        return True
+
     def load_model_old(self):
         # Load the trained model
         #model = Classifier.load_from_checkpoint(self.model_path)
@@ -803,7 +843,7 @@ class ClassifierPnm:
     
     @torch.no_grad()
     def forward(self, image, majorityVote = False, legend=True):
-        heatmap, occupancy, responses = runSingle(image, self.model, self.device, self.classes, self.class_colors, self.tile_size, self.step, majorityVote=majorityVote)
+        heatmap, occupancy, responses = runSingle(image, self.model, self.device, self.classes, self.class_colors, self.tile_size, self.step, majorityVote=majorityVote,  maxProbabilityThreshold=self.maxProbabilityThreshold)
 
         if legend:
             heatmap = self.add_legend(heatmap)

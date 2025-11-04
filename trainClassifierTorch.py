@@ -605,8 +605,13 @@ if __name__ == "__main__":
         configuration_file = sys.argv[1]
 
     print("Using ",configuration_file," configuration for training")
-
     config_json       = load_hyperparameters(os.path.dirname(os.path.abspath(__file__))+'/'+ configuration_file)
+
+    if len(sys.argv) > 2:
+        overwrite_model = sys.argv[2]
+        config_json['model'] = overwrite_model
+        print("Using model configuration provided by commandline parameter (",overwrite_model,")") 
+
     batch_size        = config_json['hparams']['batch_size']
     seed              = config_json['hparams']['seed']
     dropout_rate      = config_json['hparams']['dropout_rate']
@@ -618,7 +623,7 @@ if __name__ == "__main__":
     class_weight      = config_json['class_weight']
     lr                = config_json['optimizer']['learning_rate']
     use_wandb         = config_json['wandb']['use_wandb']
-    loss                 = config_json['loss']
+    loss              = config_json['loss']
     penalize_false_clean = float(config_json['penalize_false_clean'])
             
     if torch.cuda.is_available():
