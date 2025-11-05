@@ -24,7 +24,7 @@ from numba import njit #Test
 from readData import readPolarPNMToRGBALive#,readPolarPNMToRGBAResized
 from SharedMemoryManager import SharedMemoryManager
 from torch.nn import functional as F
-
+#--------------------------------------------------------------------------
 def dumpListAsCSV(theList,fields,theFilename):
    import csv
    with open(theFilename, 'w') as f:
@@ -33,17 +33,13 @@ def dumpListAsCSV(theList,fields,theFilename):
     write.writerow(fields)
     write.writerows(theList)
 
-
 def load_classes_json(filename):
     with open(filename, 'r') as f:
         classes = json.load(f)
     return classes
 
-
 def checkIfPathIsDirectory(filename):
     return os.path.isdir(filename) 
-
-
 #--------------------------------------------------------------------------
 # Drawing routines to decorate output to make classification understandable
 #--------------------------------------------------------------------------
@@ -141,7 +137,6 @@ def printLabels(heatmap,classes,class_colors):
        cv2.putText(heatmap, classes[classID], (x,y) , cv2.FONT_HERSHEY_SIMPLEX, 1.5, class_colors[classID], 5)
        y += 40
 #------------------------------------------------------------------------
- 
 
 @torch.no_grad()
 def generate_predictionStatistics(predictions,num_classes):
@@ -625,9 +620,13 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0, chunks=0, tryToSkip 
         #print("probs ",probs)
         max_probs, predictions = torch.max(probs, dim=1)
         #print("Max probs ",max_probs)
-        if (forceLowMaxProbToThisClass is not None):
-            predictions[max_probs < thresholdMaxProbability] = forceLowMaxProbToThisClass
-            low_activations += 1
+        if (forceLowMaxProbToThisClass is not None) and (thresholdMaxProbability>0.0):
+            #predictions[max_probs < thresholdMaxProbability] = forceLowMaxProbToThisClass
+            #low_activations += 1
+            mask = max_probs < thresholdMaxProbability
+            low_activations += mask.sum().item()
+            predictions[mask] = forceLowMaxProbToThisClass
+
     
     else:
         chunksB = npTiles.chunk(chunks)
@@ -641,9 +640,13 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0, chunks=0, tryToSkip 
         probs = softmax(preds)
         max_probs, predictions = torch.max(probs, dim=1)
         #print("Max probs ",max_probs)
-        if (forceLowMaxProbToThisClass is not None):
-            predictions[max_probs < thresholdMaxProbability] = forceLowMaxProbToThisClass
-            low_activations += 1
+        if (forceLowMaxProbToThisClass is not None) and (thresholdMaxProbability>0.0):
+            #predictions[max_probs < thresholdMaxProbability] = forceLowMaxProbToThisClass
+            #low_activations += 1
+            mask = max_probs < thresholdMaxProbability
+            low_activations += mask.sum().item()
+            predictions[mask] = forceLowMaxProbToThisClass
+
 
     seconds    = time.time() - start
     hz    = 1 / (seconds+0.0001)
@@ -665,7 +668,8 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0, chunks=0, tryToSkip 
     predictions = predictions.flatten()
     #------------------------------------------------------------------------
     
-    #print("Predictions ",predictions.shape, " Low Activations (",thresholdMaxProbability,") on ",low_activations," tiles")   
+    #print("Predictions ",predictions.shape, " Low Activations (",thresholdMaxProbability,") on ",low_activations," tiles")
+    print("forceLowMaxProbToThisClass  ",forceLowMaxProbToThisClass, " Low Activations (",thresholdMaxProbability,") on ",low_activations," tiles")    
     return predictions #,num_classes
 
 
@@ -697,8 +701,12 @@ def runSingle(image,model,device,classes,class_colors,tile_size,step, dumpTiles=
 
 
     # Perform inference on the image tiles
+    start      = time.time()    
     predictions = classify_tiles(model, rgba_image, tile_size=tile_size, step=step, majorityVote=majorityVote,  thresholdMaxProbability=maxProbabilityThreshold, forceLowMaxProbToThisClass=classIDForCleanTiles)
     rgba_image  = rgba_image * 255.0
+    seconds    = time.time() - start
+    hz    = 1 / (seconds+0.0001)
+    print("NN @ %0.02f Hz"%hz)   
 
     # Dump all tiles as PNG files
     if dumpTiles:
@@ -751,6 +759,7 @@ class ClassifierPnm:
         self.step = step
         self.model_path = model_path
         self.maxProbabilityThreshold = 0.0
+        self.hz = 0.0
 
         print("Classes : ",self.tile_classes)
         print("Tile Size : ",self.tile_size)
@@ -762,7 +771,6 @@ class ClassifierPnm:
         self.model = self.load_model()
 
         self.class_colors = getNDifferentColors(len(self.tile_classes))
-
 
     def load_model(self):
         model = Classifier(
@@ -843,10 +851,15 @@ class ClassifierPnm:
     
     @torch.no_grad()
     def forward(self, image, majorityVote = False, legend=True):
+        start      = time.time()    
+   
         heatmap, occupancy, responses = runSingle(image, self.model, self.device, self.classes, self.class_colors, self.tile_size, self.step, majorityVote=majorityVote,  maxProbabilityThreshold=self.maxProbabilityThreshold)
 
         if legend:
             heatmap = self.add_legend(heatmap)
+
+        seconds    = time.time() - start
+        self.hz    = 1 / (seconds+0.0001)
 
         return heatmap, occupancy, responses
 
@@ -892,13 +905,11 @@ if __name__ == "__main__":
     #model_classes = sys.argv[2]
     #image_path    = sys.argv[3]
 
-    # Load the trained model
-    #import ipdb; ipdb.set_trace()
-    #from tensorflow.keras.losses import SparseCategoricalCrossentropy, BinaryCrossentropy, CategoricalCrossentropy, CategoricalFocalCrossentropy
-    #total_loss = CategoricalCrossentropy()
-    #model  = keras.models.load_model('tile_classifier.keras', custom_objects={'Classifier': Classifier})
-    #model = Classifier.load_from_checkpoint(model_path)
-    modelC = ClassifierPnm(model_path='last.pth',cfg_path='last.json')
+    step=16
+    tile_size=64
+
+
+    modelC = ClassifierPnm(model_path='last.pth',cfg_path='last.json',step=step,tile_size=tile_size)
     model=modelC.model
     if torch.cuda.is_available():
         device = 'cuda'
@@ -906,7 +917,6 @@ if __name__ == "__main__":
         device = 'cpu'
     model.to(device)
     model=model.eval()
-    #tiles = torch.rand(2000, 4, 64, 64, dtype=torch.float16,device='cuda')
     #model.half()
     #Compile the model for inference
     model = torch.compile(model)
@@ -915,8 +925,6 @@ if __name__ == "__main__":
     #Set the model to inference mode
     torch.set_float32_matmul_precision('medium') 
 
-    step=16
-    tile_size=64
     
     streamName = "stream1"
     smm = SharedMemoryManager("./libSharedMemoryVideoBuffers.so", 
@@ -924,8 +932,7 @@ if __name__ == "__main__":
                               frameName  = streamName,
                               connect    = True)
 
-    # Loop to continuously read frames 
-
+    # Loop to continuously read frames
     while True:
         # Capture frame-by-frame
         frame = smm.read_from_shared_memory()

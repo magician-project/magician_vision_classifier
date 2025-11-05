@@ -1,4 +1,11 @@
-from liveClassifierTorch import ClassifierPnm, runSingle, readPolarPNMToRGBALive, tile_and_cast_data_torch, classify_tiles
+
+import cv2
+import time
+import numpy as np
+import pytorch_lightning as pl
+import torch
+
+from liveClassifierTorch import ClassifierPnm, runSingle, readPolarPNMToRGBALive, tile_and_cast_data_torch, classify_tiles, generate_heatmap
 
 class EnsembleClassifierPnm:
     def __init__(self, model_cfg_list, tile_size=64, step=16):
@@ -9,6 +16,7 @@ class EnsembleClassifierPnm:
         self.classifiers = []
         self.tile_size = tile_size
         self.step = step
+        self.hz   = 0.0
 
         # Initialize all ClassifierPnm instances
         for model_path, cfg_path in model_cfg_list:
@@ -39,6 +47,8 @@ class EnsembleClassifierPnm:
         First classifier predicts normally.
         For tiles not predicted as 'class_clean', runs all classifiers and does majority voting.
         """
+        start      = time.time()
+
         # Run first classifier
         first_clf = self.classifiers[0]
         heatmap, occupancy, responses = runSingle(
@@ -95,6 +105,9 @@ class EnsembleClassifierPnm:
 
         if legend:
             heatmap = first_clf.add_legend(heatmap)
+
+        seconds    = time.time() - start
+        self.hz    = 1 / (seconds+0.0001)
 
         return heatmap, occupancy, responses
 
