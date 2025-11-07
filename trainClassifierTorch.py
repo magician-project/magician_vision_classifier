@@ -160,8 +160,16 @@ def evaluate_dumped_tiles(model, tiles_dir, classes, device='cuda', batch_size=1
 
 
 
+#-------------------------------------------------------------------------------
+def checkIfPathExists(filename):
+    return os.path.exists(filename)
+#-------------------------------------------------------------------------------
+def checkIfPathIsDirectory(filename):
+    return os.path.isdir(filename) 
+#-------------------------------------------------------------------------------
 def checkIfFileExists(filename):
     return os.path.isfile(filename)
+#-------------------------------------------------------------------------------
 
 def load_hyperparameters(config_file):
     if not checkIfFileExists(config_file):
@@ -320,28 +328,6 @@ class Classifier(pl.LightningModule):
         self.clean_class  = clean_class  
         self.penalize_false_clean = penalize_false_clean
 
-        #self.model = torch.hub.load('pytorch/vision:v0.9.0', 'convnext_tiny', pretrained=True)
-        #Convnext Tiny
-        #self.model = convnext_tiny(pretrained=True)
-        #self.model.features[0][0] = nn.Conv2d(4, 96, kernel_size=(4, 4), stride=(4, 4))
-        #self.model.classifier[2] = nn.Linear(768, 3)
-        #EfficientNetV2S
-        #self.model = efficientnet_v2_s(pretrained=True)
-        #self.model.features[0][0] = nn.Conv2d(4, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
-        #self.model.classifier[1]= nn.Linear(1280, num_classes,bias = True)
-        #import ipdb; ipdb.set_trace()
-        #Resnext
-        #if train:
-        #self.mean=(0.2164, 0.2316, 0.2423, 0.2299)
-        #self.std=(0.0188, 0.0199, 0.0206, 0.0198)
-        
-
-        #Freeze the model
-        #for param in self.model.parameters():
-        #    param.requires_grad = False
-        #else:
-        #    self.model = resnext50_32x4d()
-        
         #RESNEXT
         if self.type == 'resnext50':
             self.model = resnext50_32x4d(weights=ResNeXt50_32X4D_Weights.IMAGENET1K_V2)
@@ -625,6 +611,10 @@ if __name__ == "__main__":
     use_wandb         = config_json['wandb']['use_wandb']
     loss              = config_json['loss']
     penalize_false_clean = float(config_json['penalize_false_clean'])
+
+    model_name = config_json['model']
+    if "name" in config_json:
+             model_name = "%s_%s" % (config_json['name'],config_json['model'])
             
     if torch.cuda.is_available():
         device = 'cuda'
@@ -664,7 +654,6 @@ if __name__ == "__main__":
     
     #Set the random seed for reproducibility
     torch.manual_seed(seed)
-    # Set the random seed for numpy
     np.random.seed(seed)
     random.seed(seed)
     pl.seed_everything(seed, workers=True)
@@ -672,28 +661,29 @@ if __name__ == "__main__":
     
     # Split the dataset into training and validation sets
     train_dataset, val_dataset = random_split(
-        dataset,
-        [train_size, validation_size],
-        generator=torch.Generator().manual_seed(seed),
-    )
+                                              dataset,
+                                              [train_size, validation_size],
+                                              generator=torch.Generator().manual_seed(seed),
+                                             )
 
     # Create DataLoaders
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        drop_last=True
-    )
+                              train_dataset,
+                              batch_size=batch_size,
+                              shuffle=True,
+                              num_workers=num_workers,
+                              drop_last=True
+                             )
 
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,  # Typically, we don't shuffle the validation set
-        num_workers=num_workers,
-        drop_last=True
-    )
-    #print class names
+                            val_dataset,
+                            batch_size=batch_size,
+                            shuffle=False,  # Typically, we don't shuffle the validation set
+                            num_workers=num_workers,
+                            drop_last=True
+                           )
+
+    #Print class names as a sanity check
     class_names = dataset.classes
     print(f"Classes: {class_names}")
 
@@ -729,27 +719,24 @@ if __name__ == "__main__":
     if use_wandb:
         loggers = [TensorBoardLogger("lightning_logs", name="classifier"),  WandbLogger(project=config_json['wandb']['project'], log_model=True,name=config_json['wandb']['name']+model_type+loss)]
     else:
-        loggers = [TensorBoardLogger("lightning_logs", name="classifier")]
+        if (checkIfPathExists("tensorboard/")):
+           os.system("echo \"Removing previous tensorboard logs..\" && rm -rf tensorboard/")
+        loggers = [TensorBoardLogger("tensorboard", name=model_name)]
 
     trainer = pl.Trainer(
-        max_epochs=epochs,
-        logger=loggers,
-        #callbacks=[EarlyStopping(monitor='val_loss')],
-        accelerator= config_json['accelerator'],
-        devices= config_json['devices'],
-        gradient_clip_val=gradient_clip_val,
-        deterministic=True,
-        
-    )
+                         max_epochs=epochs,
+                         logger=loggers,
+                         #callbacks=[EarlyStopping(monitor='val_loss')],
+                         accelerator=config_json['accelerator'],
+                         devices=config_json['devices'],
+                         gradient_clip_val=gradient_clip_val,
+                         deterministic=True,
+                       )
 
     #Train and log to console
     #------------------------------------------------------------------
     trainer.fit(classifier, train_loader, val_loader)
 
-
-    model_name = config_json['model']
-    if "name" in config_json:
-             model_name = "%s_%s" % (config_json['name'],config_json['model'])
 
     #Save the model
     #------------------------------------------------------------------
@@ -765,12 +752,13 @@ if __name__ == "__main__":
     #        with open("tile_evaluation.json", "w") as f:
     #            json.dump(metrics, f, indent=2)
 
+
     #Predictions
     #------------------------------------------------------------------
+    print("Final model validation")
     classifier.eval()
     trainer.validate(classifier, val_loader)
-
-
+    #------------------------------------------------------------------
 
     try:
       print("Removing previous confusion matrix data..")
@@ -835,7 +823,7 @@ if __name__ == "__main__":
 
     print("Saving everything as %s archive" % zip_name)
     os.system("mkdir models/")
-    os.system("zip -r models/%s %s.json %s_confusion.json %s*.png %s.pth" % (zip_name,model_name,model_name,model_name,model_name) ) #Create zip of models
+    os.system("zip -r models/%s %s.json %s_confusion.json %s*.png %s.pth tensorboard/" % (zip_name,model_name,model_name,model_name,model_name) ) #Create zip of models
 
     print('To upload results copy/paste:') 
     print("scp -P 2222 models/%s ammar@ammar.gr:/home/ammar/public_html/magician/ckpts" % zip_name)  

@@ -129,16 +129,17 @@ class EnsembleClassifierPnm:
         print("All tiles classified as clean — skipping ensemble voting.")
         final_predictions = base_preds
     else:
-        print(f"Running ensemble voting for {len(non_clean_indices)} non-clean tiles")
 
         # --- Step 3: Run ensemble classifiers on all tiles ---
         all_predictions = []
         if (parallel):
+          print(f"Parallel running ensemble voting for {len(non_clean_indices)} non-clean tiles")
           all_predictions = parallel_classify_tiles(
                                                      self.classifiers, rgba_image,
                                                      tile_size=self.tile_size, step=self.step,
                                                      majorityVote=majorityVote )
         else:
+          print(f"Running ensemble voting for {len(non_clean_indices)} non-clean tiles")
           for clf in self.classifiers:
             preds = classify_tiles(clf.model, rgba_image,
                                    tile_size=self.tile_size, step=self.step,

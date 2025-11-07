@@ -747,6 +747,7 @@ class ClassifierPnm:
         if os.path.exists(cfg_path):
             try:
                 with open(cfg_path, "r") as f:
+                    print("Opening Classifier configuration file ",cfg_path)
                     self.cfg = json.load(f)
                     self.tile_classes = self.cfg["classes"]
                     self.classes      = self.cfg["classes"]
@@ -754,7 +755,11 @@ class ClassifierPnm:
             except Exception as e: 
                 print("Failed reading ",cfg_path)
                 print("Failed:", repr(e))
-                os.exit(1)
+                sys.exit(1)
+        else:
+            print("Classifier configuration file ",cfg_path," does not exist")
+            sys.exit(1)
+
 
         self.step = step
         self.model_path = model_path
@@ -774,11 +779,11 @@ class ClassifierPnm:
 
     def load_model(self):
         model = Classifier(
-            model=self.cfg['model'],
-            lr=0.1,
-            num_classes=len(self.classes),
-            tile_size=self.cfg['hparams']['tile_size']
-        )
+                           model=self.cfg['model'],
+                           lr=0.1,
+                           num_classes=len(self.classes),
+                           tile_size=self.cfg['hparams']['tile_size']
+                          )
 
         checkpoint = torch.load(self.model_path, map_location=self.device)
         state_dict = checkpoint.get('state_dict', checkpoint)
