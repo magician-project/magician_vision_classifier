@@ -893,11 +893,12 @@ class ClassifierPnm:
             cv2.rectangle(overlay, top_left, bottom_right, color, -1)
 
             # Draw text label
+            text_pos = (bottom_right[0] + 8, bottom_right[1] - 4)
+            cv2.putText(overlay, cls, text_pos, font, font_scale, (0, 0, 0), font_thickness, cv2.LINE_AA )
+            text_pos = (bottom_right[0] + 12, bottom_right[1] - 8)
+            cv2.putText(overlay, cls, text_pos, font, font_scale, (0, 0, 0), font_thickness, cv2.LINE_AA )
             text_pos = (bottom_right[0] + 10, bottom_right[1] - 6)
-            cv2.putText(
-                overlay, cls, text_pos, font,
-                font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA
-            )
+            cv2.putText(overlay, cls, text_pos, font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA )
 
         # Blend the overlay with the original heatmap
         cv2.addWeighted(overlay, alpha, heatmap, 1 - alpha, 0, heatmap)

@@ -3,8 +3,51 @@ import time
 import numpy as np
 import pytorch_lightning as pl
 import torch
+import torch.nn as nn
 
 from liveClassifierTorch import ClassifierPnm, runSingle, readPolarPNMToRGBALive, tile_and_cast_data_torch, classify_tiles, generate_heatmap
+ 
+ 
+def run_models_async(models, x):
+    """
+    Runs a list of models asynchronously using CUDA streams.
+    Each model can have a different architecture.
+    Returns a list of their outputs.
+    """
+    assert torch.cuda.is_available(), "CUDA required for async inference"
+    device = next(models[0].parameters()).device
+
+    # Create a stream per model
+    streams = [torch.cuda.Stream(device=device) for _ in models]
+    results = [None] * len(models)
+
+    # Launch each model in its own stream
+    for i, (model, stream) in enumerate(zip(models, streams)):
+        with torch.cuda.stream(stream):
+            results[i] = model(x.clone())  # clone avoids in-place sharing
+
+    # Wait for all streams to finish
+    torch.cuda.synchronize()
+    return results
+
+class MergedEnsemble(nn.Module):
+    def __init__(self, models):
+        super().__init__()
+        self.models = nn.ModuleList(models)
+
+    def forward(self, x):
+        outputs = []
+        for model in self.models:
+            out = model(x)
+            outputs.append(out)
+        # Try to unify output types
+        if isinstance(outputs[0], torch.Tensor):
+            try:
+                return torch.stack(outputs)  # (num_models, batch, ...)
+            except RuntimeError:
+                return torch.cat([o.unsqueeze(0) for o in outputs], dim=0)
+        return outputs
+
 
 
 def parallel_classify_tiles(classifiers, rgba_image, tile_size, step, majorityVote=False, max_workers=None):
@@ -59,6 +102,18 @@ class EnsembleClassifierPnm:
                                 tile_size=tile_size, step=step)
             self.classifiers.append(clf)
 
+        # After loading all ensemble models:
+        ensemble_models = [clf.model for clf in self.classifiers]
+
+        # Merge into one parallel model
+        if torch.cuda.is_available():
+            self.device = 'cuda'
+        else:
+            self.device = 'cpu'
+        print("Compiling 2-stage models as one!")
+        self.merged_model = MergedEnsemble(ensemble_models).to(self.device)
+        torch.compile(self.merged_model)
+
         # --- Common class/color definitions from the first ensemble model ---
         self.classes = self.classifiers[0].classes
         self.class_colors = self.classifiers[0].class_colors
@@ -87,7 +142,7 @@ class EnsembleClassifierPnm:
         print("Clean class ID:", self.cleanClassID)
 
  @torch.no_grad()
- def forward(self, image, majorityVote=False, legend=True, strict=True, parallel=False):
+ def forward(self, image, majorityVote=False, legend=True, strict=True, parallel=False, multimodel=True):
     """
     Step 1: Run the initial classifier on the image.
     Step 2: Identify non-clean tiles from initial classifier.
@@ -132,14 +187,40 @@ class EnsembleClassifierPnm:
 
         # --- Step 3: Run ensemble classifiers on all tiles ---
         all_predictions = []
-        if (parallel):
+
+        # --- Step 3: Run ensemble classifiers as one merged GPU model ---
+        if (multimodel):
+           print(f"GPU-Parallel running ensemble voting for {len(non_clean_indices)} non-clean tiles")
+
+           with torch.no_grad():
+               outputs = run_models_async([clf.model for clf in self.classifiers], npTiles)
+               all_predictions = [torch.argmax(o, dim=1) for o in outputs]
+               all_predictions = torch.stack(all_predictions)
+           """
+           with torch.no_grad():
+               preds_all = self.merged_model(npTiles)  # shape (num_models, num_tiles, num_classes)
+               if preds_all.ndim == 3:
+                   all_predictions = torch.argmax(preds_all, dim=2)  # (num_models, num_tiles)
+               else:
+                   # fallback if model returns class indices directly
+                   all_predictions = preds_all
+ 
+               # Ensure it's the right shape
+               # (num_models, num_tiles)
+               if isinstance(all_predictions, torch.Tensor):
+                   pass  # good, nothing to do
+               else:
+                   # If it happens to be a list, stack it
+                   all_predictions = torch.stack(all_predictions)
+        """
+        elif (parallel):
           print(f"Parallel running ensemble voting for {len(non_clean_indices)} non-clean tiles")
           all_predictions = parallel_classify_tiles(
                                                      self.classifiers, rgba_image,
                                                      tile_size=self.tile_size, step=self.step,
                                                      majorityVote=majorityVote )
         else:
-          print(f"Running ensemble voting for {len(non_clean_indices)} non-clean tiles")
+          print(f"Serial Running ensemble voting for {len(non_clean_indices)} non-clean tiles")
           for clf in self.classifiers:
             preds = classify_tiles(clf.model, rgba_image,
                                    tile_size=self.tile_size, step=self.step,
@@ -150,7 +231,16 @@ class EnsembleClassifierPnm:
             all_predictions.append(preds)
 
         # Stack predictions: shape = (num_models, num_tiles)
-        all_predictions = torch.stack(all_predictions)
+        #all_predictions = torch.stack(all_predictions)
+        # --- Normalize all_predictions shape ---
+        if isinstance(all_predictions, torch.Tensor):
+            # already a tensor (merged_model or something returned one)
+            pass
+        elif isinstance(all_predictions, (list, tuple)):
+            all_predictions = torch.stack(all_predictions)
+        else:
+            raise TypeError(f"Unexpected type for all_predictions: {type(all_predictions)}")
+
 
         # --- Step 4: Perform voting only on non-clean tiles ---
         final_predictions = base_preds.clone()
@@ -161,14 +251,11 @@ class EnsembleClassifierPnm:
             clean_votes = votes.count(self.cleanClassID)
 
             if strict:
-                # In strict mode: if majority of models say "clean", mark as clean
                 if clean_votes > num_models / 2:
                     voted_class = self.cleanClassID
                 else:
-                    # Otherwise use normal majority voting among all predictions
                     voted_class = max(set(votes), key=votes.count)
             else:
-                # Normal mode: plain majority voting
                 voted_class = max(set(votes), key=votes.count)
 
             final_predictions[idx] = voted_class
