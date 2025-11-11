@@ -759,22 +759,31 @@ class ClassifierPnm:
         else:
             print("Classifier configuration file ",cfg_path," does not exist")
             sys.exit(1)
-
-
+        #--------------------------------------------------------------
         self.step = step
         self.model_path = model_path
         self.maxProbabilityThreshold = 0.0
         self.hz = 0.0
-
+        #--------------------------------------------------------------
         print("Classes : ",self.tile_classes)
         print("Tile Size : ",self.tile_size)
-
+        #--------------------------------------------------------------
         if torch.cuda.is_available():
             self.device = 'cuda'
         else:
             self.device = 'cpu'
+        #--------------------------------------------------------------
+        self.base_channels = 32
+        if  'base_channels' in self.cfg['hparams']:
+          self.base_channels = self.cfg['hparams']['base_channels']
+        print("Base channels ", self.base_channels)
+        #--------------------------------------------------------------
+        self.final_dense_layer=512
+        if  'final_dense_layer' in self.cfg['hparams']:
+                  self.final_dense_layer = self.cfg['hparams']['final_dense_layer']
+        print("Final Dense Layer ", self.final_dense_layer)
+        #-----------------------------------------------------------------
         self.model = self.load_model()
-
         self.class_colors = getNDifferentColors(len(self.tile_classes))
 
     def load_model(self):
@@ -782,7 +791,9 @@ class ClassifierPnm:
                            model=self.cfg['model'],
                            lr=0.1,
                            num_classes=len(self.classes),
-                           tile_size=self.cfg['hparams']['tile_size']
+                           tile_size=self.cfg['hparams']['tile_size'],
+                           base_channels = self.base_channels,
+                           final_dense_layer = self.final_dense_layer
                           )
 
         checkpoint = torch.load(self.model_path, map_location=self.device)
@@ -836,6 +847,7 @@ class ClassifierPnm:
         print(f"Reload complete: {name}")
         return True
 
+    """
     def load_model_old(self):
         # Load the trained model
         #model = Classifier.load_from_checkpoint(self.model_path)
@@ -853,6 +865,7 @@ class ClassifierPnm:
         model=model.eval()
         #model = model.half()
         return model
+    """
     
     @torch.no_grad()
     def forward(self, image, majorityVote = False, legend=True):

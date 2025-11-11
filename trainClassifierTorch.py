@@ -238,9 +238,10 @@ class CategoricalFocalLoss(nn.Module):
 
 
 class CustomCNN(nn.Module):
-    def __init__(self, in_channels=4, intended_tile_size=64, num_classes=4, dropout_rate=0.5, base_channels = 32):
+    def __init__(self, in_channels=4, intended_tile_size=64, num_classes=4, dropout_rate=0.5, base_channels=32, final_dense_layer=512):
         super(CustomCNN, self).__init__()
-
+  
+        print("Custom CNN (",base_channels,",",final_dense_layer,") constructor")
         self.channels  = in_channels
         self.tile_size = intended_tile_size
  
@@ -263,10 +264,9 @@ class CustomCNN(nn.Module):
         self.bn4   = nn.BatchNorm2d(c3)
         self.pool4 = nn.MaxPool2d(2)
 
-
-        prefinalLayerChannels = 2048
-        intermediateLayerChannels = 1024   # new FC layer
-        finalLayerChannels = 512           # output to final FC
+        prefinalLayerChannels     = int(final_dense_layer * 4.5) 
+        intermediateLayerChannels = int(final_dense_layer * 1.5)   # new FC layer
+        finalLayerChannels        = final_dense_layer              # output to final FC
 
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc1 = nn.Linear(c3, prefinalLayerChannels)
@@ -313,20 +313,26 @@ class Classifier(pl.LightningModule):
                       Unpolarized=False,
                       load_checkpoint=None,
                       penalize_false_clean=0.0,
+                      base_channels=32,
+                      final_dense_layer=512,
                       clean_class=0
                  ):
         super(Classifier, self).__init__()
-        self.type = model
-        self.lr           = lr
-        self.tile_size    = tile_size
-        self.num_classes  = num_classes
-        self.dropout_rate = dropout_rate
-
+        #-----------------------------------------
+        self.type              = model
+        self.lr                = lr
+        self.tile_size         = tile_size
+        self.num_classes       = num_classes
+        self.dropout_rate      = dropout_rate
+        self.base_channels     = base_channels
+        self.final_dense_layer = final_dense_layer
+        #-----------------------------------------
         self.AoLP=AoLP
         self.DoLP=DoLP
         self.Unpolarized = Unpolarized
         self.clean_class  = clean_class  
         self.penalize_false_clean = penalize_false_clean
+        #-----------------------------------------
 
         #RESNEXT
         if self.type == 'resnext50':
@@ -355,15 +361,10 @@ class Classifier(pl.LightningModule):
             self.model.stem[0] = nn.Conv2d(4, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             #import ipdb; ipdb.set_trace()
             self.model.fc = nn.Linear(784, num_classes)
-        elif self.type == 'custom':
-            self.model = CustomCNN(in_channels=4, intended_tile_size=tile_size, num_classes=num_classes, dropout_rate=dropout_rate)
-
+        elif ('custom' in self.type) or ('cnn' in self.type):
+            self.model = CustomCNN(in_channels=4, intended_tile_size=tile_size, num_classes=num_classes, dropout_rate=dropout_rate, base_channels=self.base_channels, final_dense_layer=self.final_dense_layer)
         else:
             raise ValueError(f"Unsupported model type: {model}. Supported types are 'resnext50', 'resnet18', 'convnext_tiny', 'efficientnet_v2_s', 'swin_v2_t', 'regnet_y_800mf'.")
-        #self.model.fc.requires_grad         = True
-        #self.model.fc.bias.requires_grad    = True
-        #self.model.conv1.requires_grad      = True
-        #self.model.conv1.bias.requires_grad = True
 
         if (load_checkpoint is not None):
            self.model = Classifier.load_from_checkpoint(load_checkpoint)
@@ -592,12 +593,15 @@ if __name__ == "__main__":
 
     print("Using ",configuration_file," configuration for training")
     config_json       = load_hyperparameters(os.path.dirname(os.path.abspath(__file__))+'/'+ configuration_file)
+    print(config_json)
 
     if len(sys.argv) > 2:
         overwrite_model = sys.argv[2]
         config_json['model'] = overwrite_model
         print("Using model configuration provided by commandline parameter (",overwrite_model,")") 
 
+    #Parse JSON Values
+    #-----------------------------------------------------------------
     batch_size        = config_json['hparams']['batch_size']
     seed              = config_json['hparams']['seed']
     dropout_rate      = config_json['hparams']['dropout_rate']
@@ -611,11 +615,23 @@ if __name__ == "__main__":
     use_wandb         = config_json['wandb']['use_wandb']
     loss              = config_json['loss']
     penalize_false_clean = float(config_json['penalize_false_clean'])
-
+    #-----------------------------------------------------------------
+    base_channels     = 32
+    if  'base_channels' in config_json['hparams']:
+          base_channels = config_json['hparams']['base_channels']
+    print("Base channels ", base_channels)
+    #-----------------------------------------------------------------
+    final_dense_layer=512
+    if  'final_dense_layer' in config_json['hparams']:
+          final_dense_layer = config_json['hparams']['final_dense_layer']
+    print("Final Dense Layer ", final_dense_layer)
+    #-----------------------------------------------------------------
     model_name = config_json['model']
     if "name" in config_json:
              model_name = "%s_%s" % (config_json['name'],config_json['model'])
+    #-----------------------------------------------------------------
             
+    #Let's Go..
     if torch.cuda.is_available():
         device = 'cuda'
     else:
@@ -624,14 +640,13 @@ if __name__ == "__main__":
 
     # Define the transform
     transform = transforms.Compose([
-        transforms.ToTensor(),  # Convert images to PyTorch tensors
-        #transforms.Normalize(mean=[0.2164, 0.2316, 0.2423, 0.2299], std=[0.0188, 0.0199, 0.0206, 0.0198]),
-    ])
-
+                                    transforms.ToTensor(),  # Convert images to PyTorch tensors
+                                   #transforms.Normalize(mean=[0.2164, 0.2316, 0.2423, 0.2299], std=[0.0188, 0.0199, 0.0206, 0.0198]),
+                                  ])
 
     H5PYFilename = '%s/dataset.h5' % directory 
-    if (checkIfFileExists(H5PYFilename)) and False:
-          #If there is a .h5 file read directly from it to not spam I/O
+    if (checkIfFileExists(H5PYFilename)):
+          #If there is a .h5 file read directly from it to not spam I/O (Use DatasetConverter.py)
           from DatasetConverter import HDF5Dataset
           print("Using H5 dataset loader ",H5PYFilename)
           dataset = HDF5Dataset(H5PYFilename)
@@ -675,7 +690,7 @@ if __name__ == "__main__":
                               drop_last=True
                              )
 
-    val_loader = DataLoader(
+    val_loader  = DataLoader(
                             val_dataset,
                             batch_size=batch_size,
                             shuffle=False,  # Typically, we don't shuffle the validation set
@@ -710,6 +725,8 @@ if __name__ == "__main__":
                             tile_size=config_json['hparams']['tile_size'],
                             dropout_rate=dropout_rate,
                             penalize_false_clean=penalize_false_clean,
+                            base_channels=base_channels,
+                            final_dense_layer=final_dense_layer,
                             clean_class=cleanClassID)
     print(f"Learning rate: {lr}")
     

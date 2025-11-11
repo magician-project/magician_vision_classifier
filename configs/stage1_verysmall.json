@@ -6,8 +6,8 @@
       "dropout_rate": 0.25,
       "seed": 42,
       "gradient_clip_value": 1.0,
-      "base_channels": 48,
-      "final_dense_layer": 512,
+      "base_channels": 30,
+      "final_dense_layer": 256,
       "AoLP": false, 
       "DoLP": false,
       "unpolarized": false
@@ -37,13 +37,13 @@
         "name": "AmmarConfig",
         "use_wandb": false
     },
-    "directory": "keras_dataset/",
+    "directory": "binary_dataset/",
     "class_weight": false,
     "loss": "focal",
-    "penalize_false_clean": 0.0,
+    "penalize_false_clean": 16.0,
     "accelerator": "auto",
-    "name": "allclass",
-    "model": "small_cnn",
+    "name": "binary",
+    "model": "verysmall_cnn",
     "devices": 1,
     "selected_classes": [ ]
   }

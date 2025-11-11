@@ -35,7 +35,6 @@
         "name": "AmmarConfig",
         "use_wandb": false
     },
-    "tensorboard_log_dir": "tile_classifier/tensorboard/",
     "directory": "keras_dataset/",
     "class_weight": false,
     "loss": "focal",

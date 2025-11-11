@@ -2,10 +2,12 @@
     "hparams":{
       "tile_size": 48,
       "batch_size": 64,
-      "training_epochs": 15,
+      "training_epochs": 25,
       "dropout_rate": 0.25,
       "seed": 42,
       "gradient_clip_value": 1.0,
+      "base_channels": 48,
+      "final_dense_layer": 512,
       "AoLP": false, 
       "DoLP": false,
       "unpolarized": false
@@ -35,14 +37,13 @@
         "name": "AmmarConfig",
         "use_wandb": false
     },
-    "tensorboard_log_dir": "tile_classifier/tensorboard/",
     "directory": "binary_dataset/",
     "class_weight": false,
     "loss": "focal",
     "penalize_false_clean": 16.0,
     "accelerator": "auto",
     "name": "binary",
-    "model": "custom",
+    "model": "resnet18",
     "devices": 1,
     "selected_classes": [ ]
   }

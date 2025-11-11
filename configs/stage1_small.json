@@ -37,12 +37,12 @@
         "name": "AmmarConfig",
         "use_wandb": false
     },
-    "directory": "keras_dataset/",
+    "directory": "binary_dataset/",
     "class_weight": false,
     "loss": "focal",
-    "penalize_false_clean": 0.0,
+    "penalize_false_clean": 16.0,
     "accelerator": "auto",
-    "name": "allclass",
+    "name": "binary",
     "model": "small_cnn",
     "devices": 1,
     "selected_classes": [ ]
