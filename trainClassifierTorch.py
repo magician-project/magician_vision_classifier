@@ -831,7 +831,8 @@ if __name__ == "__main__":
 
     #Update symbolic links 
     #------------------------------------------------------------------
-    os.system("rm last.pth last.json && ln -s %s.pth last.pth && ln -s %s.json last.json" % (model_name,model_name) )
+    #os.system("rm last.pth last.json && ln -s %s.pth last.pth && ln -s %s.json last.json" % (model_name,model_name) )
+    #No longer needed
 
     # Build zip filename with timestamp
     #------------------------------------------------------------------
@@ -840,7 +841,7 @@ if __name__ == "__main__":
 
     print("Saving everything as %s archive" % zip_name)
     os.system("mkdir models/")
-    os.system("zip -r models/%s %s.json %s_confusion.json %s*.png %s.pth tensorboard/" % (zip_name,model_name,model_name,model_name,model_name) ) #Create zip of models
+    os.system("zip -r models/%s %s.json %s_confusion.json %s*.png %s.pth tensorboard/*/*/*" % (zip_name,model_name,model_name,model_name,model_name) ) #Create zip of models
 
     print('To upload results copy/paste:') 
     print("scp -P 2222 models/%s ammar@ammar.gr:/home/ammar/public_html/magician/ckpts" % zip_name)  

@@ -6,6 +6,8 @@
       "dropout_rate": 0.25,
       "seed": 42,
       "gradient_clip_value": 1.0,
+      "base_channels": 48,
+      "final_dense_layer": 512,
       "AoLP": false, 
       "DoLP": false,
       "unpolarized": false

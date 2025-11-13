@@ -32,14 +32,42 @@ def dumpListAsCSV(theList,fields,theFilename):
     write = csv.writer(f)
     write.writerow(fields)
     write.writerows(theList)
+#--------------------------------------------------------------------------
+def log_performance(filename, model_name, step, tile_size,
+                    majorityVote, maxProbabilityThreshold,
+                    num_predictions, hz):
+    """Append a performance log line to a file. Creates header if missing."""
+    file_exists = os.path.exists(filename)
 
+    with open(filename, "a") as f:
+        # Write header first time
+        if not file_exists:
+            f.write("model_name, step, tile_size, majorityVote, "
+                    "maxProbabilityThreshold, num_predictions, framerate_hz\n")
+
+        # Write values
+        f.write(f"{model_name}, {step}, {tile_size}, {int(majorityVote)}, "
+                f"{maxProbabilityThreshold}, {num_predictions}, {hz:.4f}\n")
+#--------------------------------------------------------------------------
 def load_classes_json(filename):
     with open(filename, 'r') as f:
         classes = json.load(f)
     return classes
-
+#--------------------------------------------------------------------------
 def checkIfPathIsDirectory(filename):
     return os.path.isdir(filename) 
+#--------------------------------------------------------------------------
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+#--------------------------------------------------------------------------
+
 #--------------------------------------------------------------------------
 # Drawing routines to decorate output to make classification understandable
 #--------------------------------------------------------------------------
@@ -468,88 +496,6 @@ def dump_tiles_as_png(rgba_image, predictions, classes, tile_size, step, output_
     print(f"Saved {saved} tiles to '{output_dir}'")
     return output_dir
 
-@torch.no_grad()
-def generate_heatmap(predictions, classes, class_colors, rgba_image, tile_size=24, step=2): # , include_tiles=False
-    original_image = torch.tensor(rgba_image, dtype=torch.uint8)
-    height, width, _ = original_image.shape
-    
-    tilesH = (height - tile_size)  // step
-    tilesW = (width  - tile_size)  // step
-
-    occupancy = torch.full((tilesH + 1, tilesW + 1), 255, dtype=torch.uint8)
-
-    responses = dict()
-    responses["points"]  = list()
-    responses["classes"] = list()
-
-    #Heatmap is an RGB image!
-    heatmap = original_image[:, :, :3].clone()
-    
-    cleanClassID = 0
-    for i in range(len(classes)):
-           if (classes[i] == "class_clean") or (classes[i] == "Clean"):
-              cleanClassID = i
-
-    activations = [0] * len(classes)
-
-    print("generate_heatmap tile_size =", tile_size)
-    print("step =", step)
-    print("expected classes =", len(classes))
-    print("clean class =", cleanClassID)
-    print("classes colors =", len(class_colors))
-    print("predictions =", predictions.shape)
-    
-    half_tile_size = tile_size // 2
-    
-    # Create grid indices for tiles
-    y_indices = torch.arange(0, height - tile_size, step)
-    x_indices = torch.arange(0, width  - tile_size, step)
-    
-    allTiles = tilesH * tilesW
-    totalActivations = 0
-    
-    #predicted_classes = torch.tensor(predictions, dtype=torch.int64) #nikos code
-    predicted_classes = torch.tensor(predictions, dtype=torch.int32)
-    
-    idx = 0
-    for vTile, y in enumerate(y_indices):
-        for hTile, x in enumerate(x_indices):
-            try:
-                #if idx >= len(predicted_classes):
-                #   print("idx out of bounds=", idx, "/",len(predicted_classes) )
-                #   break  # or continue safely
-                predicted_class = int(predicted_classes[idx].item())
-                if predicted_class >= len(classes): 
-                    print("Predicted class for tile ",idx," is ",predicted_class," but we only have ",len(classes)," classes")
-                    raise ValueError("Predicted class for tile ",idx," is ",predicted_class," but we only have ",len(classes)," classes")
-                    #continue
-                if (predicted_class != cleanClassID):
-                    totalActivations += 1
-                    color = torch.tensor(class_colors[predicted_class], dtype=torch.uint8)
-                    
-                    # This is the activation point
-                    activationCoordinateX = int(x + half_tile_size)
-                    activationCoordinateY = int(y + half_tile_size)
-
-                    # Apply color to heatmap
-                    draw_cross(heatmap, (activationCoordinateY, activationCoordinateX), 10, color)
-
-                    # Keep Stats
-                    activations[predicted_class]+=1
-                    responses["points"].append((activationCoordinateX * 2,activationCoordinateY * 2)) #*2 to restore unpolarized dimensions
-                    responses["classes"].append(classes[int(predicted_class)])
-                    occupancy[vTile, hTile] = 0 #?
-            except Exception as e:
-                print("Could not access", x, y)
-                print("Failed:", repr(e))
-            finally:
-                idx += 1
-    
-    print(f"{totalActivations}/{allTiles} activations")
-    print("classes =", classes)
-    print("Results : ",activations)
-    return heatmap.cpu().numpy(), occupancy.cpu().numpy(), responses
-
 
 @torch.no_grad()
 def tile_and_cast_data_torch(image, tile_size=24, step=2):
@@ -581,157 +527,192 @@ def tile_and_cast_data_torch(image, tile_size=24, step=2):
 
     return tiles
 
+@torch.no_grad()
+def generate_heatmap(predictions, class_id_to_name, class_id_to_color, cleanClassID,
+                     rgba_image, tile_size=24, step=2):
+    """
+    Generate color-coded heatmap using integer class IDs only.
+    Matches tiling produced by tile_and_cast_data_torch.
+    """
+    original_image = torch.as_tensor(rgba_image, dtype=torch.uint8)
+    height, width, _ = original_image.shape
+
+    tilesH = (height - tile_size) // step
+    tilesW = (width - tile_size) // step
+    expected_tiles = (tilesH + 1) * (tilesW + 1)
+
+    if len(predictions) != expected_tiles:
+        print(f"⚠️ Warning: predictions={len(predictions)} tiles expected={expected_tiles}")
+
+    occupancy = torch.full((tilesH + 1, tilesW + 1), 255, dtype=torch.uint8)
+    responses = {"points": [], "classes": []}
+    heatmap = original_image[:, :, :3].clone()
+    activations = torch.zeros(len(class_id_to_name), dtype=torch.int32)
+
+    y_indices = torch.arange(0, height - tile_size + 1, step)
+    x_indices = torch.arange(0, width - tile_size + 1, step)
+
+    predicted_classes = torch.as_tensor(predictions, dtype=torch.int32)
+    totalActivations = 0
+    idx = 0
+    num_preds = len(predicted_classes)
+    half_tile_size = tile_size // 2
+
+    for vTile, y in enumerate(y_indices):
+        for hTile, x in enumerate(x_indices):
+            if idx >= num_preds:
+                break
+
+            predicted_class = int(predicted_classes[idx])
+
+            # Skip invalid IDs gracefully
+            if predicted_class < 0 or predicted_class >= len(class_id_to_name):
+                idx += 1
+                continue
+
+            if predicted_class != cleanClassID:
+                totalActivations += 1
+                color = class_id_to_color[predicted_class]
+
+                activationCoordinateX = int(x + half_tile_size)
+                activationCoordinateY = int(y + half_tile_size)
+
+                draw_cross(heatmap, (activationCoordinateY, activationCoordinateX), 10, color)
+
+                activations[predicted_class] += 1
+                responses["points"].append(
+                    (activationCoordinateX * 2, activationCoordinateY * 2)
+                )
+                responses["classes"].append(class_id_to_name[predicted_class])
+                occupancy[vTile, hTile] = 0
+
+            idx += 1
+
+        if idx >= num_preds:
+            break
+
+    print(f"{totalActivations}/{num_preds} activations")
+    print("Per-class activations:", activations.tolist())
+    return heatmap.cpu().numpy(), occupancy.cpu().numpy(), responses
+
 
 @torch.no_grad()
-def classify_tiles(model, rgba_image, tile_size=64, step=0, chunks=0, tryToSkip = False, majorityVote=True, thresholdMaxProbability=0.50, forceLowMaxProbToThisClass=None):
-    start      = time.time()
-    #dtype      = torch.float16
-    dtype      = torch.float32
-    #------------------------------------------------------------------------
-    # Extract tiles and cast data in one step
-    npTiles = tile_and_cast_data_torch(rgba_image, tile_size=tile_size, step=step).to(dtype).permute(0,3,1,2).contiguous().to('cuda')
-    #npTiles = tile_and_cast_data_cpu(rgba_image, tile_size=tile_size, step=step).to(dtype).permute(0,3,1,2).contiguous().to('cuda')
-    #npTiles = tileAndCastData(rgba_image, tile_size=tile_size, step=step).float().to('cuda')
-    #npTiles = torch.tensor(npTiles).float().permute(0,3,1,2).to('cuda')
-    seconds    = time.time() - start
-    hz    = 1 / (seconds+0.0001)
-    #print("Before NN @ %0.02f Hz"%hz)   
+def classify_tiles(model, rgba_image, tile_size=64, step=0,
+                   chunks=0, majorityVote=True,
+                   thresholdMaxProbability=0.50,
+                   forceLowMaxProbToThisClass=None):
+    """
+    Classify tiles efficiently, returning integer class IDs.
+    Matches exactly the number of tiles produced by tile_and_cast_data_torch.
+    """
+    start = time.time()
 
-    #print("classify_tiles -> Will need to evaluate ",npTiles.shape," tiles")
-    start      = time.time()    
-    #-------------------------------------- ----------------------------------
-        
-    channels = 4 #4 Polarizations  
-    if npTiles.shape[1:] != (channels, tile_size, tile_size):  # Sanity check on desired input size
-          raise ValueError(f"classify_tiles input size must be {channels}x{tile_size}x{tile_size}, got {npTiles.shape[1:]}")
+    # Extract tiles and prepare tensor (N, C, H, W)
+    npTiles = tile_and_cast_data_torch(rgba_image, tile_size=tile_size, step=step)
+    npTiles = npTiles.to(dtype=torch.float32).permute(0, 3, 1, 2).contiguous().to('cuda')
 
-    low_activations = 0
+    channels = 4
+    if npTiles.shape[1:] != (channels, tile_size, tile_size):
+        raise ValueError(f"Expected {channels}x{tile_size}x{tile_size}, got {npTiles.shape[1:]}")
+
     softmax = torch.nn.Softmax(dim=1)
-    # Predict the class probabilities for each tile
-    #predictions = model.predict(npTiles, batch_size=1024)
-    #import ipdb; ipdb.set_trace()
-    #Use batch size of 1024
-    #num_classes = 4
-    if (chunks==0):
-        with torch.no_grad(),torch.amp.autocast(device_type='cuda', dtype=dtype):
+    low_activations = 0
+
+    # Predict in one pass or in chunks
+    if chunks == 0:
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
             preds = model(npTiles)
-            #print("preds ",preds)
         probs = softmax(preds)
-        #print("probs ",probs)
         max_probs, predictions = torch.max(probs, dim=1)
-        #print("Max probs ",max_probs)
-        if (forceLowMaxProbToThisClass is not None) and (thresholdMaxProbability>0.0):
-            #predictions[max_probs < thresholdMaxProbability] = forceLowMaxProbToThisClass
-            #low_activations += 1
+        if forceLowMaxProbToThisClass is not None and thresholdMaxProbability > 0.0:
             mask = max_probs < thresholdMaxProbability
             low_activations += mask.sum().item()
             predictions[mask] = forceLowMaxProbToThisClass
-
-    
     else:
-        chunksB = npTiles.chunk(chunks)
-        predictionsList = list()
-        for chunk in chunksB:
-            #import ipdb; ipdb.set_trace()
-            predictionsList.append( model(chunk) )
-
-        preds = torch.cat(predictionsList)
-        #import ipdb; ipdb.set_trace()
+        preds_list = []
+        for chunk in npTiles.chunk(chunks):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
+                preds_list.append(model(chunk))
+        preds = torch.cat(preds_list)
         probs = softmax(preds)
         max_probs, predictions = torch.max(probs, dim=1)
-        #print("Max probs ",max_probs)
-        if (forceLowMaxProbToThisClass is not None) and (thresholdMaxProbability>0.0):
-            #predictions[max_probs < thresholdMaxProbability] = forceLowMaxProbToThisClass
-            #low_activations += 1
+        if forceLowMaxProbToThisClass is not None and thresholdMaxProbability > 0.0:
             mask = max_probs < thresholdMaxProbability
             low_activations += mask.sum().item()
             predictions[mask] = forceLowMaxProbToThisClass
-
-
-    seconds    = time.time() - start
-    hz    = 1 / (seconds+0.0001)
-    #print("Actual NN @ %0.02f Hz"%hz)   
 
     predictions = predictions.cpu().numpy()
-    
-    if (majorityVote):
-      original_image = torch.tensor(rgba_image, dtype=torch.uint8) #<- TODO improve
-      height, width, _ = original_image.shape                      #<- TODO We can get shape without cast
-      y_indices = torch.arange(0, height - tile_size, step)        #<- TODO We shouldn't get a list of indices just to do this calculation
-      x_indices = torch.arange(0, width  - tile_size, step)        #<- TODO We shouldn't get a list of indices just to do this calculation
-      tilesHorizontally = len(x_indices)
-      tilesVertically   = len(y_indices)
-      predictions = majority_vote_2d_pytorch(predictions, tilesHorizontally, tilesVertically, window_size=3)
-    #------------------------------------------------------------------------
+    print(f"Low-confidence tiles reassigned: {low_activations}")
 
+    # Spatial smoothing (optional)
+    if majorityVote:
+        h, w, _ = rgba_image.shape
+        tilesHorizontally = (w - tile_size) // step
+        tilesVertically   = (h - tile_size) // step
+        predictions = majority_vote_2d_pytorch(predictions, tilesHorizontally, tilesVertically, window_size=3)
 
-    predictions = predictions.flatten()
-    #------------------------------------------------------------------------
-    
-    #print("Predictions ",predictions.shape, " Low Activations (",thresholdMaxProbability,") on ",low_activations," tiles")
-    print("forceLowMaxProbToThisClass  ",forceLowMaxProbToThisClass, " Low Activations (",thresholdMaxProbability,") on ",low_activations," tiles")    
-    return predictions #,num_classes
-
-
-
-
+    print(f"classify_tiles done in {time.time() - start:.2f}s, got {len(predictions)} tiles")
+    return predictions.flatten()
 
 @torch.no_grad()
-def runSingle(image,model,device,classes,class_colors,tile_size,step, dumpTiles=False, majorityVote=True, maxProbabilityThreshold=0.50):
-    print("runSingle image : ",image.shape, " tile_size : ",tile_size,"x",tile_size, " classes : ",classes)
-    rgba_image = readPolarPNMToRGBALive(image) #readPolarPNMToRGBAResized(image_path,resize=0.5)
+def runSingle(image, model, device, classes, class_colors,
+              tile_size, step, dumpTiles=False,
+              majorityVote=True, maxProbabilityThreshold=0.50 , name="Model", log=True):
+    """
+    Full pipeline: read image, classify tiles, and generate heatmap.
+    Uses integer IDs internally for performance.
+    """
+    print(f"runSingle: image {image.shape}, tile={tile_size}, step={step}, classes={len(classes)}")
 
-    rgba_image = cv2.cvtColor(rgba_image, cv2.COLOR_RGBA2BGRA) #Undo opencv crazyness.. <---------------FLIP RGBA to BGRA
-    #rgba_image = rgba_image/255.0 #old code
+    # 1. Read & normalize image
+    rgba_image = readPolarPNMToRGBALive(image)
+    rgba_image = cv2.cvtColor(rgba_image, cv2.COLOR_RGBA2BGRA)
     rgba_image = (rgba_image.astype('float32') / 255.0)
-    rgba_image = torch.tensor(rgba_image).float().to(device, dtype=torch.float32)
+    rgba_image = torch.as_tensor(rgba_image, device=device, dtype=torch.float32)
 
-    #Dataset mean:  [[[[ 89.66365  99.0593  103.32124  94.00895]]]]
-    #Dataset std:  [[[[66.99435  72.73822  74.47066  71.135704]]]]
-    #data_mean = np.array([ 89.66365,  99.0593,  103.32124,  94.00895])
-    #data_std  = np.array([ 66.99435,  72.73822,  74.47066,  71.135704])
-    #rgba_image = (rgba_image - data_mean) / data_std
+    # 2. Identify "clean" class once
+    cleanClassID = next((i for i, c in enumerate(classes) if c.lower() in ("class_clean", "clean")), None)
 
-    classIDForCleanTiles = None
-    if (maxProbabilityThreshold>0.0):
-       try:
-         classIDForCleanTiles = classes.index('class_clean')
-       except ValueError:
-         classIDForCleanTiles = None
+    # 3. Perform inference
+    start = time.time()
 
+    predictions = classify_tiles(
+        model,
+        rgba_image,
+        tile_size=tile_size,
+        step=step,
+        majorityVote=majorityVote,
+        thresholdMaxProbability=maxProbabilityThreshold,
+        forceLowMaxProbToThisClass=cleanClassID,
+    )
+    print(bcolors.OKGREEN)
+    hz = 1/(time.time()-start+1e-4)
+    print("%s / step=%u / inference @ %0.2f Hz" % (name,step,hz))
+    print(bcolors.ENDC)
 
-    # Perform inference on the image tiles
-    start      = time.time()    
-    predictions = classify_tiles(model, rgba_image, tile_size=tile_size, step=step, majorityVote=majorityVote,  thresholdMaxProbability=maxProbabilityThreshold, forceLowMaxProbToThisClass=classIDForCleanTiles)
-    rgba_image  = rgba_image * 255.0
-    seconds    = time.time() - start
-    hz    = 1 / (seconds+0.0001)
-    print("NN @ %0.02f Hz"%hz)   
+    if (log):
+      log_performance("perf.csv", name, step, tile_size, majorityVote, maxProbabilityThreshold, len(predictions), hz)
+    
+    # 4. Restore image intensity for heatmap overlay
+    rgba_image *= 255.0
 
-    # Dump all tiles as PNG files
     if dumpTiles:
         dump_tiles_as_png(rgba_image, predictions, classes, tile_size, step)
-    
 
-    #minimums,maximums,stds,means = generate_predictionStatistics(predictions,num_classes)
-    #print("Minimums ",minimums)
-    #print("Maximums ",maximums)
-    #print("STDs ",stds)
-    #print("Means ",means)
+    # 5. Precompute lookup tables
+    class_id_to_name  = classes
+    class_id_to_color = [torch.tensor(c, dtype=torch.uint8) for c in class_colors]
 
-    #predictions = predictions.tolist()
-    #dumpListAsCSV(predictions,classes,"predictions.csv")
-    #list from numpy array
-
-    # Generate heatmap image
-    #start      = time.time()    
-    #------------------------------------------------------------------------
-    # Extract tiles and cast data in one step
-    heatmapRGBImage, occupancy, responses  = generate_heatmap(predictions, classes, class_colors, rgba_image, tile_size=tile_size, step=step)
-    #npTiles = torch.tensor(npTiles).float().permute(0,3,1,2).to('cuda')
-    #seconds    = time.time() - start
-    #hz    = 1 / (seconds+0.0001)
-    #print("Generate heatmap %0.02f Hz"%hz)   
+    # 6. Generate heatmap safely
+    heatmapRGBImage, occupancy, responses = generate_heatmap(
+        predictions,
+        class_id_to_name,
+        class_id_to_color,
+        cleanClassID,
+        rgba_image,
+        tile_size=tile_size,
+        step=step,
+    )
 
     return heatmapRGBImage, occupancy, responses
 
@@ -761,6 +742,7 @@ class ClassifierPnm:
             sys.exit(1)
         #--------------------------------------------------------------
         self.step = step
+        self.name = os.path.basename(model_path)
         self.model_path = model_path
         self.maxProbabilityThreshold = 0.0
         self.hz = 0.0
@@ -800,10 +782,11 @@ class ClassifierPnm:
         state_dict = checkpoint.get('state_dict', checkpoint)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
+        print(f"Optimizing {self.model_path}")
+        model.compile()
         print(f"Loaded {self.model_path}")
         print("Missing keys:", missing)
         print("Unexpected keys:", unexpected)
-
         model = model.to(self.device)
         model.eval()
         return model
@@ -825,6 +808,7 @@ class ClassifierPnm:
         """Unload previous model and reload a new model + config from given name."""
         model_path = os.path.join(directoryPath, f"{name}.pth")
         cfg_path   = os.path.join(directoryPath, f"{name}.json")
+        self.name  = os.path.basename(model_path)
 
         if not (os.path.exists(model_path) and os.path.exists(cfg_path)):
             print(f"Missing model or config for '{name}' in {directoryPath}")
@@ -839,39 +823,38 @@ class ClassifierPnm:
         except Exception as e:
             print("Failed reading config:", repr(e))
             return False
-
+        #--------------------------------------------------------------
+        self.base_channels = 32
+        if  'base_channels' in self.cfg['hparams']:
+          self.base_channels = self.cfg['hparams']['base_channels']
+        print("Base channels ", self.base_channels)
+        #--------------------------------------------------------------
+        self.final_dense_layer=512
+        if  'final_dense_layer' in self.cfg['hparams']:
+                  self.final_dense_layer = self.cfg['hparams']['final_dense_layer']
+        print("Final Dense Layer ", self.final_dense_layer)
+        #-----------------------------------------------------------------
         self.model_path = model_path
         print(f"Reloading model '{name}' from {directoryPath} ...")
         self.model = self.load_model()
         self.class_colors = getNDifferentColors(len(self.tile_classes))
         print(f"Reload complete: {name}")
         return True
-
-    """
-    def load_model_old(self):
-        # Load the trained model
-        #model = Classifier.load_from_checkpoint(self.model_path)
-
-        model = Classifier( 
-                              model=self.cfg['model'], 
-                              lr=0.1,
-                              num_classes     = len(self.classes),
-                              tile_size       = self.cfg['hparams']['tile_size'],
-                              load_checkpoint = self.model_path
-                           )
-
-        #model.model = Classifier.load_from_checkpoint(self.model_path)
-        model=model.to(self.device)
-        model=model.eval()
-        #model = model.half()
-        return model
-    """
     
     @torch.no_grad()
     def forward(self, image, majorityVote = False, legend=True):
         start      = time.time()    
    
-        heatmap, occupancy, responses = runSingle(image, self.model, self.device, self.classes, self.class_colors, self.tile_size, self.step, majorityVote=majorityVote,  maxProbabilityThreshold=self.maxProbabilityThreshold)
+        heatmap, occupancy, responses = runSingle(image, 
+                                                  self.model,
+                                                  self.device,
+                                                  self.classes,
+                                                  self.class_colors,
+                                                  self.tile_size,
+                                                  self.step,
+                                                  majorityVote=majorityVote,
+                                                  maxProbabilityThreshold=self.maxProbabilityThreshold,
+                                                  name=self.name)
 
         if legend:
             heatmap = self.add_legend(heatmap)
