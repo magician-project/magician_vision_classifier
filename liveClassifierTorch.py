@@ -717,6 +717,29 @@ def runSingle(image, model, device, classes, class_colors,
     return heatmapRGBImage, occupancy, responses
 
 
+
+def ensure_file(path):
+            import subprocess
+            if os.path.exists(path):
+                return True
+
+            filename = os.path.basename(path)
+            url = f"http://ammar.gr/magician/ckpts/{filename}"
+
+            print(f"File {path} not found. Downloading from {url} ...")
+
+            try:
+                # -q quiet, -O output file, --show-progress gives progress bar
+                result = subprocess.run(
+                    ["wget", "-q", "--show-progress", "-O", path, url],
+                    check=True
+                )
+                print(f"Downloaded {filename} → {path}")
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"Failed downloading {url}")
+                print("wget error:", e)
+                return False
 class ClassifierPnm:
     def __init__(self,
                  model_path='/app/src/python/classifier/resnet18.pth', 
@@ -724,6 +747,17 @@ class ClassifierPnm:
                  tile_classes=['class_neg', 'class_pos', 'class_clean','class_unknown'],
                  tile_size=64,
                  step=16):
+
+        # ------------------------------
+        # Ensure model + config exist
+        # ------------------------------
+        if not ensure_file(model_path):
+            print("Failed fetching ",model_path)
+            sys.exit(1)
+
+        if not ensure_file(cfg_path):
+            print("Failed fetching ",cfg_path)
+            sys.exit(1)
 
         if os.path.exists(cfg_path):
             try:
