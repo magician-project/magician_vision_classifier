@@ -527,6 +527,8 @@ def tile_and_cast_data_torch(image, tile_size=24, step=2):
 
     return tiles
 
+
+
 @torch.no_grad()
 def generate_heatmap(predictions, class_id_to_name, class_id_to_color, cleanClassID,
                      rgba_image, tile_size=24, step=2):
@@ -545,7 +547,7 @@ def generate_heatmap(predictions, class_id_to_name, class_id_to_color, cleanClas
         print(f"⚠️ Warning: predictions={len(predictions)} tiles expected={expected_tiles}")
 
     occupancy = torch.full((tilesH + 1, tilesW + 1), 255, dtype=torch.uint8)
-    responses = {"points": [], "classes": []}
+    responses = {"points": [], "classes": [], "classIDs": []}
     heatmap = original_image[:, :, :3].clone()
     activations = torch.zeros(len(class_id_to_name), dtype=torch.int32)
 
@@ -580,10 +582,9 @@ def generate_heatmap(predictions, class_id_to_name, class_id_to_color, cleanClas
                 draw_cross(heatmap, (activationCoordinateY, activationCoordinateX), 10, color)
 
                 activations[predicted_class] += 1
-                responses["points"].append(
-                    (activationCoordinateX * 2, activationCoordinateY * 2)
-                )
+                responses["points"].append( (activationCoordinateX * 2, activationCoordinateY * 2) )
                 responses["classes"].append(class_id_to_name[predicted_class])
+                responses["classIDs"].append(int(predicted_class))
                 occupancy[vTile, hTile] = 0
 
             idx += 1
@@ -595,6 +596,184 @@ def generate_heatmap(predictions, class_id_to_name, class_id_to_color, cleanClas
     print("Per-class activations:", activations.tolist())
     return heatmap.cpu().numpy(), occupancy.cpu().numpy(), responses
 
+
+@torch.no_grad()
+def process_predictions_erode(predictions, class_id_to_name, cleanClassID, rgba_image, tile_size=48, step=14, erosion_kernel=1, erosion_threshold=1):
+    """
+    erosion_kernel: radius in tiles for neighbor search
+    erosion_threshold: minimum number of neighbors required to keep a prediction
+    """
+
+    original_image   = torch.as_tensor(rgba_image, dtype=torch.uint8)
+    height, width, _ = original_image.shape
+
+    tilesH           = (height - tile_size) // step
+    tilesW           = (width - tile_size) // step
+    expected_tiles   = (tilesH + 1) * (tilesW + 1)
+
+    if len(predictions) != expected_tiles:
+        print(f"⚠️ Warning: predictions={len(predictions)} tiles expected={expected_tiles}")
+
+    occupancy = torch.full((tilesH + 1, tilesW + 1), 255, dtype=torch.uint8)
+    responses = {"points": [], "classes": [], "classIDs": []}
+    heatmap = original_image[:, :, :3].clone()
+    activations = torch.zeros(len(class_id_to_name), dtype=torch.int32)
+
+    y_indices = torch.arange(0, height - tile_size + 1, step)
+    x_indices = torch.arange(0, width - tile_size + 1, step)
+
+    predicted_classes = torch.as_tensor(predictions, dtype=torch.int32)
+    totalActivations = 0
+    idx = 0
+    num_preds = len(predicted_classes)
+    half_tile_size = tile_size // 2
+
+    # ---- FIRST PASS: collect raw detections ----
+    coord_map = []  # stores (vTile, hTile, predicted_class)
+    
+    for vTile, y in enumerate(y_indices):
+        for hTile, x in enumerate(x_indices):
+
+            if idx >= num_preds:
+                break
+
+            predicted_class = int(predicted_classes[idx])
+
+            # Skip invalid IDs gracefully
+            if 0 <= predicted_class < len(class_id_to_name):
+                if predicted_class != cleanClassID:
+                    coord_map.append((vTile, hTile, predicted_class))
+                    totalActivations += 1
+                    activations[predicted_class] += 1
+                    occupancy[vTile, hTile] = 0
+
+            idx += 1
+        if idx >= num_preds:
+            break
+
+    print(f"{totalActivations}/{num_preds} activations (before erosion)")
+
+    # ---- EROSION MASK CONSTRUCTION ----
+    eroded_mask = torch.zeros_like(occupancy, dtype=torch.uint8)  # 1 = keep
+
+    for (v, h, clsID) in coord_map:
+        # Count neighbors within erosion_kernel
+        count = 0
+        for dv in range(-erosion_kernel, erosion_kernel + 1):
+            for dh in range(-erosion_kernel, erosion_kernel + 1):
+                nv, nh = v + dv, h + dh
+                if 0 <= nv < tilesH + 1 and 0 <= nh < tilesW + 1:
+                    if occupancy[nv, nh] == 0:
+                        count += 1
+                        #print("Count ",count," ",nv,",",nh," erosion_kernel=",erosion_kernel," erosion_threshold=",erosion_threshold)
+
+        # If enough neighbors, keep it
+        if count >= erosion_threshold:
+            eroded_mask[v, h] = 1
+
+    # ---- SECOND PASS: rebuild filtered responses ----
+    filtered_responses = {"points": [], "classes": [], "classIDs": []}
+    filtered_activations = torch.zeros_like(activations)
+
+    for (vTile, hTile, predicted_class) in coord_map:
+        if eroded_mask[vTile, hTile] == 0:
+            continue  # removed by erosion
+
+        x = hTile * step
+        y = vTile * step
+        activationCoordinateX = int(x + half_tile_size)
+        activationCoordinateY = int(y + half_tile_size)
+
+        filtered_responses["points"].append((activationCoordinateX * 2, activationCoordinateY * 2))
+        filtered_responses["classes"].append(class_id_to_name[predicted_class])
+        filtered_responses["classIDs"].append(predicted_class)
+        filtered_activations[predicted_class] += 1
+
+    print(f"{filtered_activations.sum().item()}/{num_preds} activations (after erosion)")
+    print("Per-class activations:", filtered_activations.tolist())
+
+    return occupancy.cpu().numpy(), filtered_responses
+
+
+
+@torch.no_grad()
+def process_predictions(predictions, class_id_to_name, cleanClassID, rgba_image, tile_size=24, step=2):
+    original_image = torch.as_tensor(rgba_image, dtype=torch.uint8)
+    height, width, _ = original_image.shape
+
+    tilesH = (height - tile_size) // step
+    tilesW = (width - tile_size) // step
+    expected_tiles = (tilesH + 1) * (tilesW + 1)
+
+    if len(predictions) != expected_tiles:
+        print(f"⚠️ Warning: predictions={len(predictions)} tiles expected={expected_tiles}")
+
+    occupancy = torch.full((tilesH + 1, tilesW + 1), 255, dtype=torch.uint8)
+    responses = {"points": [], "classes": [], "classIDs": []}
+    heatmap = original_image[:, :, :3].clone()
+    activations = torch.zeros(len(class_id_to_name), dtype=torch.int32)
+
+    y_indices = torch.arange(0, height - tile_size + 1, step)
+    x_indices = torch.arange(0, width - tile_size + 1, step)
+
+    predicted_classes = torch.as_tensor(predictions, dtype=torch.int32)
+    totalActivations = 0
+    idx = 0
+    num_preds = len(predicted_classes)
+    half_tile_size = tile_size // 2
+
+    for vTile, y in enumerate(y_indices):
+        for hTile, x in enumerate(x_indices):
+            if idx >= num_preds:
+                break
+
+            predicted_class = int(predicted_classes[idx])
+
+            # Skip invalid IDs gracefully
+            if predicted_class < 0 or predicted_class >= len(class_id_to_name):
+                idx += 1
+                continue
+
+            if predicted_class != cleanClassID:
+                totalActivations += 1 
+                activationCoordinateX = int(x + half_tile_size)
+                activationCoordinateY = int(y + half_tile_size)
+                activations[predicted_class] += 1
+                responses["points"].append( (activationCoordinateX * 2, activationCoordinateY * 2) )
+                responses["classes"].append(class_id_to_name[predicted_class])
+                responses["classIDs"].append(int(predicted_class))
+                occupancy[vTile, hTile] = 0
+
+            idx += 1
+
+        if idx >= num_preds:
+            break
+
+    print(f"{totalActivations}/{num_preds} activations")
+    print("Per-class activations:", activations.tolist())
+    return occupancy.cpu().numpy(), responses
+
+#----------------------------------------------------------
+#----------------------------------------------------------
+def draw_heatmap(rgba_image, responses, class_id_to_color, size=10):
+    """
+    Draw crosses onto a heatmap using the responses returned by process_predictions().
+    """
+
+    # RGB only
+    original_image = torch.as_tensor(rgba_image, dtype=torch.uint8)
+    heatmap = original_image[:, :, :3].clone().cpu().numpy()
+
+    for (x, y), class_id in zip(responses["points"], responses["classIDs"]):
+
+        color = class_id_to_color[class_id]
+
+        # IMPORTANT: your original signature requires (Y, X)
+        draw_cross(heatmap, (y//2, x//2), size, color)
+
+    return heatmap
+#----------------------------------------------------------
+#----------------------------------------------------------
 
 @torch.no_grad()
 def classify_tiles(model, rgba_image, tile_size=64, step=0,
@@ -654,15 +833,29 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
     print(f"classify_tiles done in {time.time() - start:.2f}s, got {len(predictions)} tiles")
     return predictions.flatten()
 
+
+
 @torch.no_grad()
-def runSingle(image, model, device, classes, class_colors,
-              tile_size, step, dumpTiles=False,
-              majorityVote=True, maxProbabilityThreshold=0.50 , name="Model", log=True):
+def runSingle(image,
+              model,
+              device,
+              classes,
+              class_colors,
+              tile_size,
+              step,
+              dumpTiles=False,
+              majorityVote=True,
+              maxProbabilityThreshold=0.50,
+              erosion_kernel=0, 
+              erosion_threshold=0,
+              name="Model",
+              log=True,
+              draw=True):
     """
     Full pipeline: read image, classify tiles, and generate heatmap.
     Uses integer IDs internally for performance.
     """
-    print(f"runSingle: image {image.shape}, tile={tile_size}, step={step}, classes={len(classes)}")
+    print(f"runSingle: image {image.shape}, tile={tile_size}, step={step}, classes={len(classes)} erosion_kernel={erosion_kernel} erosion_threshold={erosion_threshold}")
 
     # 1. Read & normalize image
     rgba_image = readPolarPNMToRGBALive(image)
@@ -703,20 +896,43 @@ def runSingle(image, model, device, classes, class_colors,
     class_id_to_name  = classes
     class_id_to_color = [torch.tensor(c, dtype=torch.uint8) for c in class_colors]
 
+
+    if (erosion_kernel==0) or (erosion_threshold==0):
     # 6. Generate heatmap safely
-    heatmapRGBImage, occupancy, responses = generate_heatmap(
-        predictions,
-        class_id_to_name,
-        class_id_to_color,
-        cleanClassID,
-        rgba_image,
-        tile_size=tile_size,
-        step=step,
-    )
+       heatmapRGBImage, occupancy, responses = generate_heatmap(
+                                                                predictions,
+                                                                class_id_to_name,
+                                                                class_id_to_color,
+                                                                cleanClassID,
+                                                                rgba_image,
+                                                                tile_size=tile_size,
+                                                                step=step
+                                                               )
+    else:
+    # 6. Process predictions (no drawing)
+       occupancy, responses  = process_predictions_erode(
+                                                         predictions,
+                                                         class_id_to_name,
+                                                         cleanClassID,
+                                                         rgba_image,
+                                                         tile_size=tile_size,
+                                                         step=step,
+                                                         erosion_kernel=erosion_kernel, 
+                                                         erosion_threshold=erosion_threshold
+                                                        )
+
+    # 7. Draw heatmap only if needed
+       if (draw):
+          heatmapRGBImage = draw_heatmap(
+                                         rgba_image,
+                                         responses,
+                                         class_id_to_color
+                                        )
+       else:
+          original_image = torch.as_tensor(rgba_image, dtype=torch.uint8)
+          heatmap = original_image[:, :, :3].clone().cpu().numpy()
 
     return heatmapRGBImage, occupancy, responses
-
-
 
 def ensure_file(path):
             import subprocess
@@ -740,6 +956,9 @@ def ensure_file(path):
                 print(f"Failed downloading {url}")
                 print("wget error:", e)
                 return False
+
+
+
 class ClassifierPnm:
     def __init__(self,
                  model_path='/app/src/python/classifier/resnet18.pth', 
@@ -876,7 +1095,7 @@ class ClassifierPnm:
         return True
     
     @torch.no_grad()
-    def forward(self, image, majorityVote = False, legend=True):
+    def forward(self, image, majorityVote = False, legend=True, erosion_kernel=0, erosion_threshold=0):
         start      = time.time()    
    
         heatmap, occupancy, responses = runSingle(image, 
@@ -888,6 +1107,8 @@ class ClassifierPnm:
                                                   self.step,
                                                   majorityVote=majorityVote,
                                                   maxProbabilityThreshold=self.maxProbabilityThreshold,
+                                                  erosion_kernel=erosion_kernel, 
+                                                  erosion_threshold=erosion_threshold,
                                                   name=self.name)
 
         if legend:
