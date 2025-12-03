@@ -11,3 +11,4 @@ tensorflow
 matplotlib
 seaborn
 h5py
+numba
