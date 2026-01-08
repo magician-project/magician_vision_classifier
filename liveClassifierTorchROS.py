@@ -17,8 +17,8 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 #--------------------------------------------------------
-from trainClassifierTorch import Classifier
-from liveClassifierTorch import ClassifierPnm, runSingle
+from liveClassifierTorch import ClassifierPnm
+from EnsembleClassifier  import EnsembleClassifierPnm
 from SharedMemoryManager import SharedMemoryManager
 #--------------------------------------------------------
 import rclpy
@@ -163,10 +163,7 @@ def main():
     ros_thread = threading.Thread(target=rclpy.spin, args=(ros_node,), daemon=True)
     ros_thread.start()
 
-    # Initialize Neural Network
-    modelC = ClassifierPnm(model_path='last.pth', cfg_path='last.json')
-    model = modelC.model
-
+    # Initialize Neural Networks ( in both modes )
     SingleClassifier      = ClassifierPnm(model_path="../magician_vision_classifier/allclass_resnet18.pth",cfg_path="../magician_vision_classifier/allclass_resnet18.json")
     EnsembleClassifier    = EnsembleClassifierPnm(
                                                   initial_model_cfg = ("../magician_vision_classifier/binary_small_cnn.pth","../magician_vision_classifier/binary_small_cnn.json"),
@@ -177,13 +174,10 @@ def main():
                                                                             #("../magician_vision_classifier/allclass_efficientnet_v2_s.pth","../magician_vision_classifier/allclass_efficientnet_v2_s.json"), #<- This is the slowest to run
                                                                             ("../magician_vision_classifier/allclass_convnext_tiny.pth","../magician_vision_classifier/allclass_convnext_tiny.json")])
 
-
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model.to(device).eval()
-
+ 
     # Compile the model for inference
     torch.set_float32_matmul_precision('medium')
-    model = torch.compile(model)
+    tile_size = 0 #<- Invalid value to make sure it is observed
 
     # Initialize Shared Memory mechanism to retrieve polarization images
     # without overheads on the ROS message mechanism (that is needed for accurate robot motion control)
@@ -227,6 +221,7 @@ def main():
                 if (ros_node.two_stage_enabled()):
                   EnsembleClassifier.step                    = ros_node.get_step_size()
                   EnsembleClassifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
+                  tile_size = EnsembleClassifier.tile_size 
                   heatmap, occupancy, responses  = EnsembleClassifier.forward(
                                                                               frame, 
                                                                               majorityVote=majorityVotingConfiguration
@@ -236,6 +231,7 @@ def main():
                 else:
                   SingleClassifier.step                    = ros_node.get_step_size()
                   SingleClassifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
+                  tile_size = SingleClassifier.tile_size 
                   heatmap, occupancy, responses  = SingleClassifier.forward(
                                                                             frame,
                                                                             majorityVote=majorityVotingConfiguration,
@@ -262,8 +258,8 @@ def main():
                 ros_node.publish_detection(
                                            x=x,
                                            y=y,
-                                           w=modelC.tile_size,
-                                           h=modelC.tile_size,
+                                           w=tile_size,
+                                           h=tile_size,
                                            det_type=det_type,
                                            det_class=det_class,
                                            probability=confidence
