@@ -86,7 +86,8 @@ def tile_and_cast_selected_tiles_torch(image, selected_indices, tile_size=24, st
 # -------------------------------------------------------------------------------------
 # -------------------------------------------------------------------------------------
 @torch.no_grad()
-def classify_selected_tiles(model,
+def classify_selected_tiles(name,
+                            model,
                             rgba_image,
                             npTiles,
                             tile_size=64,
@@ -139,22 +140,25 @@ def classify_selected_tiles(model,
             predictions[mask] = forceLowMaxProbToThisClass
 
     predictions = predictions.cpu().numpy()
+    confidences = max_probs.cpu().numpy()
 
     print(f"Low-confidence tiles reassigned: {low_activations}")
-    print(f"classify_selected_tiles done in {time.time() - start:.2f}s, got {len(predictions)} selected tiles")
+    print(f"classify_selected_tiles ({name}) done in {time.time() - start:.2f}s, on {len(predictions)} selected tiles")
 
-    return predictions
+    return predictions, confidences
 # -------------------------------------------------------------------------------------
 # -------------------------------------------------------------------------------------
 @torch.no_grad()
-def majority_vote_final(predictions, tilesW, tilesH, window_size=3):
+def majority_vote_final(predictions, confidences, tilesW, tilesH, window_size=3):
     """
-    Apply 2D majority voting (spatial smoothing) to FINAL tile predictions.
+    Apply 2D majority voting (spatial smoothing) to FINAL tile predictions,
+    and propagate confidences for the winning class in each window.
 
     Parameters
     ----------
     predictions : 1D numpy or torch array of class IDs
         Should have length == tilesW * tilesH
+    confidences : 1D numpy or torch array of float confidences (same length)
     tilesW : int
         Number of tiles horizontally
     tilesH : int
@@ -164,51 +168,48 @@ def majority_vote_final(predictions, tilesW, tilesH, window_size=3):
 
     Returns
     -------
-    1D numpy array of smoothed predictions (same shape)
+    smoothed_predictions : 1D numpy array of smoothed predictions
+    smoothed_confidences : 1D numpy array of confidences aligned to smoothed predictions
     """
 
-    # Convert to tensor
-    if isinstance(predictions, np.ndarray):
-        preds = torch.from_numpy(predictions).long()
-    elif isinstance(predictions, torch.Tensor):
-        preds = predictions.long().cpu()
-    else:
-        preds = torch.tensor(predictions, dtype=torch.long)
+    # Convert to tensors
+    preds = torch.tensor(predictions, dtype=torch.long)    if not isinstance(predictions, torch.Tensor) else predictions.long()
+    confs = torch.tensor(confidences, dtype=torch.float32) if not isinstance(confidences, torch.Tensor) else confidences.float()
 
-    # Shape check
-    assert preds.numel() == tilesW * tilesH, (
-        f"majority_vote_final: got {preds.numel()} predictions "
-        f"but expected {tilesW * tilesH}"
-    )
+    expectedDimensionality = tilesW * tilesH 
+    assert preds.numel() == expectedDimensionality, str("predictions length mismatch, expected %u, encountered %u " % (expectedDimensionality,preds.numel()) )
+    assert confs.numel() == expectedDimensionality, str("confidences length mismatch, expected %u, encountered %u " % (expectedDimensionality,confs.numel()))
 
-    #print("majority_vote_final:")
-    #print("  preds shape:", preds.shape)
-    #print("  tilesH:", tilesH, "tilesW:", tilesW)
-    #print("  target:", tilesH * tilesW)
-    #print("  reshaped size:", tilesH, tilesW)
-
-    # Reshape into 2D grid
-    grid = preds.view(tilesH, tilesW)
+    # Reshape into 2D grids
+    grid_preds = preds.view(tilesH, tilesW)
+    grid_confs = confs.view(tilesH, tilesW)
 
     pad = window_size // 2
-    padded = torch.nn.functional.pad(grid, (pad, pad, pad, pad), mode='constant', value=-1 )    # -1 = Padding marker
+    padded_preds = torch.nn.functional.pad(grid_preds, (pad, pad, pad, pad), mode='constant', value=-1)
+    padded_confs = torch.nn.functional.pad(grid_confs, (pad, pad, pad, pad), mode='constant', value=0.0)
 
+    out_preds = grid_preds.clone()
+    out_confs = grid_confs.clone()
 
-    out = grid.clone()
-
-    # Sliding window majority vote
     for y in range(tilesH):
         for x in range(tilesW):
-            window = padded[y:y+window_size, x:x+window_size]
-            window_flat = window.flatten()
+            window_preds = padded_preds[y:y+window_size, x:x+window_size].flatten()
+            window_confs = padded_confs[y:y+window_size, x:x+window_size].flatten()
 
-            # Count frequencies
-            vals, counts = torch.unique(window_flat, return_counts=True)
+            # Majority vote
+            vals, counts = torch.unique(window_preds, return_counts=True)
             majority_class = vals[counts.argmax()]
 
-            out[y, x] = majority_class
+            out_preds[y, x] = majority_class
 
-    return out.flatten().numpy()
+            # Confidence: mean of confidences of tiles that match the majority class
+            mask = window_preds == majority_class
+            if mask.any():
+                out_confs[y, x] = window_confs[mask].mean()
+            else:
+                out_confs[y, x] = 0.0
+
+    return out_preds.flatten().numpy(), out_confs.flatten().numpy()
 
 # -------------------------------------------------------------------------------------
 # Async multi-model helpers
@@ -306,6 +307,7 @@ class EnsembleClassifierPnm:
                                        step=step,
                                       )
 
+        self.name = "EnsembleClassifier"
         # --- Load the ensemble classifiers ---
         self.classifiers = [
                              ClassifierPnm(model_path=mp, cfg_path=cp, tile_size=tile_size, step=step)
@@ -342,6 +344,90 @@ class EnsembleClassifierPnm:
         print(f"Initialized EnsembleClassifierPnm with 1 initial + {len(self.classifiers)} ensemble models")
         print("Clean class ID:", self.cleanClassID)
 
+
+
+
+
+    # -------------------------------------------------------------------------
+    @torch.no_grad()
+    def ensemble_vote_and_answer_for_all_tiles(self, num_models, global_number_of_tiles, all_predictions, all_confidences, non_clean_indices, cleanClassID, strict=True):
+        """
+        Perform ensemble voting on non-clean tiles and assign confidences.
+
+        Parameters
+        ----------
+        all_predictions : torch.Tensor [M, N] 
+            Predicted class IDs from M models for N tiles
+        all_confidences : torch.Tensor [M, N] 
+            Max probabilities from M models for N tiles
+        non_clean_indices : list[int] 
+            Indices of non-clean tiles in the global grid
+        cleanClassID : int 
+            ID of the clean class
+        strict : bool
+            If True, enforce strict majority vote to revert to clean class
+
+        Returns
+        -------
+        final_predictions : torch.Tensor, shape [total_tiles]
+        final_confidences : torch.Tensor, shape [total_tiles]
+        """
+        #
+        num_models_est, num_tiles = all_predictions.shape
+
+        #total_tiles = max(non_clean_indices.max().item() + 1, num_tiles) # ?
+        #print("all_predictions.shape ",all_predictions)
+        #print("Num_tiles ( from all_predictions ) ",num_tiles,"  / total_tiles ",total_tiles )
+        #print("Correct number of global tiles ",global_number_of_tiles)
+
+        total_tiles = global_number_of_tiles
+
+        assert num_models_est == num_models, str("num_models mismatch, expected %u, encountered %u " % (num_models,num_models_est) )
+    
+
+        # Initialize full-length predictions and confidences
+        final_predictions = torch.full((total_tiles,),  fill_value=cleanClassID, dtype=torch.int32, device=all_predictions.device)
+        final_confidences = torch.zeros((total_tiles,), dtype=torch.float32, device=all_predictions.device)
+
+        # Decide whether predictions are in local (selected) indexing or global
+        use_local_index = (num_tiles == len(non_clean_indices))
+        #use_local_index = True
+
+        if use_local_index:
+            for local_j, global_idx in enumerate(non_clean_indices):
+                votes = all_predictions[:, local_j].tolist()
+                confs = all_confidences[:, local_j]
+                clean_votes = votes.count(cleanClassID)
+
+                if strict and clean_votes > num_models / 2:
+                    voted_class = cleanClassID
+                    voted_conf  = confs[votes.index(cleanClassID)].item()
+                else:
+                    voted_class = max(set(votes), key=votes.count)
+                    voted_conf  = confs[[i for i, v in enumerate(votes) if v == voted_class][0]].item()
+
+                final_predictions[global_idx] = voted_class
+                final_confidences[global_idx] = voted_conf
+
+        else:
+            for global_idx in non_clean_indices:
+                votes = all_predictions[:, global_idx].tolist()
+                confs = all_confidences[:, global_idx]
+                clean_votes = votes.count(cleanClassID)
+
+                if strict and clean_votes > num_models / 2:
+                    voted_class = cleanClassID
+                    voted_conf  = confs[votes.index(cleanClassID)].item()
+                else:
+                    voted_class = max(set(votes), key=votes.count)
+                    voted_conf  = confs[[i for i, v in enumerate(votes) if v == voted_class][0]].item()
+
+                final_predictions[global_idx] = voted_class
+                final_confidences[global_idx] = voted_conf
+
+        return final_predictions, final_confidences
+
+
     # -------------------------------------------------------------------------
     @torch.no_grad()
     def forward(self, image, majorityVote=False, legend=True, strict=True, parallel=False, multimodel=True , debugExecuteSecondStage=False, log=True):
@@ -364,30 +450,35 @@ class EnsembleClassifierPnm:
         rgba_image = torch.as_tensor(rgba_image, device=self.device, dtype=torch.float32)
 
         # --- Step 2: Get predictions from first binary (clean/non-clean) model ---
-        base_preds = classify_tiles(
-                                    init_clf.model,
-                                    rgba_image,
-                                    tile_size=self.tile_size,
-                                    step=self.step,
-                                    majorityVote=majorityVote,
-                                    thresholdMaxProbability=self.maxProbabilityThreshold,
-                                    forceLowMaxProbToThisClass=self.firstCleanClassID,
-                                   )
+        base_preds, base_confidences = classify_tiles(
+                                                      init_clf.model,
+                                                      rgba_image,
+                                                      tile_size=self.tile_size,
+                                                      step=self.step,
+                                                      majorityVote=majorityVote,
+                                                      thresholdMaxProbability=self.maxProbabilityThreshold,
+                                                      forceLowMaxProbToThisClass=self.firstCleanClassID,
+                                                     )
         #base_preds is filled with 0 and 1 predictions, self.firstCleanClassID points to wether 0 or 1 is the clean class 
-        #dump_predictions_to_file(base_preds, "base_predictions.txt", header="Base ensemble-voted predictions")
+        #dump_predictions_to_file(base_preds, "base_predictions.txt", header="Base ensemble-voted predictions") #<= debug
 
-        base_preds = torch.tensor(base_preds, device=self.device, dtype=torch.int32)
+        #Base predictions and their confidences are now extracted
+        base_preds       = torch.tensor(base_preds, device=self.device, dtype=torch.int32)
+        base_confidences = torch.tensor(base_confidences, device=self.device, dtype=torch.float32)
+
 
         # --- Identify non-clean tiles ---
         non_clean_indices = (base_preds != self.firstCleanClassID).nonzero(as_tuple=True)[0]
         if len(non_clean_indices) == 0:
-            print("All tiles classified as clean — skipping ensemble voting.")
+            print("All tiles are clean — no ensemble voting needed!")
             final_predictions = base_preds
+            final_confidences = base_confidences
         else:
             print(f"{len(non_clean_indices)} non-clean tiles for ensemble voting")
 
+
             # --- Step 3: Ensemble inference ---
-            all_predictions = None
+            #First of all we need to cast the selected tiles to Torch, so that they are ready to be consumed
             if (debugExecuteSecondStage):
                 #Execute second stage regardless of first..
                 npTiles = tile_and_cast_data_torch(rgba_image, tile_size=self.tile_size, step=self.step)
@@ -397,40 +488,61 @@ class EnsembleClassifierPnm:
 
 
             #multimodel=False
+            all_predictions = None
+            preds_list = []
+            conf_list  = []
+
+
+            #===========================================================================================
+            #       The following is the same thing with 3 different optimization attempts..
+            #     Serial execution of the nets is the fallback especially on low VRAM machines
+            #===========================================================================================
             if multimodel:
                 print("Running ensemble via async CUDA streams")
                 outputs = run_models_async([clf.model for clf in self.classifiers], npTiles)
-                all_predictions = torch.stack([torch.argmax(o, dim=1) for o in outputs])
+                for o in outputs:
+                     probs = torch.nn.functional.softmax(o, dim=1)
+                     max_probs, predictions = torch.max(probs, dim=1)
+                     preds_list.append(predictions)
+                     conf_list.append(max_probs)
             elif parallel:
-                print("Running ensemble via CPU thread pool")
-                all_predictions = torch.stack(parallel_classify_tiles(self.classifiers, rgba_image, self.tile_size, self.step, majorityVote))
+            #===========================================================================================
+                print("Running ensemble via CPU thread pool ( This runs all tiles, not just selected btw ) ")
+                ensemble_results = parallel_classify_tiles(self.classifiers, rgba_image, self.tile_size, self.step, majorityVote)
+                for preds, confs in ensemble_results:
+                     preds_list.append(torch.tensor(preds, device=self.device))
+                     conf_list.append(torch.tensor(confs, device=self.device))
             else:
+            #===========================================================================================
                 print("Running ensemble serially")
-                preds_list = []
                 for clf in self.classifiers:
                     if (debugExecuteSecondStage):
-                       preds = classify_tiles(
-                                              clf.model,
-                                              rgba_image,
-                                              tile_size=self.tile_size,
-                                              step=self.step,
-                                              majorityVote=majorityVote,
-                                              thresholdMaxProbability=self.maxProbabilityThreshold,
-                                              forceLowMaxProbToThisClass=self.cleanClassID,
-                                             )
+                       preds, confs = classify_tiles(
+                                                     clf.model,
+                                                     rgba_image,
+                                                     tile_size=self.tile_size,
+                                                     step=self.step,
+                                                     majorityVote=majorityVote,
+                                                     thresholdMaxProbability=self.maxProbabilityThreshold,
+                                                     forceLowMaxProbToThisClass=self.cleanClassID,
+                                                    )
                     else:
-                       preds = classify_selected_tiles(
-                                                       clf.model,
-                                                       rgba_image,
-                                                       npTiles,
-                                                       tile_size=self.tile_size,
-                                                       step=self.step,
-                                                       thresholdMaxProbability=self.maxProbabilityThreshold,
-                                                       forceLowMaxProbToThisClass=self.cleanClassID
-                                                      )
+                       preds, confs = classify_selected_tiles(
+                                                              clf.name,
+                                                              clf.model,
+                                                              rgba_image,
+                                                              npTiles,
+                                                              tile_size=self.tile_size,
+                                                              step=self.step,
+                                                              thresholdMaxProbability=self.maxProbabilityThreshold,
+                                                              forceLowMaxProbToThisClass=self.cleanClassID
+                                                             )
                     #---------------------------------------------------------
                     preds_list.append(torch.tensor(preds, device=self.device))
-                all_predictions = torch.stack(preds_list)
+                    conf_list.append(torch.tensor(confs, device=self.device))
+            #===========================================================================================
+            all_predictions = torch.stack(preds_list)  
+            all_confidences = torch.stack(conf_list)      # [M, N]
 
 
         # --- Step 4: Voting among ensemble ---
@@ -440,46 +552,16 @@ class EnsembleClassifierPnm:
 
         # Start by assuming everything is CLEAN in the ensemble space
         final_predictions = torch.full_like(base_preds, fill_value=self.cleanClassID)
-        global_votes      = torch.full_like(base_preds, fill_value=self.cleanClassID)
+        final_confidences = base_confidences.clone()
 
-        # If there are any non-clean tiles, apply ensemble voting to them
+
+        #ensemble_vote_and_answer_for_all_tiles should answer for ALL tiles both selected (non-clean) and non-selected (clean) ones!
         if len(non_clean_indices) > 0:
-            num_models      = all_predictions.shape[0]
-            # If all_predictions only has entries for the selected tiles
-            use_local_index = (all_predictions.shape[1] == len(non_clean_indices))
-
-            if use_local_index:
-                print("Local Index (selected tiles only)")
-
-                for local_j, global_idx in enumerate(non_clean_indices):
-                    votes = all_predictions[:, local_j].tolist()
-                    clean_votes = votes.count(self.cleanClassID)
-
-                    if strict and clean_votes > num_models / 2:
-                        voted_class = self.cleanClassID
-                    else:
-                        voted_class = max(set(votes), key=votes.count)
-
-                    final_predictions[global_idx] = voted_class
-                    global_votes[global_idx]      = voted_class
-
-            else:
-                print("Global Index (full tile predictions)")
-
-                for global_idx in non_clean_indices:
-                    votes = all_predictions[:, global_idx].tolist()
-                    clean_votes = votes.count(self.cleanClassID)
-
-                    if strict and clean_votes > num_models / 2:
-                        voted_class = self.cleanClassID
-                    else:
-                        voted_class = max(set(votes), key=votes.count)
-
-                    final_predictions[global_idx] = voted_class
-                    global_votes[global_idx]      = voted_class
+                    final_predictions, final_confidences = self.ensemble_vote_and_answer_for_all_tiles(len(self.classifiers), final_predictions.numel(), all_predictions, all_confidences, non_clean_indices, self.cleanClassID, strict=strict)
 
         # Convert final predictions now that indexing is correct
         final_predictions = final_predictions.cpu().numpy()
+        final_confidences = final_confidences.cpu().numpy()
 
         if (majorityVote):
            # Compute tile grid dimensions
@@ -488,16 +570,17 @@ class EnsembleClassifierPnm:
            tilesH = (height - self.tile_size) // self.step 
 
            # Apply majority vote smoothing
-           final_predictions = majority_vote_final(final_predictions, tilesW, tilesH, window_size=3)
+           final_predictions, final_confidences = majority_vote_final(final_predictions, final_confidences, tilesW, tilesH, window_size=3)
 
         # final_predictions should now be mostly 'self.cleanClassID' (e.g. 7),
         # with other ensemble class IDs only on non-clean tiles.
         #dump_predictions_to_file(final_predictions, "final_predictions.txt",header="Final ensemble-voted predictions")
-        global_votes = global_votes.cpu().numpy()  # (optional debugging)
+        #global_votes = global_votes.cpu().numpy()  # (optional debugging)
 
         # --- Step 5: Generate heatmap using final voted results ---
         heatmap, occupancy, responses = generate_heatmap(
                                                          final_predictions,
+                                                         final_confidences,
                                                          self.classes,
                                                          self.class_id_to_color,
                                                          self.cleanClassID,
