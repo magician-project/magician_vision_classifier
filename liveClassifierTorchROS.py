@@ -167,6 +167,17 @@ def main():
     modelC = ClassifierPnm(model_path='last.pth', cfg_path='last.json')
     model = modelC.model
 
+    SingleClassifier      = ClassifierPnm(model_path="../magician_vision_classifier/allclass_resnet18.pth",cfg_path="../magician_vision_classifier/allclass_resnet18.json")
+    EnsembleClassifier    = EnsembleClassifierPnm(
+                                                  initial_model_cfg = ("../magician_vision_classifier/binary_small_cnn.pth","../magician_vision_classifier/binary_small_cnn.json"),
+                                                  model_cfg_list=[
+                                                                            ("../magician_vision_classifier/allclass_verysmall_cnn.pth","../magician_vision_classifier/allclass_verysmall_cnn.json"),
+                                                                            ("../magician_vision_classifier/allclass_resnet18.pth","../magician_vision_classifier/allclass_resnet18.json"),
+                                                                            ("../magician_vision_classifier/allclass_resnext50.pth","../magician_vision_classifier/allclass_resnext50.json"),
+                                                                            #("../magician_vision_classifier/allclass_efficientnet_v2_s.pth","../magician_vision_classifier/allclass_efficientnet_v2_s.json"), #<- This is the slowest to run
+                                                                            ("../magician_vision_classifier/allclass_convnext_tiny.pth","../magician_vision_classifier/allclass_convnext_tiny.json")])
+
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model.to(device).eval()
 
@@ -174,7 +185,8 @@ def main():
     torch.set_float32_matmul_precision('medium')
     model = torch.compile(model)
 
-    # Initialize Shared Memory mechanism
+    # Initialize Shared Memory mechanism to retrieve polarization images
+    # without overheads on the ROS message mechanism (that is needed for accurate robot motion control)
     stream_name = "stream1"
     smm = SharedMemoryManager( 
                               "./libSharedMemoryVideoBuffers.so",
@@ -183,6 +195,7 @@ def main():
                               connect=True
                              )
    
+    #Always use tile majority voting 
     majorityVotingConfiguration = True
 
     try:
@@ -209,16 +222,28 @@ def main():
             # -------------------------
             # Actually run the neural network
             # -------------------------
+            #===========================================================================================================
             with torch.inference_mode():
-                modelC.step                    = ros_node.get_step_size()
-                modelC.maxProbabilityThreshold = rosnode.get_max_probability_threshold()
-                heatmap, occupancy, responses  = modelC.forward(
-                                                                frame, 
-                                                                majorityVote=majorityVotingConfiguration
-                                                                parallel=ros_node.two_stage_enabled(),
-                                                                multimodel=ros_node.two_stage_enabled()
-                                                               )
+                if (ros_node.two_stage_enabled()):
+                  EnsembleClassifier.step                    = ros_node.get_step_size()
+                  EnsembleClassifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
+                  heatmap, occupancy, responses  = EnsembleClassifier.forward(
+                                                                              frame, 
+                                                                              majorityVote=majorityVotingConfiguration
+                                                                              parallel=ros_node.two_stage_enabled(),
+                                                                              multimodel=ros_node.two_stage_enabled()
+                                                                             )
+                else:
+                  SingleClassifier.step                    = ros_node.get_step_size()
+                  SingleClassifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
+                  heatmap, occupancy, responses  = SingleClassifier.forward(
+                                                                            frame,
+                                                                            majorityVote=majorityVotingConfiguration,
+                                                                            erosion_kernel=0,
+                                                                            erosion_threshold=0
+                                                                           )
                 #print("Responses:", responses)
+            #===========================================================================================================
             
             # -------------------------
             # Publish detections
