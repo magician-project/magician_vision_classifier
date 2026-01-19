@@ -126,7 +126,7 @@ class DefectPublisher(Node):
         msg.w           = int(w)
         msg.h           = int(h)
         msg.type        = det_type
-        msg.class_      = det_class  # 'class' is reserved in Python
+        msg.class_name  = det_class  # 'class' is reserved in Python
         msg.probability = float(probability)
         self.publisher_.publish(msg)
         self.get_logger().info(f"Published detection: ({x},{y},{w},{h}) {det_type}:{det_class} p={probability:.2f}")
