@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import time
 
-from evaluate import generate_predictionStatistics, generate_colors, generate_heatmap, classify_tiles, load_classes_json, load_keras_model, checkIfPathIsDirectory, printLabels, castData
+#from evaluate import generate_predictionStatistics, generate_colors, generate_heatmap, classify_tiles, load_classes_json, load_keras_model, checkIfPathIsDirectory, printLabels, castData
 
 def convertPolarCVMATToRGBA(image):
     if image is None:

@@ -315,7 +315,9 @@ class Classifier(pl.LightningModule):
                       penalize_false_clean=0.0,
                       base_channels=32,
                       final_dense_layer=512,
-                      clean_class=0
+                      clean_class=0,
+                      noise_std=0.0, 
+                      noise_clip=None 
                  ):
         super(Classifier, self).__init__()
         #-----------------------------------------
@@ -333,6 +335,8 @@ class Classifier(pl.LightningModule):
         self.clean_class  = clean_class  
         self.penalize_false_clean = penalize_false_clean
         #-----------------------------------------
+        self.noise_std  = noise_std
+        self.noise_clip = noise_clip
 
         #RESNEXT
         if self.type == 'resnext50':
@@ -387,6 +391,15 @@ class Classifier(pl.LightningModule):
         self.auroc     = AUROC(task='MULTICLASS',     num_classes=num_classes)
         #self.confusion_matrix = ConfusionMatrix(task="multiclass",num_classes=num_classes)
 
+    def add_input_noise(self, x):
+        if self.training and self.noise_std > 0.0:
+            noise = torch.randn_like(x) * self.noise_std
+            if self.noise_clip is not None:
+                noise = torch.clamp(noise, -self.noise_clip, self.noise_clip)
+            x = x + noise
+        return x
+
+
     def forward(self, x):
         #x = self.val_transformations(image=x)['image']
         #Normalize with mean and std
@@ -410,6 +423,8 @@ class Classifier(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch
+
+        x = self.add_input_noise(x)  
 
         if (self.AoLP or self.DoLP):
            stokes = self.calculate_stokes(x)
@@ -630,7 +645,17 @@ if __name__ == "__main__":
     if "name" in config_json:
              model_name = "%s_%s" % (config_json['name'],config_json['model'])
     #-----------------------------------------------------------------
-            
+    noise_std = 0.0        
+    noise_clip = None
+    if  'noise_std' in config_json['hparams']:
+          noise_std = config_json['hparams']['noise_std']
+    if  'noise_clip' in config_json['hparams']:
+          noise_clip = config_json['hparams']['noise_clip']
+    print("Simulated Noise STD ",noise_std,"/ CLIP ",noise_clip)
+    #-----------------------------------------------------------------
+
+
+
     #Let's Go..
     if torch.cuda.is_available():
         device = 'cuda'
@@ -727,7 +752,9 @@ if __name__ == "__main__":
                             penalize_false_clean=penalize_false_clean,
                             base_channels=base_channels,
                             final_dense_layer=final_dense_layer,
-                            clean_class=cleanClassID)
+                            clean_class=cleanClassID,
+                            noise_std=noise_std,
+                            noise_clip=noise_clip)
     print(f"Learning rate: {lr}")
     
     model_type = classifier.type
@@ -747,7 +774,7 @@ if __name__ == "__main__":
                          accelerator=config_json['accelerator'],
                          devices=config_json['devices'],
                          gradient_clip_val=gradient_clip_val,
-                         deterministic=True,
+                         deterministic= (noise_std==0.0), #<- When there is noise switch to non deterministic to speed up training 
                        )
 
     #Train and log to console
