@@ -309,7 +309,7 @@ class DefectPublisher(Node):
         msg.w = int(w)
         msg.h = int(h)
         msg.type = det_type
-        msg.class_ = det_class  # 'class' is reserved in Python
+        msg.class_name = det_class  # 'class' is reserved in Python
         msg.probability = float(probability)
         self.publisher_.publish(msg)
 
@@ -343,23 +343,26 @@ def main():
     ros_thread = threading.Thread(target=rclpy.spin, args=(ros_node,), daemon=True)
     ros_thread.start()
 
+    #PATH="./magician_vision_classifier"
+    PATH="."
+
     # Initialize Neural Networks (both modes)
     SingleClassifier = ClassifierPnm(
-        model_path="./magician_vision_classifier/allclass_resnet18.pth",
-        cfg_path="./magician_vision_classifier/allclass_resnet18.json",
+        model_path="%s/allclass_resnet18.pth" % PATH,
+        cfg_path="%s/allclass_resnet18.json" % PATH,
     )
 
     EnsembleClassifier = EnsembleClassifierPnm(
         initial_model_cfg=(
-            "./magician_vision_classifier/binary_small_cnn.pth",
-            "./magician_vision_classifier/binary_small_cnn.json",
+            "%s/binary_small_cnn.pth" % PATH,
+            "%s/binary_small_cnn.json" % PATH,
         ),
         model_cfg_list=[
-            ("./magician_vision_classifier/allclass_verysmall_cnn.pth", "./magician_vision_classifier/allclass_verysmall_cnn.json"),
-            ("./magician_vision_classifier/allclass_resnet18.pth", "./magician_vision_classifier/allclass_resnet18.json"),
-            ("./magician_vision_classifier/allclass_resnext50.pth", "./magician_vision_classifier/allclass_resnext50.json"),
-            # ("./magician_vision_classifier/allclass_efficientnet_v2_s.pth", "./magician_vision_classifier/allclass_efficientnet_v2_s.json"),  # slowest
-            ("./magician_vision_classifier/allclass_convnext_tiny.pth", "./magician_vision_classifier/allclass_convnext_tiny.json"),
+            ("%s/allclass_verysmall_cnn.pth"% PATH, "%s/allclass_verysmall_cnn.json"% PATH),
+            ("%s/allclass_resnet18.pth"% PATH, "%s/allclass_resnet18.json"% PATH),
+            ("%s/allclass_resnext50.pth"% PATH, "%s/allclass_resnext50.json"% PATH),
+            # ("%s/allclass_efficientnet_v2_s.pth"% PATH, "%s/allclass_efficientnet_v2_s.json"% PATH),  # slowest
+            ("%s/allclass_convnext_tiny.pth"% PATH, "%s/allclass_convnext_tiny.json"% PATH),
         ],
     )
 
