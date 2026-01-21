@@ -20,7 +20,7 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 from trainClassifierTorch import Classifier
-from numba import njit #Test
+#from numba import njit #Test
 from readData import readPolarPNMToRGBALive#,readPolarPNMToRGBAResized
 from SharedMemoryManager import SharedMemoryManager
 from torch.nn import functional as F
@@ -56,6 +56,9 @@ def load_classes_json(filename):
 #--------------------------------------------------------------------------
 def checkIfPathIsDirectory(filename):
     return os.path.isdir(filename) 
+#--------------------------------------------------------------------------
+def checkIfFileExists(filename):
+    return os.path.isfile(filename)
 #--------------------------------------------------------------------------
 class bcolors:
     HEADER = '\033[95m'
@@ -1262,6 +1265,16 @@ if __name__ == "__main__":
     #Set the model to inference mode
     torch.set_float32_matmul_precision('medium') 
 
+
+    if checkIfFileExists("libSharedMemoryVideoBuffers.so"):
+            print("Found a shared memory video buffer library..!")
+    else:
+            print("Bootstrapping a new shared memory video buffer library")
+            #os.system("ln -s %s/libSharedMemoryVideoBuffers.so" % classifier_relative_directory)
+            os.system("git clone https://github.com/AmmarkoV/SharedMemoryVideoBuffers")
+            os.system("cd SharedMemoryVideoBuffers && make && cd ..")
+            os.system("ln -s SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so" )
+            os.system("SharedMemoryVideoBuffers/server --nokb&")
     
     streamName = "stream1"
     smm = SharedMemoryManager("./libSharedMemoryVideoBuffers.so", 

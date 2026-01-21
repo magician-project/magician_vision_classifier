@@ -27,15 +27,26 @@ from SharedMemoryManager import SharedMemoryManager
 import rclpy
 from rclpy.node import Node
 
+#To make a venv with ROS plus the needed pytorch stuff
+#sudo apt install ros-rolling-example-interfaces
+#source source /opt/ros/rolling/setup.bash
+#python3 -m venv venv --system-site-packages
+#source venv/bin/activate
+#python3 -m pip install -r requirements.txt 
+#python3 -m pip install empy lark
+
 from std_srvs.srv import SetBool
-from example_interfaces.srv import SetInt64
-from example_interfaces.srv import SetFloat64
+#from example_interfaces.srv import SetInt64
+#from example_interfaces.srv import SetFloat64
+from magician_vision_classifier.srv import SetInt64
+from magician_vision_classifier.srv import SetFloat64
+
 
 from std_msgs.msg import Float32
 from geometry_msgs.msg import Pose
 
-from magician_classifier.msg import Detection      # Custom ROS message
-from magician_classifier.msg import DetectionM     # Custom ROS message (uint8 severity, geometry_msgs/Pose location)
+from magician_vision_classifier.msg import Detection      # Custom ROS message
+from magician_vision_classifier.msg import DetectionM     # Custom ROS message (uint8 severity, geometry_msgs/Pose location)
 
 # ========================================================
 # Laser fusion globals (project-specific / fixed hardware)
