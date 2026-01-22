@@ -139,7 +139,7 @@ class DefectPublisher(Node):
     """ROS2 node that publishes Detection (+ optional DetectionM) and exposes runtime tuning services."""
 
     def __init__(self):
-        super().__init__("magician_vision_classifier_publisher")
+        super().__init__("magician_vision_classifier")
 
         # Publishers
         self.publisher_ = self.create_publisher(Detection, "detections", 10)
@@ -173,24 +173,24 @@ class DefectPublisher(Node):
         # ------------------------------------------------
         # Services (existing)
         # ------------------------------------------------
-        self.create_service(SetBool, "set_visualization", self._set_visualization_cb)
-        self.create_service(SetBool, "pause", self._pause_inference_cb)
-        self.create_service(SetBool, "set_two_stage", self._set_two_stage_cb)
+        self.create_service(SetBool, "magician_vision_classifier/set_visualization", self._set_visualization_cb)
+        self.create_service(SetBool, "magician_vision_classifier/pause", self._pause_inference_cb)
+        self.create_service(SetBool, "magician_vision_classifier/set_two_stage", self._set_two_stage_cb)
 
         # ------------------------------------------------
         # Services (NEW): runtime tuning
         # ------------------------------------------------
-        self.create_service(SetFloat64, "set_fps", self._set_fps_cb)
-        self.create_service(SetInt64, "set_step", self._set_step_cb)
-        self.create_service(SetFloat64, "set_threshold", self._set_threshold_cb)
+        self.create_service(SetFloat64, "magician_vision_classifier/set_fps", self._set_fps_cb)
+        self.create_service(SetInt64,   "magician_vision_classifier/set_step", self._set_step_cb)
+        self.create_service(SetFloat64, "magician_vision_classifier/set_threshold", self._set_threshold_cb)
 
         self.get_logger().info("Services ready:")
-        self.get_logger().info("  /set_visualization (SetBool)")
-        self.get_logger().info("  /pause (SetBool)")
-        self.get_logger().info("  /set_two_stage (SetBool)")
-        self.get_logger().info("  /set_fps (SetFloat64)")
-        self.get_logger().info("  /set_step (SetInt64)")
-        self.get_logger().info("  /set_threshold (SetFloat64)")
+        self.get_logger().info("  magician_vision_classifier/set_visualization (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/pause (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/set_two_stage (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/set_fps (SetFloat64)")
+        self.get_logger().info("  magician_vision_classifier/set_step (SetInt64)")
+        self.get_logger().info("  magician_vision_classifier/set_threshold (SetFloat64)")
 
         if USE_LASERS and self.publisher_m is not None:
             self.get_logger().info(f"Laser fusion ENABLED: topics={LASER_TOPICS} xy={LASER_XY_PIXELS} p={LASER_IDW_POWER}")

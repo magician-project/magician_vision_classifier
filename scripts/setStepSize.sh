@@ -8,6 +8,6 @@ cd "$DIR"
 #Let's load a sane virtual environment
 source install/setup.bash 
 
-ros2 service call /magician_vision_classifier/set_visualization std_srvs/srv/SetBool "{data: false}"
+ros2 service call /magician_vision_classifier/set_step magician_vision_classifier/srv/SetInt64 "{data: $@}"
 
 exit 0
