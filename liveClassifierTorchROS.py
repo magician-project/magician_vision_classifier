@@ -73,6 +73,27 @@ LASER_IDW_POWER = 2.0  # IDW interpolation power
 # ========================================================
 # Helpers
 # ========================================================
+
+def resize_to_fit_screen(img, max_w=1280, max_h=720, only_shrink=True):
+    """
+    Resize image to fit within (max_w, max_h) while preserving aspect ratio.
+    - only_shrink=True: don't upscale small images.
+    Returns (resized_img, scale).
+    """
+    h, w = img.shape[:2]
+    scale = min(max_w / float(w), max_h / float(h))
+
+    if only_shrink and scale >= 1.0:
+        return img, 1.0
+
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    return cv2.resize(img, (new_w, new_h), interpolation=interp), scale
+
+
+
 def filterType(det_type: str):
     """
     det_type might be 'class_NegativeDentClassB'
@@ -457,7 +478,8 @@ def main():
 
             # Visualization
             if ros_node.visualization_enabled():
-                cv2.imshow("Classifier Output", heatmap)
+                heatmapForAWindow,scale = resize_to_fit_screen(heatmap) 
+                cv2.imshow("Classifier Output",heatmapForAWindow)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
 
