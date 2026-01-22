@@ -610,7 +610,11 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
                 responses["classes"].append(class_id_to_name[predicted_class])
                 responses["classIDs"].append(int(predicted_class))
                 responses["confidences"].append(confidence)
-                occupancy[vTile, hTile] = 0
+                try:
+                  occupancy[vTile, hTile] = 0
+                except Exception as e:
+                  print("Failed setting occupancy:", repr(e))
+            
 
             idx += 1
 
