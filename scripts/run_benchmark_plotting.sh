@@ -6,6 +6,31 @@ if [[ $# -lt 1 ]]; then
   exit 1
 fi
 
+
+
+#-------------------------------------------------------------------
+#Simple dependency checker that will apt-get stuff if something is missing
+SYSTEM_DEPENDENCIES="gnuplot awk"
+
+for REQUIRED_PKG in $SYSTEM_DEPENDENCIES
+do
+PKG_OK=$(dpkg-query -W --showformat='${Status}\n' $REQUIRED_PKG|grep "install ok installed")
+echo "Checking for $REQUIRED_PKG: $PKG_OK"
+if [ "" = "$PKG_OK" ]; then
+
+  echo "No $REQUIRED_PKG. Setting up $REQUIRED_PKG."
+
+  #If this is uncommented then only packages that are missing will get prompted..
+  #sudo apt-get --yes install $REQUIRED_PKG
+
+  #if this is uncommented then if one package is missing then all missing packages are immediately installed..
+  sudo apt-get install $SYSTEM_DEPENDENCIES  
+  break
+fi
+done
+#-------------------------------------------------------------------
+
+
 command -v gnuplot >/dev/null 2>&1 || { echo "Error: gnuplot not found"; exit 1; }
 
 csv_files=()
