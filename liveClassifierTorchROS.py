@@ -369,13 +369,14 @@ class DefectPublisher(Node):
     # -------------------------
     # Publishers
     # -------------------------
-    def publish_detection(self, x, y, w, h, det_type, det_class, probability):
+    def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z = 0.0):
         msg = Detection()
-        msg.x = int(x)
-        msg.y = int(y)
-        msg.w = int(w)
-        msg.h = int(h)
-        msg.type = det_type
+        msg.x     = int(x)
+        msg.y     = int(y)
+        msg.w     = int(w)
+        msg.h     = int(h)
+        msg.depth = float(depth_z)
+        msg.type  = det_type
         msg.class_name = det_class  # 'class' is reserved in Python
         msg.probability = float(probability)
         self.publisher_.publish(msg)
@@ -491,25 +492,16 @@ def main():
                     )
 
             # Publish detections
-            points = responses.get("points", [])
-            classes = responses.get("classes", [])
+            points      = responses.get("points",      [])
+            classes     = responses.get("classes",     [])
             confidences = responses.get("confidences", [])
 
             for (x, y), description, confidence in zip(points, classes, confidences):
                 det_type, det_class = filterType(description)
 
-                # Existing 2D detection
-                ros_node.publish_detection(
-                    x=x,
-                    y=y,
-                    w=tile_size,
-                    h=tile_size,
-                    det_type=det_type,
-                    det_class=det_class,
-                    probability=confidence,
-                )
 
-                # Optional DetectionM with interpolated depth
+                z = 0.0
+                # DetectionM with interpolated depth
                 if USE_LASERS:
                     cx = float(x) + 0.5 * float(tile_size)
                     cy = float(y) + 0.5 * float(tile_size)
@@ -522,6 +514,19 @@ def main():
 
                     severity = class_to_severity(det_class)
                     ros_node.publish_detection_m(cx, cy, severity, z)
+
+
+                # Existing 2D detection
+                ros_node.publish_detection(
+                    x=x,
+                    y=y,
+                    w=tile_size,
+                    h=tile_size,
+                    det_type=det_type,
+                    det_class=det_class,
+                    probability=confidence,
+                    depth = z
+                )
 
             # Visualization
             if ros_node.visualization_enabled():
@@ -546,7 +551,6 @@ def main():
         rclpy.shutdown()
         cv2.destroyAllWindows()
         print("Shutdown complete.")
-
 
 if __name__ == "__main__":
     main()
