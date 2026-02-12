@@ -36,6 +36,9 @@ from rclpy.node import Node
 #python3 -m pip install empy lark
 
 from std_srvs.srv import SetBool
+from std_srvs.srv import Trigger
+from datetime import datetime
+
 #from example_interfaces.srv import SetInt64
 #from example_interfaces.srv import SetFloat64
 from magician_vision_classifier.srv import SetInt64
@@ -169,6 +172,14 @@ class DefectPublisher(Node):
         if USE_LASERS:
             self.publisher_m = self.create_publisher(DetectionM, "detections_m", 10)
 
+
+        # Last received frame (for saving)
+        self._last_frame = None
+
+        # Where to store images
+        self._output_path = "./data"
+        os.makedirs(self._output_path, exist_ok=True)
+
         # Internal execution state
         self._visualization_enabled = False
         self._inference_paused = False
@@ -194,17 +205,18 @@ class DefectPublisher(Node):
         # ------------------------------------------------
         # Services (existing)
         # ------------------------------------------------
-        self.create_service(SetBool, "magician_vision_classifier/set_visualization", self._set_visualization_cb)
-        self.create_service(SetBool, "magician_vision_classifier/pause", self._pause_inference_cb)
-        self.create_service(SetBool, "magician_vision_classifier/set_two_stage", self._set_two_stage_cb)
+        self.create_service(SetBool,    "magician_vision_classifier/set_visualization", self._set_visualization_cb)
+        self.create_service(SetBool,    "magician_vision_classifier/pause", self._pause_inference_cb)
+        self.create_service(SetBool,    "magician_vision_classifier/set_two_stage", self._set_two_stage_cb)
+        self.create_service(SetFloat64, "magician_vision_classifier/set_fps", self._set_fps_cb)
+        self.create_service(SetInt64,   "magician_vision_classifier/set_step", self._set_step_cb)
+        self.create_service(SetFloat64, "magician_vision_classifier/set_threshold", self._set_threshold_cb)
+        self.create_service(Trigger,    "magician_vision_classifier/remember_defect", self._remember_defect_cb)
+        self.create_service(Trigger,    "magician_vision_classifier/remember_clean", self._remember_clean_cb)
 
         # ------------------------------------------------
         # Services (NEW): runtime tuning
         # ------------------------------------------------
-        self.create_service(SetFloat64, "magician_vision_classifier/set_fps", self._set_fps_cb)
-        self.create_service(SetInt64,   "magician_vision_classifier/set_step", self._set_step_cb)
-        self.create_service(SetFloat64, "magician_vision_classifier/set_threshold", self._set_threshold_cb)
-
         self.get_logger().info("Services ready:")
         self.get_logger().info("  magician_vision_classifier/set_visualization (SetBool)")
         self.get_logger().info("  magician_vision_classifier/pause (SetBool)")
@@ -212,6 +224,9 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/set_fps (SetFloat64)")
         self.get_logger().info("  magician_vision_classifier/set_step (SetInt64)")
         self.get_logger().info("  magician_vision_classifier/set_threshold (SetFloat64)")
+        self.get_logger().info("  magician_vision_classifier/remember_defect (Trigger)")
+        self.get_logger().info("  magician_vision_classifier/remember_clean (Trigger)")
+
 
         if USE_LASERS and self.publisher_m is not None:
             self.get_logger().info(f"Laser fusion ENABLED: topics={LASER_TOPICS} xy={LASER_XY_PIXELS} p={LASER_IDW_POWER}")
@@ -233,7 +248,7 @@ class DefectPublisher(Node):
         self.create_subscription(Float32, LASER_TOPICS[2], make_cb(2), 10)
 
     # -------------------------
-    # Service callbacks (existing)
+    # Service callbacks  
     # -------------------------
     def _set_visualization_cb(self, request, response):
         with self._lock:
@@ -258,10 +273,7 @@ class DefectPublisher(Node):
         response.message = ("Two-stage execution ENABLED" if request.data else "Two-stage execution DISABLED")
         self.get_logger().info(response.message)
         return response
-
-    # -------------------------
-    # Service callbacks (NEW): runtime tuning
-    # -------------------------
+ 
     def _set_fps_cb(self, request, response):
         fps = float(request.data)
         with self._lock:
@@ -287,6 +299,40 @@ class DefectPublisher(Node):
         response.success = True
         response.message = f"Max probability threshold set to {self._threshold}"
         self.get_logger().info(response.message)
+        return response
+
+    def _save_current_frame(self, prefix: str):
+        if self._last_frame is None:
+                return False, "No frame available to save."
+
+        now = datetime.now()
+        filename = ( 
+                    f"{prefix}_"
+                    f"{now.year:04d}_{now.month:02d}_{now.day:02d}_"
+                    f"{now.hour:02d}_{now.minute:02d}_{now.second:02d}_"
+                    f"{int(now.microsecond/1000):03d}.png"
+                   )
+
+        full_path = os.path.join(self._output_path, filename)
+
+        try:
+            cv2.imwrite(full_path, self._last_frame)
+            return True, f"Saved: {full_path}"
+        except Exception as e:
+            return False, str(e)
+
+    def _remember_defect_cb(self, request, response):
+        success, msg = self._save_current_frame("defect")
+        response.success = success
+        response.message = msg
+        self.get_logger().info(msg)
+        return response
+
+    def _remember_clean_cb(self, request, response):
+        success, msg = self._save_current_frame("clean")
+        response.success = success
+        response.message = msg
+        self.get_logger().info(msg)
         return response
 
     # -------------------------
@@ -406,6 +452,7 @@ def main():
             loop_start = time.perf_counter()
 
             frame = smm.read_from_shared_memory()
+            ros_node._last_frame = frame.copy()
 
             # Get image to work on
             if frame is None or smm.frame_size == 0:
