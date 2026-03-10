@@ -311,13 +311,16 @@ class Classifier(pl.LightningModule):
                       AoLP=False,
                       DoLP=False,
                       Unpolarized=False,
+                      MaxPolarization=False,
+                      MinPolarization=False,
+                      RangePolarization=False,
                       load_checkpoint=None,
                       penalize_false_clean=0.0,
                       base_channels=32,
                       final_dense_layer=512,
                       clean_class=0,
-                      noise_std=0.0, 
-                      noise_clip=None 
+                      noise_std=0.0,
+                      noise_clip=None
                  ):
         super(Classifier, self).__init__()
         #-----------------------------------------
@@ -329,67 +332,82 @@ class Classifier(pl.LightningModule):
         self.base_channels     = base_channels
         self.final_dense_layer = final_dense_layer
         #-----------------------------------------
-        self.AoLP=AoLP
-        self.DoLP=DoLP
+        self.AoLP = AoLP
+        self.DoLP = DoLP
         self.Unpolarized = Unpolarized
-        self.clean_class  = clean_class  
+        self.MaxPolarization   = MaxPolarization
+        self.MinPolarization   = MinPolarization
+        self.RangePolarization = RangePolarization
+        #-----------------------------------------
+        self.clean_class  = clean_class
         self.penalize_false_clean = penalize_false_clean
         #-----------------------------------------
         self.noise_std  = noise_std
         self.noise_clip = noise_clip
 
+        # Dynamic input channels (base 4 polarization channels + optional derived channels)
+        extra_channels = 0
+        if self.DoLP: extra_channels += 1
+        if self.AoLP: extra_channels += 1
+        if self.Unpolarized: extra_channels += 1
+        if self.MaxPolarization: extra_channels += 1
+        if self.MinPolarization: extra_channels += 1
+        if self.RangePolarization: extra_channels += 1
+
+        self.base_input_channels = 4
+        self.in_channels = self.base_input_channels + extra_channels
+
         #RESNEXT
         if self.type == 'resnext50':
             self.model = resnext50_32x4d(weights=ResNeXt50_32X4D_Weights.IMAGENET1K_V2)
-            #self.model = resnext50_32x4d(weights=ResNeXt50_32X4D_Weights.DEFAULT)
-            self.model.conv1 = nn.Conv2d(4, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+            self.model.conv1 = nn.Conv2d(self.in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
             self.model.fc = nn.Linear(2048, num_classes)
         elif self.type == 'resnet18':
             self.model = resnet18(weights=ResNet18_Weights.DEFAULT)
-            self.model.conv1 = nn.Conv2d(4, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+            self.model.conv1 = nn.Conv2d(self.in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
             self.model.fc = nn.Linear(512, num_classes)
         elif self.type == 'convnext_tiny':
             self.model = convnext_tiny(weights=ConvNeXt_Tiny_Weights.DEFAULT)
-            self.model.features[0][0] = nn.Conv2d(4, 96, kernel_size=(4, 4), stride=(4, 4))
+            self.model.features[0][0] = nn.Conv2d(self.in_channels, 96, kernel_size=(4, 4), stride=(4, 4))
             self.model.classifier[2]  = nn.Linear(768, num_classes)
         elif self.type == 'efficientnet_v2_s':
             self.model = efficientnet_v2_s(weights=EfficientNet_V2_S_Weights.DEFAULT)
-            self.model.features[0][0] = nn.Conv2d(4, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
-            self.model.classifier[1]  = nn.Linear(1280, num_classes,bias = True)
+            self.model.features[0][0] = nn.Conv2d(self.in_channels, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+            self.model.classifier[1]  = nn.Linear(1280, num_classes, bias=True)
         elif self.type == 'swin_v2_t':
             self.model = torchvision.models.swin_v2_t(weights=Swin_V2_T_Weights.DEFAULT)
-            self.model.features[0][0] = nn.Conv2d(4, 96, kernel_size=(4, 4), stride=(4, 4))
+            self.model.features[0][0] = nn.Conv2d(self.in_channels, 96, kernel_size=(4, 4), stride=(4, 4))
             self.model.head = nn.Linear(768, num_classes)
         elif self.type == 'regnet_y_800mf':
             self.model = torchvision.models.regnet_y_800mf(weights=RegNet_Y_800MF_Weights.DEFAULT)
-            self.model.stem[0] = nn.Conv2d(4, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
-            #import ipdb; ipdb.set_trace()
+            self.model.stem[0] = nn.Conv2d(self.in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.fc = nn.Linear(784, num_classes)
         elif ('custom' in self.type) or ('cnn' in self.type):
-            self.model = CustomCNN(in_channels=4, intended_tile_size=tile_size, num_classes=num_classes, dropout_rate=dropout_rate, base_channels=self.base_channels, final_dense_layer=self.final_dense_layer)
+            self.model = CustomCNN(
+                                   in_channels=self.in_channels,
+                                   intended_tile_size=tile_size,
+                                   num_classes=num_classes,
+                                   dropout_rate=dropout_rate,
+                                   base_channels=self.base_channels,
+                                   final_dense_layer=self.final_dense_layer
+                                  )
         else:
             raise ValueError(f"Unsupported model type: {model}. Supported types are 'resnext50', 'resnet18', 'convnext_tiny', 'efficientnet_v2_s', 'swin_v2_t', 'regnet_y_800mf'.")
 
         if (load_checkpoint is not None):
            self.model = Classifier.load_from_checkpoint(load_checkpoint)
 
-        #Resnet18
-        #self.criterion = CategoricalFocalLoss(gamma=gamma, alpha=None)
         if loss == 'focal':
             self.criterion = CategoricalFocalLoss(gamma=2.0, alpha=None)
         elif loss == 'cross_entropy':
             self.criterion = nn.CrossEntropyLoss()
         else:
             raise ValueError(f"Unsupported loss type: {loss}. Supported types are 'focal' and 'cross_entropy'.")
-        #Vitb16
-        #self.model = vit_b_16(weights=ViT_B_16_Weights.DEFAULT)
-        #self.model.conv_proj = nn.Conv2d(4, 768, kernel_size=(16, 16), stride=(16, 16))
-        #self.model.heads[0] = nn.Linear(768, num_classes)
+
         self.accuracy  = Accuracy(task='MULTICLASS',  num_classes=num_classes)
         self.recall    = Recall(task='MULTICLASS',    num_classes=num_classes)
         self.precision = Precision(task='MULTICLASS', num_classes=num_classes)
         self.auroc     = AUROC(task='MULTICLASS',     num_classes=num_classes)
-        #self.confusion_matrix = ConfusionMatrix(task="multiclass",num_classes=num_classes)
 
     def add_input_noise(self, x):
         if self.training and self.noise_std > 0.0:
@@ -399,61 +417,78 @@ class Classifier(pl.LightningModule):
             x = x + noise
         return x
 
+    def build_input_features(self, x):
+        """
+        Build model input by appending derived channels.
+        All polarization-derived features are computed from the original 4 channels only.
+        Expects x shape: [B, >=4, H, W] at input (normally [B,4,H,W]).
+        Returns x shape: [B, self.in_channels, H, W]
+        """
+        if x.shape[1] < 4:
+            raise ValueError(f"Expected at least 4 channels for polarization input, got {x.shape[1]}")
+
+        pol = x[:, 0:4, :, :]  # original polarization channels only
+
+        # AoLP / DoLP from Stokes computed on the original channels
+        if self.AoLP or self.DoLP:
+            stokes = self.calculate_stokes(pol)
+
+            if self.DoLP:
+                dolp = self.calculate_DoLP(stokes).unsqueeze(1)  # [B,1,H,W]
+                x = torch.cat((x, dolp), dim=1)
+
+            if self.AoLP:
+                aolp = self.calculate_AoLP(stokes).unsqueeze(1)  # [B,1,H,W]
+                x = torch.cat((x, aolp), dim=1)
+
+        # Unpolarized = mean over original 4 channels
+        if self.Unpolarized:
+            mon = pol.mean(dim=1, keepdim=True)
+            x = torch.cat((x, mon), dim=1)
+
+        # Max / Min / Range over original 4 channels
+        if self.MaxPolarization:
+            max_pol = pol.max(dim=1, keepdim=True)[0]
+            x = torch.cat((x, max_pol), dim=1)
+
+        if self.MinPolarization:
+            min_pol = pol.min(dim=1, keepdim=True)[0]
+            x = torch.cat((x, min_pol), dim=1)
+
+        if self.RangePolarization:
+            max_pol = pol.max(dim=1, keepdim=True)[0]
+            min_pol = pol.min(dim=1, keepdim=True)[0]
+            range_pol = max_pol - min_pol
+            x = torch.cat((x, range_pol), dim=1)
+
+        # Final sanity: ensure model sees the expected channel count
+        if x.shape[1] != self.in_channels:
+            raise ValueError(f"Feature builder produced {x.shape[1]} channels, expected {self.in_channels}. "
+                             f"(Flags: DoLP={self.DoLP}, AoLP={self.AoLP}, Unpolarized={self.Unpolarized}, "
+                             f"MaxPolarization={self.MaxPolarization}, MinPolarization={self.MinPolarization}, "
+                             f"RangePolarization={self.RangePolarization})")
+        return x
 
     def forward(self, x):
-        #x = self.val_transformations(image=x)['image']
-        #Normalize with mean and std
-        #x = (x - torch.tensor(self.mean).reshape(1, 4, 1, 1)) / torch.tensor(self.std).reshape(1, 4, 1, 1)
-
-        if (self.AoLP or self.DoLP):
-          stokes = self.calculate_stokes(x)
-        # Calculate DoLP and AoLP
-          if (self.DoLP):
-            DoLP = self.calculate_DoLP(stokes).reshape(x.shape[0], 1, x.shape[2], x.shape[3])
-            x    = torch.cat((x, DoLP), dim=1)
-          if (self.AoLP):
-            AoLP = self.calculate_AoLP(stokes).reshape(x.shape[0], 1, x.shape[2], x.shape[3])
-            x    = torch.cat((x, AoLP), dim=1)
-        
-        if (self.Unpolarized):
-           mon = x.mean(dim=1, keepdim=True)  # Average the input tensor across the channel dimension
-           x   = torch.cat((x, mon),dim=1)  # Concatenate the average tensor to the input tensor
-
+        x = self.build_input_features(x)
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
         x, y = batch
 
-        x = self.add_input_noise(x)  
-
-        if (self.AoLP or self.DoLP):
-           stokes = self.calculate_stokes(x)
-           # Calculate DoLP and AoLP
-           if (self.DoLP):
-            DoLP = self.calculate_DoLP(stokes).reshape(x.shape[0], 1, x.shape[2], x.shape[3])  # Reshape to match input dimensions
-            x    = torch.cat((x, DoLP), dim=1)
-           if (self.AoLP):
-            AoLP = self.calculate_AoLP(stokes).reshape(x.shape[0], 1, x.shape[2], x.shape[3])  # Reshape to match input dimensions
-            x    = torch.cat((x, AoLP), dim=1)
-
-        if (self.Unpolarized):
-           mon = x.mean(dim=1, keepdim=True)  # Average the input tensor across the channel dimension
-           x   = torch.cat((x, mon),dim=1)  # Concatenate the average tensor to the input tensor
+        x = self.add_input_noise(x)
+        x = self.build_input_features(x)
 
         y_hat = self.model(x)
         base_loss  = self.criterion(y_hat, y)
 
         if self.penalize_false_clean > 0.0:
-            # Compute extra penalty for “false clean”
             pred_probs = F.softmax(y_hat, dim=1)
-            # Consider all samples whose true class is NOT the clean class
             non_clean_mask = (y != self.clean_class)
-        
             penalty_strength = float(self.penalize_false_clean)
-        
+
             if non_clean_mask.any():
                 p_clean = pred_probs[non_clean_mask, self.clean_class]
-                # strong penalty that grows as p_clean -> 1
                 false_clean_loss = -torch.log(1.0 - p_clean + 1e-8).mean()
                 loss = base_loss + penalty_strength * false_clean_loss
             else:
@@ -461,35 +496,23 @@ class Classifier(pl.LightningModule):
         else:
             loss = base_loss
 
-        self.log('train_loss', loss,prog_bar=True)
+        self.log('train_loss', loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
 
-        if (self.AoLP or self.DoLP):
-          stokes = self.calculate_stokes(x)
-          # Calculate DoLP and AoLP
-          if (self.DoLP):
-            DoLP = self.calculate_DoLP(stokes).reshape(x.shape[0], 1, x.shape[2], x.shape[3])
-            x    = torch.cat((x, DoLP), dim=1)
-          if (self.AoLP):
-            AoLP = self.calculate_AoLP(stokes).reshape(x.shape[0], 1, x.shape[2], x.shape[3])
-            x    = torch.cat((x, AoLP), dim=1)
+        x = self.build_input_features(x)
 
-        if (self.Unpolarized):
-          mon = x.mean(dim=1, keepdim=True)  # Average the input tensor across the channel dimension
-          x   = torch.cat((x, mon),dim=1)  # Concatenate the average tensor to the input tensor
-        
         y_hat = self.model(x)
         loss  = self.criterion(y_hat, y)
-        self.log('val_loss', loss,sync_dist=True)
+        self.log('val_loss', loss, sync_dist=True)
 
-        self.accuracy.update(y_hat, y) 
+        self.accuracy.update(y_hat, y)
         self.log('val_accuracy',  self.accuracy.compute(),  prog_bar=True, sync_dist=True)
 
-        self.recall.update(y_hat, y)   
-        self.log('val_recall',    self.recall.compute(),    prog_bar=True, sync_dist=True) 
+        self.recall.update(y_hat, y)
+        self.log('val_recall',    self.recall.compute(),    prog_bar=True, sync_dist=True)
 
         self.precision.update(y_hat, y)
         self.log('val_precision', self.precision.compute(), prog_bar=True, sync_dist=True)
@@ -497,12 +520,6 @@ class Classifier(pl.LightningModule):
         self.auroc.update(y_hat, y)
         self.log('val_auroc', self.auroc.compute(), prog_bar=True, sync_dist=True)
 
-        """
-        self.log('val_recall',    self.recall(y_hat, y),    prog_bar=True, sync_dist=True) #Why is recall /precision always the same
-        self.log('val_precision', self.precision(y_hat, y), prog_bar=True, sync_dist=True)
-        self.log('val_auroc',     self.auroc(y_hat, y), prog_bar=True, sync_dist=True)
-        """
-        
         return loss
 
     def calculate_stokes(self, x):
@@ -510,13 +527,12 @@ class Classifier(pl.LightningModule):
         Calculate the Stokes parameters from the input tensor.
         Assuming x is a tensor of shape (batch_size, 4, height, width).
         """
-        # Stokes parameters
         S0 = x[:, 0, :, :]
-        S1 = x[:, 1, :, :] - x[:, 2, :, :]  # Difference between two channels
-        S2 = x[:, 1, :, :] + x[:, 2, :, :]  # Sum of two channels
-        S3 = x[:, 3, :, :]  # Assuming the fourth channel is the third Stokes parameter
-        return torch.stack((S0, S1, S2, S3), dim=1)  # Shape: (batch_size, 4, height, width)
-    
+        S1 = x[:, 1, :, :] - x[:, 2, :, :]
+        S2 = x[:, 1, :, :] + x[:, 2, :, :]
+        S3 = x[:, 3, :, :]
+        return torch.stack((S0, S1, S2, S3), dim=1)
+
     def calculate_DoLP(self, x):
         """
         Calculate the Degree of Linear Polarization (DoLP) from the Stokes parameters.
@@ -525,12 +541,10 @@ class Classifier(pl.LightningModule):
         S0 = x[:, 0, :, :]
         S1 = x[:, 1, :, :]
         S2 = x[:, 2, :, :]
-        S3 = x[:, 3, :, :]
-        
-        # Calculate DoLP
-        DoLP = torch.sqrt(S1**2 + S2**2) / S0
+        #S3 = x[:, 3, :, :]  # Not used in DoLP
+        DoLP = torch.sqrt(S1**2 + S2**2) / (S0 + 1e-8)
         return DoLP
-    
+
     def calculate_AoLP(self, x):
         """
         Calculate the Angle of Linear Polarization (AoLP) from the Stokes parameters.
@@ -538,35 +552,99 @@ class Classifier(pl.LightningModule):
         """
         S1 = x[:, 1, :, :]
         S2 = x[:, 2, :, :]
-        
-        # Calculate AoLP
         AoLP = 0.5 * torch.atan2(S2, S1)
         return AoLP
-    
+
     def on_validation_epoch_end(self):
-        #self.log('val_accuracy_epoch', self.accuracy.compute(), prog_bar=True)
-        self.accuracy.reset()  # Reset the metric for the next epoch
-        
-    
+        self.accuracy.reset()
+
     def on_train_epoch_end(self):
-        #self.log('train_accuracy_epoch', self.accuracy.compute(), prog_bar=True)
-        self.accuracy.reset()  # Reset the metric for the next epoch
-    
-    #def on_train_epoch_start(self):
-        #Unfreeze the model
-        #if self.current_epoch == 2:
-            #print("Unfreezing the model")
-        #    for param in self.model.parameters():
-        #        param.requires_grad = True
-        
+        self.accuracy.reset()
+
     def configure_optimizers(self):
         self.hparams.lr = self.lr
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.hparams.lr)
-        #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
-        return optimizer#{"optimizer": optimizer, "lr_scheduler": scheduler}
-    
+        return optimizer
 
 
+def load_png_comment_metadata(image_path):
+    """
+    Read JSON metadata stored in PNG text/comment fields.
+
+    Returns:
+        dict: parsed metadata dictionary, or {} if unavailable / invalid.
+    """
+    try:
+        from PIL import Image
+        import json
+
+        with Image.open(image_path) as img:
+            candidates = []
+
+            # Classic Pillow info dict
+            if hasattr(img, "info") and isinstance(img.info, dict):
+                for key in ("comment", "Comment", "description", "Description"):
+                    if key in img.info and img.info[key] is not None:
+                        candidates.append(img.info[key])
+
+            # PNG text chunks
+            if hasattr(img, "text") and isinstance(img.text, dict):
+                for key in ("comment", "Comment", "description", "Description"):
+                    if key in img.text and img.text[key] is not None:
+                        candidates.append(img.text[key])
+
+                # Also try every text chunk, in case the metadata was stored under another key
+                for key, value in img.text.items():
+                    if value is not None:
+                        candidates.append(value)
+
+            # Deduplicate while preserving order
+            seen = set()
+            unique_candidates = []
+            for c in candidates:
+                if isinstance(c, bytes):
+                    c = c.decode("utf-8", errors="ignore")
+                elif not isinstance(c, str):
+                    c = str(c)
+
+                c = c.strip()
+                if c and c not in seen:
+                    seen.add(c)
+                    unique_candidates.append(c)
+
+            # Try to parse any candidate as JSON
+            for c in unique_candidates:
+                try:
+                    parsed = json.loads(c)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
+
+            return {}
+
+    except Exception:
+        return {}
+
+def metadata_collate_fn(batch):
+    xs = []
+    ys = []
+    metas = []
+
+    for item in batch:
+        if len(item) == 3:
+            x, y, meta = item
+        else:
+            x, y = item
+            meta = {}
+
+        xs.append(x)
+        ys.append(y)
+        metas.append(meta)
+
+    xs = torch.stack(xs, dim=0)
+    ys = torch.tensor(ys, dtype=torch.long)
+    return xs, ys, metas
 
 def load_rgba_image_pil(path):
     with Image.open(path) as img:
@@ -590,7 +668,7 @@ def load_rgba_image(image_path):
     return rgba_image
 
 
-class RGBAImageFolder(datasets.DatasetFolder):
+class RGBAImageFolderOLD(datasets.DatasetFolder):
     def __init__(self, root, transform=None):
         super(RGBAImageFolder, self).__init__(
                 root,
@@ -599,9 +677,273 @@ class RGBAImageFolder(datasets.DatasetFolder):
                 transform=transform
             )
 
+class RGBAImageFolder(datasets.DatasetFolder):
+    def __init__(self, root, transform=None, return_metadata=False):
+        super(RGBAImageFolder, self).__init__(
+            root,
+            loader=load_rgba_image,
+            extensions=('png', 'jpg', 'jpeg'),
+            transform=transform
+        )
+        self.return_metadata = return_metadata
+
+    def __getitem__(self, index):
+        path, target = self.samples[index]
+
+        sample = self.loader(path)
+        if self.transform is not None:
+            sample = self.transform(sample)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        if self.return_metadata:
+            metadata = load_png_comment_metadata(path)
+            return sample, target, metadata
+
+        return sample, target
+
+
+def _human_bytes(num_bytes: int) -> str:
+    # Human-friendly binary units
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    n = float(num_bytes)
+    for u in units:
+        if n < 1024.0 or u == units[-1]:
+            return f"{n:.2f} {u}"
+        n /= 1024.0
+    return f"{n:.2f} B"
+
+
+def _get_available_ram_bytes() -> int:
+    """Returns available system RAM in bytes."""
+    # Prefer psutil if installed
+    try:
+        import psutil  # type: ignore
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+
+    # Fallback: Linux /proc/meminfo
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    # kB -> bytes
+                    return int(parts[1]) * 1024
+    except Exception:
+        pass
+
+    return 0
+
+
+def _get_path_size_bytes(path: str) -> int:
+    """Returns the total size of files under path (or the file itself) in bytes."""
+    try:
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        total = 0
+        for root, _, files in os.walk(path):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                try:
+                    total += os.path.getsize(fp)
+                except OSError:
+                    pass
+        return total
+    except Exception:
+        return 0
+
+
+def _estimate_dataset_ram_bytes(dataset: Dataset, sample_count: int = 32) -> int:
+    """Estimate RAM footprint (bytes) of caching dataset[i] objects.
+
+    We sample a few items, compute their tensor payload sizes, and extrapolate.
+    This is only a heuristic but is much better than relying on on-disk size.
+    """
+    n = len(dataset)
+    if n == 0:
+        return 0
+
+    k = max(1, min(sample_count, n))
+    # Spread samples across the dataset to avoid bias
+    indices = np.linspace(0, n - 1, num=k, dtype=int)
+
+    total_bytes = 0
+    for idx in indices:
+        x, y = dataset[int(idx)]
+        item_bytes = 0
+        # x may be a Tensor, numpy array, PIL image, or a tuple/list thereof
+        def _payload_bytes(obj):
+            if torch.is_tensor(obj):
+                return int(obj.element_size() * obj.numel())
+            if isinstance(obj, np.ndarray):
+                return int(obj.nbytes)
+            if isinstance(obj, Image.Image):
+                # Approximate: width*height*channels*1 byte (before ToTensor). Conservative.
+                bands = len(obj.getbands()) if hasattr(obj, "getbands") else 3
+                return int(obj.size[0] * obj.size[1] * bands)
+            if isinstance(obj, (list, tuple)):
+                return sum(_payload_bytes(o) for o in obj)
+            if isinstance(obj, dict):
+                return sum(_payload_bytes(v) for v in obj.values())
+            return 0
+
+        item_bytes += _payload_bytes(x)
+        # label bytes are negligible, but include a small constant overhead
+        item_bytes += 64
+        total_bytes += item_bytes
+
+    avg = total_bytes / float(k)
+    # Add overhead multiplier for Python objects / list storage
+    overhead_multiplier = 1.25
+    return int(avg * n * overhead_multiplier)
+
+class RAMPreloadedDataset(Dataset):
+    """
+    Preloads an entire dataset into RAM (samples are cached as returned by the wrapped dataset).
+
+    Notes:
+    - This will increase startup time and RAM usage.
+    - If you use DataLoader(num_workers>0), each worker may end up with its own copy depending on
+      multiprocessing start method. For true single-copy behavior, prefer num_workers=0.
+    """
+    def __init__(self, dataset, show_progress=True):
+        super().__init__()
+        self._dataset = dataset
+        self.classes = getattr(dataset, 'classes', None)
+        self.targets = getattr(dataset, 'targets', None)
+
+        n = len(dataset)
+        print("\n[WARNING] cacheAllDataToRAM=True -> Preloading ALL dataset samples into RAM...")
+        print("          This will take some time up front, but training batches will not hit the HDD.")
+        print(f"          Samples to cache: {n}\n")
+
+        self._cached = []
+
+        iterator = range(n)
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(iterator, desc="Caching dataset to RAM", unit="sample")
+            except Exception:
+                pass
+
+        for i in iterator:
+            self._cached.append(dataset[i])
+
+        # If wrapped dataset doesn't expose targets, infer them from cached samples
+        if self.targets is None:
+            self.targets = [y for (_, y) in self._cached]
+
+        print("[OK] Dataset cached to RAM. Starting training...\n")
+
+    def __len__(self):
+        return len(self._cached)
+
+    def __getitem__(self, idx):
+        return self._cached[idx]
+
+
+class CombinedDataset(Dataset):
+    """
+    Concatenates multiple datasets and exposes:
+      - classes
+      - class_to_idx
+      - targets  (concatenated)
+    Assumes all sub-datasets share the same class list & mapping.
+    """
+    def __init__(self, datasets):
+        super().__init__()
+        if len(datasets) == 0:
+            raise ValueError("CombinedDataset received 0 datasets")
+
+        # Verify consistent class mapping
+        base_classes = getattr(datasets[0], "classes", None)
+        base_cti     = getattr(datasets[0], "class_to_idx", None)
+        if base_classes is None or base_cti is None:
+            raise ValueError("Sub-dataset does not expose classes/class_to_idx")
+
+        for i, ds in enumerate(datasets[1:], start=1):
+            if getattr(ds, "classes", None) != base_classes:
+                raise ValueError(f"Dataset #{i} has different classes. "
+                                 f"Expected {base_classes}, got {getattr(ds,'classes',None)}")
+            if getattr(ds, "class_to_idx", None) != base_cti:
+                raise ValueError(f"Dataset #{i} has different class_to_idx mapping.")
+
+        self.datasets = datasets
+        self.classes = base_classes
+        self.class_to_idx = base_cti
+
+        # Build cumulative sizes for fast indexing
+        self._lengths = [len(ds) for ds in datasets]
+        self._offsets = []
+        s = 0
+        for L in self._lengths:
+            self._offsets.append(s)
+            s += L
+        self._total_len = s
+
+        # Concatenate targets (so your class distribution + weights still work)
+        self.targets = []
+        for ds in datasets:
+            t = getattr(ds, "targets", None)
+            if t is None:
+                # Fallback if dataset doesn't expose .targets
+                self.targets.extend([ds[i][1] for i in range(len(ds))])
+            else:
+                self.targets.extend(list(t))
+
+    def __len__(self):
+        return self._total_len
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= self._total_len:
+            raise IndexError(idx)
+
+        # Find which dataset this index belongs to
+        # (linear scan is fine for small number of datasets; can binary search if needed)
+        for ds_i in range(len(self.datasets)-1, -1, -1):
+            if idx >= self._offsets[ds_i]:
+                local_idx = idx - self._offsets[ds_i]
+                return self.datasets[ds_i][local_idx]
+
+        raise RuntimeError("CombinedDataset indexing error")
+
+def print_class_distribution(dataset, title="Dataset"):
+    """
+    Prints number of samples per class.
+
+    Works with:
+    - RGBAImageFolder
+    - HDF5Dataset (if it exposes .targets)
+    - random_split subsets
+    """
+    print(f"\n--- {title} Class Distribution ---")
+
+    # Handle Subset (from random_split)
+    if isinstance(dataset, torch.utils.data.Subset):
+        targets = [dataset.dataset.targets[i] for i in dataset.indices]
+        classes = dataset.dataset.classes
+    else:
+        targets = dataset.targets
+        classes = dataset.classes
+
+    counter = Counter(targets)
+
+    total = 0
+    for class_idx in sorted(counter.keys()):
+        class_name = classes[class_idx]
+        count = counter[class_idx]
+        total += count
+        print(f"Class {class_idx} ({class_name}): {count} samples")
+
+    print(f"Total samples: {total}")
+    print("----------------------------------\n")
+
 #Main
 if __name__ == "__main__":
-
     configuration_file = "config.json"
     if len(sys.argv) > 1:
         configuration_file = sys.argv[1]
@@ -661,7 +1003,7 @@ if __name__ == "__main__":
         device = 'cuda'
     else:
         device = 'cpu'
-    directory =  config_json['directory']
+    directory =  config_json['training_dataset']
 
     # Define the transform
     transform = transforms.Compose([
@@ -686,6 +1028,40 @@ if __name__ == "__main__":
        print("Only selecting the classes ",config_json['selected_classes'], "for training")
        filter_dataset_classes(dataset, config_json['selected_classes'])
 
+    # Optionally preload all samples to RAM (slow startup, fast epoch iteration)
+    if ('cacheAllDataToRAM' in config_json['dataloader']) and (config_json['dataloader']['cacheAllDataToRAM']):
+      # --- Sanity check: ensure there is enough available RAM ---
+      available_ram = _get_available_ram_bytes()
+      # On-disk footprint (quick lower bound)
+      disk_bytes = _get_path_size_bytes(directory)
+      # Heuristic RAM estimate based on sampling decoded items
+      est_ram_bytes = _estimate_dataset_ram_bytes(dataset, sample_count=32)
+    
+      print("\n[RAM CHECK] Dataset on disk: ", _human_bytes(disk_bytes))
+      if available_ram > 0:
+            print("[RAM CHECK] System available RAM: ", _human_bytes(available_ram))
+      else:
+            print("[RAM CHECK] Could not determine available RAM (continuing without hard check).")
+    
+      # If we can measure available RAM, enforce a safety margin.
+      if available_ram > 0:
+            # Use the larger of the decoded estimate and 2x on-disk as a conservative requirement
+            conservative_required = max(est_ram_bytes, int(disk_bytes * 2.0))
+            safety_margin = 0.90  # do not consume more than 90% of available RAM
+            limit = int(available_ram * safety_margin)
+    
+            print("[RAM CHECK] Estimated RAM needed to cache: ", _human_bytes(conservative_required))
+            if conservative_required > limit:
+                  print("\n[ERROR] Not enough available RAM to safely cache the entire dataset.")
+                  print("        Required (est.): ", _human_bytes(conservative_required))
+                  print("        Available:       ", _human_bytes(available_ram))
+                  print("        Safety limit:    ", _human_bytes(limit), f" ({int(safety_margin*100)}% of available)")
+                  print("\n        Tip: disable cacheAllDataToRAM or reduce dataset / tile size / dtype, or run on a machine with more RAM.\n")
+                  sys.exit(1)
+    
+      dataset = RAMPreloadedDataset(dataset)
+      num_workers = 1 #Set workers to 1 to avoid RAM duplication 
+
 
     # Calculate the sizes for training and validation sets
     dataset_size    = len(dataset)
@@ -699,6 +1075,12 @@ if __name__ == "__main__":
     pl.seed_everything(seed, workers=True)
 
     
+
+    # Print class distribution BEFORE splitting
+    print_class_distribution(dataset, title="Full Dataset")
+
+
+    """
     # Split the dataset into training and validation sets
     train_dataset, val_dataset = random_split(
                                               dataset,
@@ -706,13 +1088,71 @@ if __name__ == "__main__":
                                               generator=torch.Generator().manual_seed(seed),
                                              )
 
+    print_class_distribution(train_dataset, title="Training Set")
+    print_class_distribution(val_dataset, title="Validation Set")
+    """
+
+
+
+
+    # -----------------------------------------------------------
+    # Optional external validation dataset
+    # -----------------------------------------------------------
+    val_directory = None
+    if "validation_dataset" in config_json and config_json["validation_dataset"]:
+        val_directory = config_json["validation_dataset"]
+
+    if val_directory is not None:
+        print("Using explicit validation dataset:", val_directory)
+
+        H5PYValFilename = f"{val_directory}/dataset.h5"
+
+        if checkIfFileExists(H5PYValFilename):
+            from DatasetConverter import HDF5Dataset
+            val_dataset = HDF5Dataset(H5PYValFilename)
+        else:
+            val_dataset = RGBAImageFolder(root=val_directory, transform=transform)
+
+        if ('selected_classes' in config_json) and config_json['selected_classes']:
+            filter_dataset_classes(val_dataset, config_json['selected_classes'])
+
+        if dataset.classes != val_dataset.classes:
+            raise ValueError(f"Training/validation class mismatch: {dataset.classes} vs {val_dataset.classes}")
+
+        if dataset.class_to_idx != val_dataset.class_to_idx:
+            raise ValueError("Training/validation class_to_idx mismatch")
+
+        train_dataset = dataset
+    else:
+        print("No validation_dataset provided → using validation_split")
+
+        dataset_size    = len(dataset)
+        validation_size = int(val_split * dataset_size)
+        train_size      = dataset_size - validation_size
+
+        train_dataset, val_dataset = random_split(
+            dataset,
+            [train_size, validation_size],
+            generator=torch.Generator().manual_seed(seed),
+        )
+
+    # -----------------------------------------------------------
+
+    print_class_distribution(train_dataset, title="Training Set")
+    print_class_distribution(val_dataset, title="Validation Set")
+
+
+
+
+
     # Create DataLoaders
     train_loader = DataLoader(
                               train_dataset,
                               batch_size=batch_size,
                               shuffle=True,
                               num_workers=num_workers,
-                              drop_last=True
+                              drop_last=True,
+                              #collate_fn=metadata_collate_fn,
                              )
 
     val_loader  = DataLoader(
@@ -720,7 +1160,8 @@ if __name__ == "__main__":
                             batch_size=batch_size,
                             shuffle=False,  # Typically, we don't shuffle the validation set
                             num_workers=num_workers,
-                            drop_last=True
+                            drop_last=True,
+                            #collate_fn=metadata_collate_fn,
                            )
 
     #Print class names as a sanity check
@@ -734,6 +1175,7 @@ if __name__ == "__main__":
               cleanClassID = i
     print(f"Clean class ID is : {cleanClassID}")
 
+    """
     if class_weight:
         class_counts = Counter(train_dataset.dataset.targets)
         alpha = torch.tensor([1 / class_counts[i] for i in range(len(class_counts))])
@@ -741,6 +1183,23 @@ if __name__ == "__main__":
         alpha = alpha.to(device)
     else:
         alpha = None
+    """
+    if class_weight:
+        if isinstance(train_dataset, torch.utils.data.Subset):
+            train_targets = [train_dataset.dataset.targets[i] for i in train_dataset.indices]
+        else:
+            train_targets = train_dataset.targets
+
+        class_counts = Counter(train_targets)
+        alpha = torch.tensor(
+            [1 / class_counts[i] for i in range(len(class_names))],
+            dtype=torch.float32
+        )
+        alpha = alpha / alpha.sum()
+        alpha = alpha.to(device)
+    else:
+        alpha = None
+
 
     # Initialize the classifier
     classifier = Classifier(
@@ -813,9 +1272,15 @@ if __name__ == "__main__":
       #------------------------------------------------------------------
       y_true = []
       y_pred = []
+      """
       for x, y in val_loader:
         y_true.extend(y.numpy())
         y_pred.extend(classifier(x).argmax(dim=1).numpy())
+      """
+      for x, y in val_loader:
+          x = x.to(classifier.device)
+          y_true.extend(y.cpu().numpy())
+          y_pred.extend(classifier(x).argmax(dim=1).detach().cpu().numpy())
 
       #num_classes = len(set(y_true))+1  # or classifier(x).shape[1]
       num_classes = len(dataset.classes)
@@ -870,6 +1335,10 @@ if __name__ == "__main__":
     os.system("mkdir models/")
     os.system("zip -r models/%s %s.json %s_confusion.json %s*.png %s.pth tensorboard/*/*/*" % (zip_name,model_name,model_name,model_name,model_name) ) #Create zip of models
 
-    print('To upload results copy/paste:') 
-    print("scp -P 2222 models/%s ammar@ammar.gr:/home/ammar/public_html/magician/ckpts" % zip_name)  
+
+    print('To upload ALL models copy/paste:') 
+    print("scp -P 2222 models/*.zip ammar@ammar.gr:/home/ammar/public_html/magician/ckpts2")  
+
+    print('To upload last training results copy/paste:') 
+    print("scp -P 2222 models/%s ammar@ammar.gr:/home/ammar/public_html/magician/ckpts2" % zip_name)  
     
