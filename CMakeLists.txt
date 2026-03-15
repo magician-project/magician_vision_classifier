@@ -11,6 +11,7 @@ find_package(geometry_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Detection.msg"
   "msg/DetectionM.msg"
+  "msg/Marker.msg"
   "srv/SetInt64.srv"
   "srv/SetFloat64.srv"
   DEPENDENCIES std_msgs geometry_msgs #service_msgs

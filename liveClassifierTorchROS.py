@@ -50,6 +50,7 @@ from geometry_msgs.msg import Pose
 
 from magician_vision_classifier.msg import Detection      # Custom ROS message
 from magician_vision_classifier.msg import DetectionM     # Custom ROS message (uint8 severity, geometry_msgs/Pose location)
+from magician_vision_classifier.msg import Marker         # Custom ROS message (string id, geometry_msgs/Pose pose)
 
 # ========================================================
 # Laser fusion globals (project-specific / fixed hardware)
@@ -71,6 +72,16 @@ LASER_XY_PIXELS = [
 ]
 
 LASER_IDW_POWER = 2.0  # IDW interpolation power
+
+# ========================================================
+# Marker scanning globals
+# ========================================================
+MARKER_SCAN_DURATION_S   = 3.0          # seconds each scan_markers call stays active
+ARUCO_DICT_NAME          = "DICT_6X6_250"
+DEFAULT_MARKER_LENGTH_M  = 0.05         # 5 cm default ArUco marker side length
+CHESSBOARD_W             = 9            # inner corner columns
+CHESSBOARD_H             = 6            # inner corner rows
+CHESSBOARD_SQUARE_M      = 0.024        # 24 mm square size
 
 
 # ========================================================
@@ -156,6 +167,32 @@ def idw_depth(x: float, y: float, xy_list, d_list, p: float = 2.0) -> float:
     return float(acc / wsum)
 
 
+def make_approx_camera_matrix(width, height):
+    """Return an approximate pinhole camera matrix and zero distortion coefficients."""
+    fx = fy = 0.9 * max(width, height)
+    cx = width  / 2.0
+    cy = height / 2.0
+    K = np.array([[fx, 0, cx],
+                  [0, fy, cy],
+                  [0,  0,  1]], dtype=np.float32)
+    dist = np.zeros((5, 1), dtype=np.float32)
+    return K, dist
+
+
+def rvec_to_quaternion(rvec):
+    """Convert an OpenCV Rodrigues rotation vector to a (qx, qy, qz, qw) quaternion."""
+    rvec = np.asarray(rvec, dtype=np.float64).reshape(3)
+    angle = float(np.linalg.norm(rvec))
+    if angle < 1e-10:
+        return 0.0, 0.0, 0.0, 1.0  # identity
+    axis = rvec / angle
+    s = math.sin(angle / 2.0)
+    return (float(axis[0] * s),
+            float(axis[1] * s),
+            float(axis[2] * s),
+            float(math.cos(angle / 2.0)))
+
+
 # ========================================================
 # ROS Node
 # ========================================================
@@ -171,6 +208,8 @@ class DefectPublisher(Node):
         self.publisher_m = None
         if USE_LASERS:
             self.publisher_m = self.create_publisher(DetectionM, "detections_m", 10)
+
+        self.publisher_markers = self.create_publisher(Marker, "markers", 10)
 
 
         # Last received frame (for saving)
@@ -191,6 +230,17 @@ class DefectPublisher(Node):
         self._threshold = 0.6
 
         self._lock = threading.Lock()
+
+        # Marker scanning state
+        self._marker_scan_until = 0.0   # monotonic time until which scanning is active
+        _aruco_dict = cv2.aruco.getPredefinedDictionary(
+            getattr(cv2.aruco, ARUCO_DICT_NAME)
+        )
+        self._aruco_detector = cv2.aruco.ArucoDetector(
+            _aruco_dict, cv2.aruco.DetectorParameters()
+        )
+        self._cb_criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4)
+        self._cam_matrix_cache = {}   # (h, w) -> (K, dist)
 
         # Laser state (latest samples)
         self._laser_depths = [float("nan"), float("nan"), float("nan")]
@@ -213,6 +263,7 @@ class DefectPublisher(Node):
         self.create_service(SetFloat64, "magician_vision_classifier/set_threshold", self._set_threshold_cb)
         self.create_service(Trigger,    "magician_vision_classifier/remember_defect", self._remember_defect_cb)
         self.create_service(Trigger,    "magician_vision_classifier/remember_clean", self._remember_clean_cb)
+        self.create_service(Trigger,    "magician_vision_classifier/scan_markers", self._scan_markers_cb)
 
         # ------------------------------------------------
         # Services (NEW): runtime tuning
@@ -321,6 +372,14 @@ class DefectPublisher(Node):
         except Exception as e:
             return False, str(e)
 
+    def _scan_markers_cb(self, request, response):
+        with self._lock:
+            self._marker_scan_until = time.monotonic() + MARKER_SCAN_DURATION_S
+        response.success = True
+        response.message = f"Marker scanning active for {MARKER_SCAN_DURATION_S:.0f} s"
+        self.get_logger().info(response.message)
+        return response
+
     def _remember_defect_cb(self, request, response):
         success, msg = self._save_current_frame("defect")
         response.success = success
@@ -366,9 +425,79 @@ class DefectPublisher(Node):
         with self._lock:
             return list(self._laser_depths)
 
+    def is_marker_scanning(self):
+        with self._lock:
+            return time.monotonic() < self._marker_scan_until
+
     # -------------------------
     # Publishers
     # -------------------------
+    def _get_camera_matrix(self, frame):
+        """Return (K, dist) for the given frame, reusing cached values per resolution."""
+        h, w = frame.shape[:2]
+        key = (h, w)
+        if key not in self._cam_matrix_cache:
+            self._cam_matrix_cache[key] = make_approx_camera_matrix(w, h)
+        return self._cam_matrix_cache[key]
+
+    def publish_marker(self, marker_id: str, tvec, rvec):
+        """Publish a Marker message with position (tvec) and orientation (rvec -> quaternion)."""
+        msg = Marker()
+        msg.id = str(marker_id)
+
+        qx, qy, qz, qw = rvec_to_quaternion(rvec)
+        pose = Pose()
+        pose.position.x = float(tvec[0])
+        pose.position.y = float(tvec[1])
+        pose.position.z = float(tvec[2])
+        pose.orientation.x = qx
+        pose.orientation.y = qy
+        pose.orientation.z = qz
+        pose.orientation.w = qw
+
+        msg.pose = pose
+        self.publisher_markers.publish(msg)
+
+    def scan_and_publish_markers(self, frame):
+        """Detect ArUco markers and chessboard in *frame*, publish a Marker msg for each hit."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        K, dist = self._get_camera_matrix(frame)
+
+        # --- ArUco ---
+        corners, ids, _ = self._aruco_detector.detectMarkers(gray)
+        if ids is not None:
+            for i, marker_id in enumerate(ids.flatten()):
+                marker_id_int = int(marker_id)
+                rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+                    [corners[i]], DEFAULT_MARKER_LENGTH_M, K, dist
+                )
+                rvec = rvecs[0].reshape(3)
+                tvec = tvecs[0].reshape(3)
+                self.publish_marker(str(marker_id_int), tvec, rvec)
+                self.get_logger().debug(
+                    f"ArUco id={marker_id_int} tvec={tvec.tolist()}"
+                )
+
+        # --- Chessboard ---
+        pattern = (CHESSBOARD_W, CHESSBOARD_H)
+        flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+        found, cb_corners = cv2.findChessboardCorners(gray, pattern, flags)
+        if found and cb_corners is not None:
+            cv2.cornerSubPix(gray, cb_corners, (20, 20), (-1, -1), self._cb_criteria)
+
+            objp = np.zeros((CHESSBOARD_W * CHESSBOARD_H, 3), np.float32)
+            objp[:, :2] = np.mgrid[0:CHESSBOARD_W, 0:CHESSBOARD_H].T.reshape(-1, 2)
+            objp *= CHESSBOARD_SQUARE_M
+
+            ok, rvec_cb, tvec_cb = cv2.solvePnP(
+                objp, cb_corners, K, dist, flags=cv2.SOLVEPNP_ITERATIVE
+            )
+            if ok:
+                self.publish_marker("chessboard", tvec_cb.reshape(3), rvec_cb.reshape(3))
+                self.get_logger().debug(
+                    f"Chessboard tvec={tvec_cb.reshape(3).tolist()}"
+                )
+
     def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z = 0.0):
         msg = Detection()
         msg.x     = int(x)
@@ -460,6 +589,10 @@ def main():
                 print("Error: Couldn't read frame from Shared Memory")
                 time.sleep(0.1)
                 continue
+
+            # Marker scanning (runs regardless of inference pause state)
+            if ros_node.is_marker_scanning():
+                ros_node.scan_and_publish_markers(frame)
 
             # Pause inference
             if ros_node.inference_paused():
