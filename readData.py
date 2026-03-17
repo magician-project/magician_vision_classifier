@@ -203,8 +203,12 @@ def debayerPolarImage(image):
 def readPolarPNMToRGBALive(image):
     # Load the image
     image = np.squeeze(image)
-  
-    #This expects a 1 channel (bayered) image 
+
+    # If already 4-channel (pre-debayered), return as-is
+    if image.ndim == 3 and image.shape[2] == 4:
+        return image
+
+    #This expects a 1 channel (bayered) image
     height, width = image.shape
 
     # Split into polarization images
