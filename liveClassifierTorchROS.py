@@ -663,7 +663,7 @@ def main():
                     det_type=det_type,
                     det_class=det_class,
                     probability=confidence,
-                    depth = z
+                    depth_z = z
                 )
 
             # Visualization
