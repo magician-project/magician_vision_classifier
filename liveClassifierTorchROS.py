@@ -167,6 +167,37 @@ def idw_depth(x: float, y: float, xy_list, d_list, p: float = 2.0) -> float:
     return float(acc / wsum)
 
 
+def estimatePoseSingleMarkers(corners_list, marker_length, K, dist):
+    """
+    Compatibility wrapper for cv2.aruco.estimatePoseSingleMarkers, which was
+    removed in OpenCV 4.7+.  Returns (rvecs, tvecs) as lists of (3,) arrays,
+    one entry per marker.
+    """
+    if hasattr(cv2.aruco, "estimatePoseSingleMarkers"):
+        rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+            corners_list, marker_length, K, dist
+        )
+        return [r.reshape(3) for r in rvecs], [t.reshape(3) for t in tvecs]
+
+    half = marker_length / 2.0
+    marker_objp = np.array([
+        [-half,  half, 0.0],
+        [ half,  half, 0.0],
+        [ half, -half, 0.0],
+        [-half, -half, 0.0],
+    ], dtype=np.float32)
+
+    rvecs, tvecs = [], []
+    for corners in corners_list:
+        img_pts = corners.reshape(4, 2).astype(np.float32)
+        ok, rvec, tvec = cv2.solvePnP(
+            marker_objp, img_pts, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE
+        )
+        rvecs.append(rvec.reshape(3) if ok else np.zeros(3))
+        tvecs.append(tvec.reshape(3) if ok else np.zeros(3))
+    return rvecs, tvecs
+
+
 def make_approx_camera_matrix(width, height):
     """Return an approximate pinhole camera matrix and zero distortion coefficients."""
     fx = fy = 0.9 * max(width, height)
@@ -466,14 +497,9 @@ class DefectPublisher(Node):
         # --- ArUco ---
         corners, ids, _ = self._aruco_detector.detectMarkers(gray)
         if ids is not None:
-            for i, marker_id in enumerate(ids.flatten()):
-                marker_id_int = int(marker_id)
-                rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-                    [corners[i]], DEFAULT_MARKER_LENGTH_M, K, dist
-                )
-                rvec = rvecs[0].reshape(3)
-                tvec = tvecs[0].reshape(3)
-                self.publish_marker(str(marker_id_int), tvec, rvec)
+            rvecs, tvecs = estimatePoseSingleMarkers(corners, DEFAULT_MARKER_LENGTH_M, K, dist)
+            for marker_id, rvec, tvec in zip(ids.flatten(), rvecs, tvecs):
+                self.publish_marker(str(int(marker_id)), tvec, rvec)
                 self.get_logger().debug(
                     f"ArUco id={marker_id_int} tvec={tvec.tolist()}"
                 )
@@ -692,4 +718,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
