@@ -501,7 +501,7 @@ class DefectPublisher(Node):
             for marker_id, rvec, tvec in zip(ids.flatten(), rvecs, tvecs):
                 self.publish_marker(str(int(marker_id)), tvec, rvec)
                 self.get_logger().debug(
-                    f"ArUco id={marker_id_int} tvec={tvec.tolist()}"
+                    f"ArUco id={marker_id} tvec={tvec.tolist()}"
                 )
 
         # --- Chessboard ---
