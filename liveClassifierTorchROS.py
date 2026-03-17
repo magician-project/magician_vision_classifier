@@ -499,35 +499,40 @@ class DefectPublisher(Node):
                 )
 
     def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z = 0.0):
-        msg = Detection()
-        msg.x     = int(x)
-        msg.y     = int(y)
-        msg.w     = int(w)
-        msg.h     = int(h)
-        msg.depth = float(depth_z)
-        msg.type  = det_type
-        msg.class_name = det_class  # 'class' is reserved in Python
-        msg.probability = float(probability)
-        self.publisher_.publish(msg)
+        try:
+          msg = Detection()
+          msg.x     = int(x)
+          msg.y     = int(y)
+          msg.w     = int(w)
+          msg.h     = int(h)
+          msg.depth = float(depth_z)
+          msg.type  = det_type
+          msg.class_name = det_class  # 'class' is reserved in Python
+          msg.probability = float(probability)
+          self.publisher_.publish(msg)
+        except Exception as e:
+          print("Failed to publish detection")
 
     def publish_detection_m(self, cx, cy, severity, depth_z):
         if (not USE_LASERS) or (self.publisher_m is None):
             return
+        try:
+          msg = DetectionM()
+          msg.severity = int(severity)
 
-        msg = DetectionM()
-        msg.severity = int(severity)
+          pose = Pose()
+          pose.position.x = float(cx)
+          pose.position.y = float(cy)
+          pose.position.z = float(depth_z)
+          pose.orientation.w = 1.0  # identity
+          pose.orientation.x = 0.0
+          pose.orientation.y = 0.0
+          pose.orientation.z = 0.0
 
-        pose = Pose()
-        pose.position.x = float(cx)
-        pose.position.y = float(cy)
-        pose.position.z = float(depth_z)
-        pose.orientation.w = 1.0  # identity
-        pose.orientation.x = 0.0
-        pose.orientation.y = 0.0
-        pose.orientation.z = 0.0
-
-        msg.location = pose
-        self.publisher_m.publish(msg)
+          msg.location = pose
+          self.publisher_m.publish(msg)
+        except Exception as e:
+          print("Failed to publish detection_m")
 
 
 # ========================================================
