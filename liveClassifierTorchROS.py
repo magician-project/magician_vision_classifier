@@ -491,6 +491,8 @@ class DefectPublisher(Node):
 
     def scan_and_publish_markers(self, frame):
         """Detect ArUco markers and chessboard in *frame*, publish a Marker msg for each hit."""
+        print("[Markers] Scanning frame...")
+
         if len(frame.shape) == 2 or frame.shape[2] == 1:
             gray = frame if len(frame.shape) == 2 else frame[:, :, 0]
         else:
@@ -498,34 +500,50 @@ class DefectPublisher(Node):
         K, dist = self._get_camera_matrix(frame)
 
         # --- ArUco ---
+        print("[Markers] Running ArUco detection...")
         corners, ids, _ = self._aruco_detector.detectMarkers(gray)
         if ids is not None:
+            print(f"[Markers] Found {len(ids)} ArUco marker(s): {ids.flatten().tolist()}")
             rvecs, tvecs = estimatePoseSingleMarkers(corners, DEFAULT_MARKER_LENGTH_M, K, dist)
             for marker_id, rvec, tvec in zip(ids.flatten(), rvecs, tvecs):
+                tvec_flat = tvec.flatten()
+                print(f"[Markers]   id={marker_id}  tvec=[{tvec_flat[0]:.3f}, {tvec_flat[1]:.3f}, {tvec_flat[2]:.3f}] m")
                 self.publish_marker(str(int(marker_id)), tvec, rvec)
                 self.get_logger().debug(
                     f"ArUco id={marker_id} tvec={tvec.tolist()}"
                 )
+        else:
+            print("[Markers] No ArUco markers found.")
 
         # --- Chessboard ---
+        print(f"[Markers] Running chessboard detection ({CHESSBOARD_W}x{CHESSBOARD_H})...")
         pattern = (CHESSBOARD_W, CHESSBOARD_H)
         flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_FAST_CHECK
         found, cb_corners = cv2.findChessboardCorners(gray, pattern, flags)
         if found and cb_corners is not None:
+            print("[Markers] Chessboard found, refining corners...")
             cv2.cornerSubPix(gray, cb_corners, (20, 20), (-1, -1), self._cb_criteria)
 
             objp = np.zeros((CHESSBOARD_W * CHESSBOARD_H, 3), np.float32)
             objp[:, :2] = np.mgrid[0:CHESSBOARD_W, 0:CHESSBOARD_H].T.reshape(-1, 2)
             objp *= CHESSBOARD_SQUARE_M
 
+            print("[Markers] Solving PnP for chessboard pose...")
             ok, rvec_cb, tvec_cb = cv2.solvePnP(
                 objp, cb_corners, K, dist, flags=cv2.SOLVEPNP_ITERATIVE
             )
             if ok:
-                self.publish_marker("chessboard", tvec_cb.reshape(3), rvec_cb.reshape(3))
+                t = tvec_cb.reshape(3)
+                print(f"[Markers] Chessboard pose: tvec=[{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] m")
+                self.publish_marker("chessboard", t, rvec_cb.reshape(3))
                 self.get_logger().debug(
-                    f"Chessboard tvec={tvec_cb.reshape(3).tolist()}"
+                    f"Chessboard tvec={t.tolist()}"
                 )
+            else:
+                print("[Markers] PnP solve failed for chessboard.")
+        else:
+            print("[Markers] No chessboard found.")
+        print("[Markers] Scan complete.")
 
     def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z = 0.0):
         try:
