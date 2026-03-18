@@ -58,9 +58,9 @@ from magician_vision_classifier.msg import Marker         # Custom ROS message (
 USE_LASERS = True  # Set to False to disable subscriptions + DetectionM publishing entirely.
 
 LASER_TOPICS = [
-    "/magician_grabber/dist0",
-    "/magician_grabber/dist1",
-    "/magician_grabber/dist2",
+    "magician_grabber/distance1",
+    "magician_grabber/distance2",
+    "magician_grabber/distance3",
 ]
 
 # Laser locations in the classifier's 2D image plane (pixels)
