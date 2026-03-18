@@ -491,7 +491,10 @@ class DefectPublisher(Node):
 
     def scan_and_publish_markers(self, frame):
         """Detect ArUco markers and chessboard in *frame*, publish a Marker msg for each hit."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if len(frame.shape) == 2 or frame.shape[2] == 1:
+            gray = frame if len(frame.shape) == 2 else frame[:, :, 0]
+        else:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         K, dist = self._get_camera_matrix(frame)
 
         # --- ArUco ---
