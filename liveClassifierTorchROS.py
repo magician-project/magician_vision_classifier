@@ -509,7 +509,7 @@ class DefectPublisher(Node):
 
         # --- Chessboard ---
         pattern = (CHESSBOARD_W, CHESSBOARD_H)
-        flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+        flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_FAST_CHECK
         found, cb_corners = cv2.findChessboardCorners(gray, pattern, flags)
         if found and cb_corners is not None:
             cv2.cornerSubPix(gray, cb_corners, (20, 20), (-1, -1), self._cb_criteria)
