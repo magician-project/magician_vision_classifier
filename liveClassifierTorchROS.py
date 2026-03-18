@@ -613,13 +613,14 @@ def main():
             loop_start = time.perf_counter()
 
             frame = smm.read_from_shared_memory()
-            ros_node._last_frame = frame.copy()
 
             # Get image to work on
             if frame is None or smm.frame_size == 0:
                 print("Error: Couldn't read frame from Shared Memory")
                 time.sleep(0.1)
                 continue
+
+            ros_node._last_frame = frame.copy()
 
             # Marker scanning (runs regardless of inference pause state)
             if ros_node.is_marker_scanning():
