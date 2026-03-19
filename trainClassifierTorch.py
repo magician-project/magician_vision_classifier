@@ -25,7 +25,24 @@ import os
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, random_split
 from PIL import Image
-from torchvision.models import resnet18,vit_b_16, convnext_tiny,resnext50_32x4d,efficientnet_v2_s,ResNet18_Weights,ResNeXt50_32X4D_Weights,ViT_B_16_Weights,ConvNeXt_Tiny_Weights,EfficientNet_V2_S_Weights,Swin_V2_T_Weights,RegNet_Y_800MF_Weights
+from torchvision.models import (
+    resnet18, ResNet18_Weights,
+    convnext_tiny, ConvNeXt_Tiny_Weights,
+    resnext50_32x4d, ResNeXt50_32X4D_Weights,
+    efficientnet_v2_s, EfficientNet_V2_S_Weights,
+    efficientnet_b0, EfficientNet_B0_Weights,
+    swin_v2_t, Swin_V2_T_Weights,
+    regnet_y_800mf, RegNet_Y_800MF_Weights,
+    regnet_y_400mf, RegNet_Y_400MF_Weights,
+    mobilenet_v3_small, MobileNet_V3_Small_Weights,
+    mobilenet_v3_large, MobileNet_V3_Large_Weights,
+    shufflenet_v2_x0_5, ShuffleNet_V2_X0_5_Weights,
+    shufflenet_v2_x1_0, ShuffleNet_V2_X1_0_Weights,
+    squeezenet1_1, SqueezeNet1_1_Weights,
+    densenet121, DenseNet121_Weights,
+    mnasnet0_5, MNASNet0_5_Weights,
+    mnasnet1_0, MNASNet1_0_Weights,
+)
 from torch.nn import functional as F
 import torchvision
 from pytorch_lightning.loggers import WandbLogger
@@ -375,13 +392,54 @@ class Classifier(pl.LightningModule):
             self.model.features[0][0] = nn.Conv2d(self.in_channels, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.classifier[1]  = nn.Linear(1280, num_classes, bias=True)
         elif self.type == 'swin_v2_t':
-            self.model = torchvision.models.swin_v2_t(weights=Swin_V2_T_Weights.DEFAULT)
+            self.model = swin_v2_t(weights=Swin_V2_T_Weights.DEFAULT)
             self.model.features[0][0] = nn.Conv2d(self.in_channels, 96, kernel_size=(4, 4), stride=(4, 4))
             self.model.head = nn.Linear(768, num_classes)
         elif self.type == 'regnet_y_800mf':
-            self.model = torchvision.models.regnet_y_800mf(weights=RegNet_Y_800MF_Weights.DEFAULT)
+            self.model = regnet_y_800mf(weights=RegNet_Y_800MF_Weights.DEFAULT)
             self.model.stem[0] = nn.Conv2d(self.in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.fc = nn.Linear(784, num_classes)
+        elif self.type == 'regnet_y_400mf':
+            self.model = torchvision.models.regnet_y_400mf(weights=RegNet_Y_400MF_Weights.DEFAULT)
+            self.model.stem[0] = nn.Conv2d(self.in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+            self.model.fc = nn.Linear(440, num_classes)
+        elif self.type == 'mobilenet_v3_small':
+            self.model = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
+            self.model.features[0][0] = nn.Conv2d(self.in_channels, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+            self.model.classifier[3] = nn.Linear(1024, num_classes)
+        elif self.type == 'mobilenet_v3_large':
+            self.model = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT)
+            self.model.features[0][0] = nn.Conv2d(self.in_channels, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+            self.model.classifier[3] = nn.Linear(1280, num_classes)
+        elif self.type == 'shufflenet_v2_x0_5':
+            self.model = shufflenet_v2_x0_5(weights=ShuffleNet_V2_X0_5_Weights.DEFAULT)
+            self.model.conv1[0] = nn.Conv2d(self.in_channels, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+            self.model.fc = nn.Linear(1024, num_classes)
+        elif self.type == 'shufflenet_v2_x1_0':
+            self.model = shufflenet_v2_x1_0(weights=ShuffleNet_V2_X1_0_Weights.DEFAULT)
+            self.model.conv1[0] = nn.Conv2d(self.in_channels, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+            self.model.fc = nn.Linear(1024, num_classes)
+        elif self.type == 'squeezenet1_1':
+            self.model = squeezenet1_1(weights=SqueezeNet1_1_Weights.DEFAULT)
+            self.model.features[0] = nn.Conv2d(self.in_channels, 64, kernel_size=(3, 3), stride=(2, 2))
+            self.model.classifier[1] = nn.Conv2d(512, num_classes, kernel_size=(1, 1))
+            self.model.num_classes = num_classes
+        elif self.type == 'efficientnet_b0':
+            self.model = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
+            self.model.features[0][0] = nn.Conv2d(self.in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+            self.model.classifier[1] = nn.Linear(1280, num_classes)
+        elif self.type == 'densenet121':
+            self.model = densenet121(weights=DenseNet121_Weights.DEFAULT)
+            self.model.features.conv0 = nn.Conv2d(self.in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+            self.model.classifier = nn.Linear(1024, num_classes)
+        elif self.type == 'mnasnet0_5':
+            self.model = mnasnet0_5(weights=MNASNet0_5_Weights.DEFAULT)
+            self.model.layers[0] = nn.Conv2d(self.in_channels, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+            self.model.classifier[1] = nn.Linear(1280, num_classes)
+        elif self.type == 'mnasnet1_0':
+            self.model = mnasnet1_0(weights=MNASNet1_0_Weights.DEFAULT)
+            self.model.layers[0] = nn.Conv2d(self.in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+            self.model.classifier[1] = nn.Linear(1280, num_classes)
         elif ('custom' in self.type) or ('cnn' in self.type):
             self.model = CustomCNN(
                                    in_channels=self.in_channels,

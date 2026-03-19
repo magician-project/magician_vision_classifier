@@ -90,7 +90,7 @@ def runSingleFrame(image,model,classes,class_colors,tile_size,step):
 
 
 
-def main(model,classes,num_classes,class_colors,streamName):
+def main(model,classes,class_colors,streamName):
     from SharedMemoryManager import SharedMemoryManager
     smm = SharedMemoryManager("libSharedMemoryVideoBuffers.so", 
                               descriptor = "video_frames.shm", 
@@ -101,11 +101,9 @@ def main(model,classes,num_classes,class_colors,streamName):
     step=16
     tile_size=64
 
-    mode=0 
-    # Loop to continuously read frames 
+    mode=0
+    # Loop to continuously read frames
     while True:
-        play_mp3("beep.mp3") 
-
         # Capture frame-by-frame
         frame = smm.read_from_shared_memory()
         

@@ -42,7 +42,6 @@ def visualizeSKLearnResults(data,numberOfDimensions,principalComponents,label):
      ax2.set_xlabel('Principal Component')
      ax2.set_ylabel('Variance Explained') 
      plt.show()
-     sys.exit(0)
 
 
 """
@@ -381,9 +380,8 @@ class PCA():
         if (self.decompositionType=="dirichlet"):
            doLatentDirichletAllocationUsingSKLearn(data,"Factor Analysis Test") 
         if (self.decompositionType=="svd"):
-           doTruncatedSVDUsingSKLearn(data,"Factor Analysis Test") 
-
-
+           doTruncatedSVDUsingSKLearn(data,"Factor Analysis Test")
+        return
 
     self.numberOfSamplesFittedOn = data.shape[0]
 
@@ -483,9 +481,8 @@ class PCA():
        json_obj = json.dumps(outputDict)
        self.trackedFiles = list()
        self.trackedFiles.append(filename)
-       file = open(filename,'w',encoding="utf-8")
-       file.write(json_obj) 
-       file.close()
+       with open(filename,'w',encoding="utf-8") as file:
+           file.write(json_obj)
 
   def load(self,filename):       
        OKGREEN = '\033[92m'
@@ -496,28 +493,27 @@ class PCA():
            self.trackedFiles = list()
            self.trackedFiles.append(filename)
            import json
-           file = open(filename,'r',encoding="utf-8")
-           data = json.load(file)
+           with open(filename,'r',encoding="utf-8") as file:
+               data = json.load(file)
            #-----------------------------------------------------
            self.numberOfSamplesFittedOn = int(data["numberOfSamplesFittedOn"])
-           self.expectedInputs          = int(data["expectedInputs"]) 
+           self.expectedInputs          = int(data["expectedInputs"])
            self.mean                    = float(data["mean"])
            self.std                     = float(data["std"])
            #-----------------------------------------------------
            numberOfEigenValues = len(data["eigenvalues"])
            print("Eigen values = ",numberOfEigenValues)
-           self.eigenvalues = np.full([numberOfEigenValues],fill_value=0,dtype=np.complex_,order='C')
+           self.eigenvalues = np.full([numberOfEigenValues],fill_value=0,dtype=np.complex128,order='C')
            for i in range(0,numberOfEigenValues):
-               self.eigenvalues[i] = complex(data["eigenvalues"][i]) 
+               self.eigenvalues[i] = complex(data["eigenvalues"][i])
            #-----------------------------------------------------
            numberOfEigenVectors = len(data["eigenvectors"])
            print("Eigen vectors = ",numberOfEigenVectors)
-           self.eigenvectors = np.full([numberOfEigenVectors,numberOfEigenVectors],fill_value=0,dtype=np.complex_,order='C')
+           self.eigenvectors = np.full([numberOfEigenVectors,numberOfEigenVectors],fill_value=0,dtype=np.complex128,order='C')
            for r in range(0,numberOfEigenVectors):
              for c in range(0,numberOfEigenVectors):
-               self.eigenvectors[r,c] = complex(data["eigenvectors"][r][c]) 
+               self.eigenvectors[r,c] = complex(data["eigenvectors"][r][c])
            #-----------------------------------------------------
-           file.close()
            print(OKGREEN,"Success Loading PCA from ",filename,ENDC)
            return True
        print(FAIL,"Failed Loading PCA from ",filename,ENDC)
