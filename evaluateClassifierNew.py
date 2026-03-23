@@ -36,6 +36,7 @@ What it does:
 import json
 import os
 import random
+import math
 import sys
 from collections import Counter, defaultdict
 
@@ -578,13 +579,14 @@ def normalize_metadata_value(value):
     return str(value)
 
 
+
 def bucket_numeric_metadata(value, bin_size=25):
     value = normalize_metadata_value(value)
     try:
-        v = int(float(value))
-        lo = (v // bin_size) * bin_size
+        v = float(value)
+        lo = int(math.floor(v / bin_size) * bin_size)
         hi = lo + bin_size - 1
-        return f"{lo}-{hi}"
+        return f"{lo:04d}-{hi:04d}"
     except Exception:
         return str(value)
 
@@ -655,7 +657,7 @@ def build_metadata_group_reports(
     return reports
 
 
-def print_metadata_group_summary(metadata_group_reports):
+def print_metadata_group_summary_less_verbose(metadata_group_reports):
     print("\n" + "=" * 90)
     print("METADATA GROUP SUMMARY")
     print("=" * 90)
@@ -674,6 +676,38 @@ def print_metadata_group_summary(metadata_group_reports):
                 f"bal_acc={m['balanced_accuracy']:.4f}"
             )
 
+
+def print_metadata_group_summary(metadata_group_reports):
+    print("\n" + "=" * 90)
+    print("METADATA GROUP SUMMARY")
+    print("=" * 90)
+
+    for key, groups in metadata_group_reports.items():
+        print(f"\n--- {key} ---")
+        if not groups:
+            print("  No groups found.")
+            continue
+
+        for value, payload in groups.items():
+            m = payload["metrics"]
+
+            print(
+                f"{key}={value:>12} | "
+                f"samples={payload['num_samples']:5d} | "
+                f"acc={m['accuracy']:.4f} | "
+                f"bal_acc={m['balanced_accuracy']:.4f}"
+            )
+
+            # Per-class stats for this metadata bucket
+            for row in m["per_class"]:
+                print(
+                    f"    class={row['class_name']:<30} "
+                    f"support={row['support']:5d} "
+                    f"acc={row['accuracy']:.4f} "
+                    f"prec={row['precision']:.4f} "
+                    f"rec={row['recall']:.4f} "
+                    f"f1={row['f1']:.4f}"
+                )
 
 def parse_metadata_keys(arg):
     if arg is None:

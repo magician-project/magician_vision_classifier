@@ -8,12 +8,10 @@ License : "FORTH"
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchmetrics import Accuracy, Recall, Precision, AUROC,ConfusionMatrix
+from torchmetrics import Accuracy, Recall, Precision, AUROC
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 import random
 import numpy as np
@@ -46,7 +44,6 @@ from torchvision.models import (
 from torch.nn import functional as F
 import torchvision
 from pytorch_lightning.loggers import WandbLogger
-import wandb
 
 
 torch.set_float32_matmul_precision('high')
@@ -281,9 +278,8 @@ class CustomCNN(nn.Module):
         self.bn4   = nn.BatchNorm2d(c3)
         self.pool4 = nn.MaxPool2d(2)
 
-        prefinalLayerChannels     = int(final_dense_layer * 4.5) 
+        prefinalLayerChannels     = int(final_dense_layer * 4.5)
         intermediateLayerChannels = int(final_dense_layer * 1.5)   # new FC layer
-        finalLayerChannels        = final_dense_layer              # output to final FC
 
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc1 = nn.Linear(c3, prefinalLayerChannels)
@@ -323,7 +319,6 @@ class Classifier(pl.LightningModule):
                       tile_size=64,
                       num_classes=4,
                       dropout_rate=0.1,
-                      train=True,
                       lr=1e-4,
                       AoLP=False,
                       DoLP=False,
@@ -531,7 +526,7 @@ class Classifier(pl.LightningModule):
         x = self.build_input_features(x)
         return self.model(x)
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch, _batch_idx):
         x, y = batch
 
         x = self.add_input_noise(x)
@@ -557,7 +552,7 @@ class Classifier(pl.LightningModule):
         self.log('train_loss', loss, prog_bar=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, _batch_idx):
         x, y = batch
 
         x = self.build_input_features(x)
@@ -830,7 +825,7 @@ def _estimate_dataset_ram_bytes(dataset: Dataset, sample_count: int = 32) -> int
 
     total_bytes = 0
     for idx in indices:
-        x, y = dataset[int(idx)]
+        x, _ = dataset[int(idx)]
         item_bytes = 0
         # x may be a Tensor, numpy array, PIL image, or a tuple/list thereof
         def _payload_bytes(obj):
@@ -969,6 +964,67 @@ class CombinedDataset(Dataset):
 
         raise RuntimeError("CombinedDataset indexing error")
 
+class BalancedBatchSampler(torch.utils.data.Sampler):
+    """
+    Yields batches where every class is represented at least once.
+
+    - slots_per_class = batch_size // num_classes  (guaranteed per-class slots)
+    - extra_slots     = batch_size  % num_classes  (filled randomly from all indices)
+
+    One epoch = ceil(largest_class_size / slots_per_class) batches, so the
+    majority class is seen roughly once; minority classes are oversampled
+    proportionally.  This prevents any batch from being entirely dominated by
+    the clean/majority class.
+    """
+    def __init__(self, targets, num_classes: int, batch_size: int):
+        if batch_size < num_classes:
+            raise ValueError(
+                f"batch_size ({batch_size}) must be >= num_classes ({num_classes}) "
+                f"for balanced sampling."
+            )
+        self.num_classes    = num_classes
+        self.batch_size     = batch_size
+        self.slots_per_class = batch_size // num_classes
+        self.extra_slots    = batch_size % num_classes
+
+        targets_np = np.asarray(targets)
+        self.class_indices = [
+            np.where(targets_np == c)[0].tolist()
+            for c in range(num_classes)
+        ]
+
+        empty = [c for c, ci in enumerate(self.class_indices) if len(ci) == 0]
+        if empty:
+            raise ValueError(f"Classes {empty} have zero samples — cannot balance.")
+
+        self._len = max(len(ci) for ci in self.class_indices) // self.slots_per_class
+
+    def __len__(self):
+        return self._len
+
+    def __iter__(self):
+        pools = [random.sample(ci, len(ci)) for ci in self.class_indices]
+        ptrs  = [0] * self.num_classes
+        all_flat = [idx for ci in self.class_indices for idx in ci]
+
+        for _ in range(self._len):
+            batch = []
+
+            for c in range(self.num_classes):
+                for _ in range(self.slots_per_class):
+                    if ptrs[c] >= len(pools[c]):
+                        pools[c] = random.sample(self.class_indices[c], len(self.class_indices[c]))
+                        ptrs[c]  = 0
+                    batch.append(pools[c][ptrs[c]])
+                    ptrs[c] += 1
+
+            if self.extra_slots:
+                batch.extend(random.sample(all_flat, self.extra_slots))
+
+            random.shuffle(batch)
+            yield batch
+
+
 def print_class_distribution(dataset, title="Dataset"):
     """
     Prints number of samples per class.
@@ -1024,6 +1080,7 @@ if __name__ == "__main__":
     tile_size         = config_json['hparams']['tile_size']
     val_split         = config_json['dataloader']['validation_split']
     num_workers       = config_json['dataloader']['num_workers']
+    balanced_sampling = config_json['dataloader'].get('balanced_sampling', False)
     gradient_clip_val = config_json['hparams']['gradient_clip_value']
     class_weight      = config_json['class_weight']
     lr                = config_json['optimizer']['learning_rate']
@@ -1204,22 +1261,37 @@ if __name__ == "__main__":
 
 
     # Create DataLoaders
-    train_loader = DataLoader(
-                              train_dataset,
-                              batch_size=batch_size,
-                              shuffle=True,
-                              num_workers=num_workers,
-                              drop_last=True,
-                              #collate_fn=metadata_collate_fn,
-                             )
+    if balanced_sampling:
+        if isinstance(train_dataset, torch.utils.data.Subset):
+            train_targets = [train_dataset.dataset.targets[i] for i in train_dataset.indices]
+        else:
+            train_targets = train_dataset.targets
+        print(f"Using BalancedBatchSampler (batch_size={batch_size}, num_classes={len(dataset.classes)})")
+        balanced_sampler = BalancedBatchSampler(
+            targets     = train_targets,
+            num_classes = len(dataset.classes),
+            batch_size  = batch_size,
+        )
+        train_loader = DataLoader(
+                                  train_dataset,
+                                  batch_sampler=balanced_sampler,
+                                  num_workers=num_workers,
+                                 )
+    else:
+        train_loader = DataLoader(
+                                  train_dataset,
+                                  batch_size=batch_size,
+                                  shuffle=True,
+                                  num_workers=num_workers,
+                                  drop_last=True,
+                                 )
 
     val_loader  = DataLoader(
                             val_dataset,
                             batch_size=batch_size,
-                            shuffle=False,  # Typically, we don't shuffle the validation set
+                            shuffle=False,
                             num_workers=num_workers,
                             drop_last=True,
-                            #collate_fn=metadata_collate_fn,
                            )
 
     #Print class names as a sanity check
