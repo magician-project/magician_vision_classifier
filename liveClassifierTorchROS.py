@@ -108,12 +108,16 @@ def resize_to_fit_screen(img, max_w=1280, max_h=720, only_shrink=True):
 
 
 
-def filterType(det_type: str):
+def filter_type(det_type: str):
     """
-    det_type might be 'class_NegativeDentClassB'
-    returns: ('NegativeDent', 'ClassB')
+    Strip the 'class_' prefix and trailing severity suffix from a detection label.
+
+    Example: 'class_NegativeDentClassB' -> ('NegativeDent', 'ClassB')
+
+    Returns:
+        (clean_type, det_class) where det_class is one of 'ClassA/B/C' or 'Unknown'.
     """
-    det_class = "Unknown"
+    det_class  = "Unknown"
     clean_type = det_type
 
     if clean_type.startswith("class_"):
@@ -121,25 +125,19 @@ def filterType(det_type: str):
 
     for cls in ("ClassA", "ClassB", "ClassC"):
         if clean_type.endswith(cls):
-            det_class = cls
+            det_class  = cls
             clean_type = clean_type[:-len(cls)]
             break
 
     return clean_type, det_class
 
 
+# DetectionM.msg severity convention: ClassA=1, ClassB=2, ClassC=3, unknown=0
+_SEVERITY_MAP: dict[str, int] = {"ClassA": 1, "ClassB": 2, "ClassC": 3}
+
 def class_to_severity(det_class: str) -> int:
-    # DetectionM.msg convention (as you described):
-    #   SEVERITY_CLASS_A = 1
-    #   SEVERITY_CLASS_B = 2
-    #   SEVERITY_CLASS_C = 3
-    if det_class == "ClassA":
-        return 1
-    if det_class == "ClassB":
-        return 2
-    if det_class == "ClassC":
-        return 3
-    return 0
+    """Map a severity class label to the DetectionM integer severity field."""
+    return _SEVERITY_MAP.get(det_class, 0)
 
 
 def idw_depth(x: float, y: float, xy_list, d_list, p: float = 2.0) -> float:
@@ -384,21 +382,25 @@ class DefectPublisher(Node):
         return response
 
     def _save_current_frame(self, prefix: str):
-        if self._last_frame is None:
-                return False, "No frame available to save."
+        # Take a snapshot under the lock so the main thread can't replace the frame
+        # while we are reading it (data race between main loop and ROS spin thread).
+        with self._lock:
+            frame = self._last_frame
+
+        if frame is None:
+            return False, "No frame available to save."
 
         now = datetime.now()
-        filename = ( 
-                    f"{prefix}_"
-                    f"{now.year:04d}_{now.month:02d}_{now.day:02d}_"
-                    f"{now.hour:02d}_{now.minute:02d}_{now.second:02d}_"
-                    f"{int(now.microsecond/1000):03d}.png"
-                   )
-
+        filename = (
+            f"{prefix}_"
+            f"{now.year:04d}_{now.month:02d}_{now.day:02d}_"
+            f"{now.hour:02d}_{now.minute:02d}_{now.second:02d}_"
+            f"{int(now.microsecond / 1000):03d}.png"
+        )
         full_path = os.path.join(self._output_path, filename)
 
         try:
-            cv2.imwrite(full_path, self._last_frame)
+            cv2.imwrite(full_path, frame)
             return True, f"Saved: {full_path}"
         except Exception as e:
             return False, str(e)
@@ -491,7 +493,7 @@ class DefectPublisher(Node):
 
     def scan_and_publish_markers(self, frame):
         """Detect ArUco markers and chessboard in *frame*, publish a Marker msg for each hit."""
-        print("[Markers] Scanning frame...")
+        self.get_logger().info("Scanning frame for markers...")
 
         if len(frame.shape) == 2 or frame.shape[2] == 1:
             gray = frame if len(frame.shape) == 2 else frame[:, :, 0]
@@ -500,20 +502,19 @@ class DefectPublisher(Node):
         K, dist = self._get_camera_matrix(frame)
 
         # --- ArUco ---
-        print("[Markers] Running ArUco detection...")
+        self.get_logger().debug("Running ArUco detection...")
         corners, ids, _ = self._aruco_detector.detectMarkers(gray)
         if ids is not None:
-            print(f"[Markers] Found {len(ids)} ArUco marker(s): {ids.flatten().tolist()}")
+            self.get_logger().info(f"Found {len(ids)} ArUco marker(s): {ids.flatten().tolist()}")
             rvecs, tvecs = estimatePoseSingleMarkers(corners, DEFAULT_MARKER_LENGTH_M, K, dist)
             for marker_id, rvec, tvec in zip(ids.flatten(), rvecs, tvecs):
                 tvec_flat = tvec.flatten()
-                print(f"[Markers]   id={marker_id}  tvec=[{tvec_flat[0]:.3f}, {tvec_flat[1]:.3f}, {tvec_flat[2]:.3f}] m")
-                self.publish_marker(str(int(marker_id)), tvec, rvec)
-                self.get_logger().debug(
-                    f"ArUco id={marker_id} tvec={tvec.tolist()}"
+                self.get_logger().info(
+                    f"  id={marker_id}  tvec=[{tvec_flat[0]:.3f}, {tvec_flat[1]:.3f}, {tvec_flat[2]:.3f}] m"
                 )
+                self.publish_marker(str(int(marker_id)), tvec, rvec)
         else:
-            print("[Markers] No ArUco markers found.")
+            self.get_logger().info("No ArUco markers found.")
 
         # --- Chessboard (disabled: too slow) ---
         # print(f"[Markers] Running chessboard detection ({CHESSBOARD_W}x{CHESSBOARD_H})...")
@@ -543,43 +544,43 @@ class DefectPublisher(Node):
         #         print("[Markers] PnP solve failed for chessboard.")
         # else:
         #     print("[Markers] No chessboard found.")
-        print("[Markers] Scan complete.")
+        self.get_logger().info("Marker scan complete.")
 
-    def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z = 0.0):
+    def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z=0.0):
         try:
-          msg = Detection()
-          msg.x     = int(x)
-          msg.y     = int(y)
-          msg.w     = int(w)
-          msg.h     = int(h)
-          msg.depth = float(depth_z)
-          msg.type  = det_type
-          msg.class_name = det_class  # 'class' is reserved in Python
-          msg.probability = float(probability)
-          self.publisher_.publish(msg)
+            msg = Detection()
+            msg.x           = int(x)
+            msg.y           = int(y)
+            msg.w           = int(w)
+            msg.h           = int(h)
+            msg.depth       = float(depth_z)
+            msg.type        = det_type
+            msg.class_name  = det_class  # 'class' is a reserved keyword in Python
+            msg.probability = float(probability)
+            self.publisher_.publish(msg)
         except Exception as e:
-          print("Failed to publish detection")
+            self.get_logger().error(f"Failed to publish detection: {e}")
 
     def publish_detection_m(self, cx, cy, severity, depth_z):
         if (not USE_LASERS) or (self.publisher_m is None):
             return
         try:
-          msg = DetectionM()
-          msg.severity = int(severity)
+            msg = DetectionM()
+            msg.severity = int(severity)
 
-          pose = Pose()
-          pose.position.x = float(cx)
-          pose.position.y = float(cy)
-          pose.position.z = float(depth_z)
-          pose.orientation.w = 1.0  # identity
-          pose.orientation.x = 0.0
-          pose.orientation.y = 0.0
-          pose.orientation.z = 0.0
+            pose = Pose()
+            pose.position.x    = float(cx)
+            pose.position.y    = float(cy)
+            pose.position.z    = float(depth_z)
+            pose.orientation.w = 1.0  # identity quaternion
+            pose.orientation.x = 0.0
+            pose.orientation.y = 0.0
+            pose.orientation.z = 0.0
 
-          msg.location = pose
-          self.publisher_m.publish(msg)
+            msg.location = pose
+            self.publisher_m.publish(msg)
         except Exception as e:
-          print("Failed to publish detection_m")
+            self.get_logger().error(f"Failed to publish detection_m: {e}")
 
 
 # ========================================================
@@ -596,27 +597,28 @@ def main():
     PATH="."
 
     # Initialize Neural Networks (both modes)
-    SingleClassifier = ClassifierPnm(
-        model_path="%s/allclass_resnet18.pth" % PATH,
-        cfg_path="%s/allclass_resnet18.json" % PATH,
+    single_classifier = ClassifierPnm(
+        model_path=f"{PATH}/allclass_resnet18.pth",
+        cfg_path=f"{PATH}/allclass_resnet18.json",
     )
 
-    EnsembleClassifier = EnsembleClassifierPnm(
+    ensemble_classifier = EnsembleClassifierPnm(
         initial_model_cfg=(
-            "%s/binary_small_cnn.pth" % PATH,
-            "%s/binary_small_cnn.json" % PATH,
+            f"{PATH}/binary_small_cnn.pth",
+            f"{PATH}/binary_small_cnn.json",
         ),
         model_cfg_list=[
-            ("%s/allclass_verysmall_cnn.pth"% PATH, "%s/allclass_verysmall_cnn.json"% PATH),
-            ("%s/allclass_resnet18.pth"% PATH, "%s/allclass_resnet18.json"% PATH),
-            ("%s/allclass_resnext50.pth"% PATH, "%s/allclass_resnext50.json"% PATH),
-            # ("%s/allclass_efficientnet_v2_s.pth"% PATH, "%s/allclass_efficientnet_v2_s.json"% PATH),  # slowest
-            ("%s/allclass_convnext_tiny.pth"% PATH, "%s/allclass_convnext_tiny.json"% PATH),
+            (f"{PATH}/allclass_verysmall_cnn.pth", f"{PATH}/allclass_verysmall_cnn.json"),
+            (f"{PATH}/allclass_resnet18.pth",       f"{PATH}/allclass_resnet18.json"),
+            (f"{PATH}/allclass_resnext50.pth",      f"{PATH}/allclass_resnext50.json"),
+            # (f"{PATH}/allclass_efficientnet_v2_s.pth", f"{PATH}/allclass_efficientnet_v2_s.json"),  # slowest
+            (f"{PATH}/allclass_convnext_tiny.pth",  f"{PATH}/allclass_convnext_tiny.json"),
         ],
     )
 
-    torch.set_float32_matmul_precision("medium")
-    tile_size = 0  # invalid value to ensure it is observed
+    # Use the same precision setting as training for consistent numeric behaviour.
+    torch.set_float32_matmul_precision("high")
+    tile_size = 0  # updated inside the inference block each iteration
 
     # Shared memory frame source
     stream_name = "stream1"
@@ -627,7 +629,7 @@ def main():
         connect=True,
     )
 
-    majorityVotingConfiguration = True
+    majority_voting = True
 
     try:
         while True:
@@ -637,7 +639,7 @@ def main():
 
             # Get image to work on
             if frame is None or smm.frame_size == 0:
-                print("Error: Couldn't read frame from Shared Memory")
+                ros_node.get_logger().warning("Couldn't read frame from Shared Memory")
                 time.sleep(0.1)
                 continue
 
@@ -655,24 +657,24 @@ def main():
             # Run the neural network
             with torch.inference_mode():
                 if ros_node.two_stage_enabled():
-                    EnsembleClassifier.step = ros_node.get_step_size()
-                    EnsembleClassifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
-                    tile_size = EnsembleClassifier.tile_size
+                    ensemble_classifier.step = ros_node.get_step_size()
+                    ensemble_classifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
+                    tile_size = ensemble_classifier.tile_size
 
-                    heatmap, occupancy, responses = EnsembleClassifier.forward(
+                    heatmap, occupancy, responses = ensemble_classifier.forward(
                         frame,
-                        majorityVote=majorityVotingConfiguration,
+                        majorityVote=majority_voting,
                         parallel=True,
                         multimodel=True,
                     )
                 else:
-                    SingleClassifier.step = ros_node.get_step_size()
-                    SingleClassifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
-                    tile_size = SingleClassifier.tile_size
+                    single_classifier.step = ros_node.get_step_size()
+                    single_classifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
+                    tile_size = single_classifier.tile_size
 
-                    heatmap, occupancy, responses = SingleClassifier.forward(
+                    heatmap, occupancy, responses = single_classifier.forward(
                         frame,
-                        majorityVote=majorityVotingConfiguration,
+                        majorityVote=majority_voting,
                         erosion_kernel=0,
                         erosion_threshold=0,
                     )
@@ -683,7 +685,7 @@ def main():
             confidences = responses.get("confidences", [])
 
             for (x, y), description, confidence in zip(points, classes, confidences):
-                det_type, det_class = filterType(description)
+                det_type, det_class = filter_type(description)
 
 
                 z = 0.0
@@ -730,7 +732,7 @@ def main():
                     time.sleep(sleep_time)
 
     except KeyboardInterrupt:
-        print("Interrupted by user.")
+        ros_node.get_logger().info("Interrupted by user.")
 
     finally:
         ros_node.destroy_node()

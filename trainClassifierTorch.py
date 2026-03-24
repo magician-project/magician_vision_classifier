@@ -6,23 +6,24 @@ Copyright : "2025 Foundation of Research and Technology, Computer Science Depart
 License : "FORTH" 
 """
 
+import datetime
+import glob
+import json
+import os
+import random
+import shutil
+import subprocess
+import sys
+from collections import Counter
+
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
-from torchmetrics import Accuracy, Recall, Precision, AUROC
-import pytorch_lightning as pl
-from pytorch_lightning.loggers import TensorBoardLogger
-import random
-import numpy as np
-import datetime
-import json
-from collections import Counter
-import sys
-import os
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, random_split
+import torchvision
 from PIL import Image
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset, random_split
+from torchvision import datasets, transforms
 from torchvision.models import (
     resnet18, ResNet18_Weights,
     convnext_tiny, ConvNeXt_Tiny_Weights,
@@ -41,12 +42,9 @@ from torchvision.models import (
     mnasnet0_5, MNASNet0_5_Weights,
     mnasnet1_0, MNASNet1_0_Weights,
 )
-from torch.nn import functional as F
-import torchvision
-from pytorch_lightning.loggers import WandbLogger
-
-
-torch.set_float32_matmul_precision('high')
+from torchmetrics import Accuracy, Recall, Precision, AUROC
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 
 
 def filter_dataset_classes(dataset, keep_classes):
@@ -447,8 +445,11 @@ class Classifier(pl.LightningModule):
         else:
             raise ValueError(f"Unsupported model type: {model}. Supported types are 'resnext50', 'resnet18', 'convnext_tiny', 'efficientnet_v2_s', 'swin_v2_t', 'regnet_y_800mf'.")
 
-        if (load_checkpoint is not None):
-           self.model = Classifier.load_from_checkpoint(load_checkpoint)
+        if load_checkpoint is not None:
+            # load_from_checkpoint returns a full Classifier (LightningModule), not a bare
+            # backbone. Copy only the backbone weights so self.model keeps the correct type.
+            loaded = Classifier.load_from_checkpoint(load_checkpoint)
+            self.model.load_state_dict(loaded.model.state_dict())
 
         if loss == 'focal':
             self.criterion = CategoricalFocalLoss(gamma=2.0, alpha=None)
@@ -555,9 +556,9 @@ class Classifier(pl.LightningModule):
     def validation_step(self, batch, _batch_idx):
         x, y = batch
 
-        x = self.build_input_features(x)
-
-        y_hat = self.model(x)
+        # Use self(x) — goes through the canonical forward() path.
+        # Note: add_input_noise is intentionally skipped here (noise is training-only).
+        y_hat = self(x)
         loss  = self.criterion(y_hat, y)
         self.log('val_loss', loss, sync_dist=True)
 
@@ -609,15 +610,17 @@ class Classifier(pl.LightningModule):
         return AoLP
 
     def on_validation_epoch_end(self):
+        # Reset ALL metrics to prevent cross-epoch accumulation.
+        # (Previously only accuracy was reset — recall/precision/auroc were silently wrong.)
         self.accuracy.reset()
-
-    def on_train_epoch_end(self):
-        self.accuracy.reset()
+        self.recall.reset()
+        self.precision.reset()
+        self.auroc.reset()
 
     def configure_optimizers(self):
-        self.hparams.lr = self.lr
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.hparams.lr)
-        return optimizer
+        # Optimize self.parameters() (all module params) rather than just self.model.parameters(),
+        # so any future additions to Classifier itself are covered automatically.
+        return torch.optim.AdamW(self.parameters(), lr=self.lr)
 
 
 def load_png_comment_metadata(image_path):
@@ -721,15 +724,6 @@ def load_rgba_image(image_path):
     return rgba_image
 
 
-class RGBAImageFolderOLD(datasets.DatasetFolder):
-    def __init__(self, root, transform=None):
-        super(RGBAImageFolder, self).__init__(
-                root,
-                loader=load_rgba_image,  # Use custom loader for RGBA images
-                extensions=('png', 'jpg', 'jpeg'),  # Add supported image extensions
-                transform=transform
-            )
-
 class RGBAImageFolder(datasets.DatasetFolder):
     def __init__(self, root, transform=None, return_metadata=False):
         super(RGBAImageFolder, self).__init__(
@@ -758,14 +752,13 @@ class RGBAImageFolder(datasets.DatasetFolder):
 
 
 def _human_bytes(num_bytes: int) -> str:
-    # Human-friendly binary units
+    """Return a human-readable representation of a byte count (e.g. '1.23 GiB')."""
     units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
     n = float(num_bytes)
     for u in units:
         if n < 1024.0 or u == units[-1]:
             return f"{n:.2f} {u}"
         n /= 1024.0
-    return f"{n:.2f} B"
 
 
 def _get_available_ram_bytes() -> int:
@@ -825,7 +818,8 @@ def _estimate_dataset_ram_bytes(dataset: Dataset, sample_count: int = 32) -> int
 
     total_bytes = 0
     for idx in indices:
-        x, _ = dataset[int(idx)]
+        item = dataset[int(idx)]
+        x = item[0]  # always the tensor; ignore label and optional metadata tuple
         item_bytes = 0
         # x may be a Tensor, numpy array, PIL image, or a tuple/list thereof
         def _payload_bytes(obj):
@@ -1058,6 +1052,9 @@ def print_class_distribution(dataset, title="Dataset"):
 
 #Main
 if __name__ == "__main__":
+    # Enable TF32 for faster matmul on Ampere+ GPUs without losing meaningful precision.
+    torch.set_float32_matmul_precision('high')
+
     configuration_file = "config.json"
     if len(sys.argv) > 1:
         configuration_file = sys.argv[1]
@@ -1291,7 +1288,7 @@ if __name__ == "__main__":
                             batch_size=batch_size,
                             shuffle=False,
                             num_workers=num_workers,
-                            drop_last=True,
+                            drop_last=False,  # never discard validation samples
                            )
 
     #Print class names as a sanity check
@@ -1352,8 +1349,9 @@ if __name__ == "__main__":
     if use_wandb:
         loggers = [TensorBoardLogger("lightning_logs", name="classifier"),  WandbLogger(project=config_json['wandb']['project'], log_model=True,name=config_json['wandb']['name']+model_type+loss)]
     else:
-        if (checkIfPathExists("tensorboard/")):
-           os.system("echo \"Removing previous tensorboard logs..\" && rm -rf tensorboard/")
+        if checkIfPathExists("tensorboard/"):
+            print("Removing previous tensorboard logs..")
+            shutil.rmtree("tensorboard/", ignore_errors=True)
         loggers = [TensorBoardLogger("tensorboard", name=model_name)]
 
     trainer = pl.Trainer(
@@ -1394,54 +1392,51 @@ if __name__ == "__main__":
     #------------------------------------------------------------------
 
     try:
-      print("Removing previous confusion matrix data..")
-      os.system("rm %s_confusion.json %s*.png" % (model_name,model_name) ) #Create zip of models
+        print("Removing previous confusion matrix data..")
+        for stale in glob.glob(f"{model_name}_confusion.json") + glob.glob(f"{model_name}*.png"):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
 
-      print("Generating new confusion matrix data..")
-      #Print confusion matrix numpy
-      #------------------------------------------------------------------
-      y_true = []
-      y_pred = []
-      """
-      for x, y in val_loader:
-        y_true.extend(y.numpy())
-        y_pred.extend(classifier(x).argmax(dim=1).numpy())
-      """
-      for x, y in val_loader:
-          x = x.to(classifier.device)
-          y_true.extend(y.cpu().numpy())
-          y_pred.extend(classifier(x).argmax(dim=1).detach().cpu().numpy())
+        print("Generating new confusion matrix data..")
+        y_true = []
+        y_pred = []
 
-      #num_classes = len(set(y_true))+1  # or classifier(x).shape[1]
-      num_classes = len(dataset.classes)
-      confusion_matrix = np.zeros((num_classes, num_classes), dtype=int)
+        # torch.no_grad() prevents graph construction for every batch (saves memory).
+        with torch.no_grad():
+            for x, y in val_loader:
+                x = x.to(classifier.device)
+                y_true.extend(y.cpu().numpy())
+                y_pred.extend(classifier(x).argmax(dim=1).cpu().numpy())
 
-      for true, pred in zip(y_true, y_pred):
-        confusion_matrix[true, pred] += 1
-      print(confusion_matrix)
-      #------------------------------------------------------------------
+        num_classes = len(dataset.classes)
+        confusion_matrix = np.zeros((num_classes, num_classes), dtype=int)
+        for true, pred in zip(y_true, y_pred):
+            confusion_matrix[true, pred] += 1
+        print(confusion_matrix)
 
-      # Convert confusion matrix and classes to JSON-serializable form
-      #------------------------------------------------------------------
-      config_json["confusion_matrix"] = confusion_matrix.tolist()
-      config_json["classes_int"] = [int(c) for c in set(y_true)]  # force Python ints
-      config_json["classes"] = dataset.classes
+        # Embed confusion matrix in the main config JSON
+        config_json["confusion_matrix"] = confusion_matrix.tolist()
+        config_json["classes_int"] = [int(c) for c in set(y_true)]
+        config_json["classes"] = dataset.classes
 
-
-      # Create extra summary JSON 
-      #------------------------------------------------------------------
-      print("Generating confusion matrix plot")
-      confusion_json = {
-                        "title": "%s / Tile Size = %u / Epochs = %u " % (model_name,tile_size,epochs),
-                        "labels": dataset.classes, 
-                        "matrix": confusion_matrix.tolist() 
-                       }
-      with open('%s_confusion.json' % model_name, 'w') as f:
-       json.dump(confusion_json, f, indent=2)
-      os.system("python3 plotTool.py %s_confusion.json" % model_name)
+        # Write a separate confusion JSON and generate the plot image
+        print("Generating confusion matrix plot")
+        confusion_json = {
+            "title":  f"{model_name} / Tile Size = {tile_size} / Epochs = {epochs}",
+            "labels": dataset.classes,
+            "matrix": confusion_matrix.tolist(),
+        }
+        with open(f"{model_name}_confusion.json", "w") as f:
+            json.dump(confusion_json, f, indent=2)
+        subprocess.run(
+            ["python3", "plotTool.py", f"{model_name}_confusion.json"], check=False
+        )
     except Exception as e:
-      print("Failed generating a confusion matrix : ",e)
-      os.system("echo \"Failed\" > %s_confusion.json" % model_name)
+        print("Failed generating a confusion matrix:", e)
+        with open(f"{model_name}_confusion.json", "w") as f:
+            f.write("Failed\n")
 
 
     #Save the JSON 
@@ -1461,9 +1456,14 @@ if __name__ == "__main__":
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     zip_name = f"{model_name}_{timestamp}.zip"
 
-    print("Saving everything as %s archive" % zip_name)
-    os.system("mkdir models/")
-    os.system("zip -r models/%s %s.json %s_confusion.json %s*.png %s.pth tensorboard/*/*/*" % (zip_name,model_name,model_name,model_name,model_name) ) #Create zip of models
+    print(f"Saving everything as {zip_name} archive")
+    os.makedirs("models/", exist_ok=True)
+    zip_inputs = (
+        [f"{model_name}.json", f"{model_name}_confusion.json", f"{model_name}.pth"]
+        + glob.glob(f"{model_name}*.png")
+        + glob.glob("tensorboard/*/*/*")
+    )
+    subprocess.run(["zip", "-r", f"models/{zip_name}"] + zip_inputs, check=False)
 
 
     print('To upload ALL models copy/paste:') 
