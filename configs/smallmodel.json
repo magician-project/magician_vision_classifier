@@ -2,7 +2,7 @@
     "hparams":{
       "tile_size": 48,
       "batch_size": 64,
-      "training_epochs": 25,
+      "training_epochs": 10,
       "dropout_rate": 0.25,
       "seed": 42,
       "gradient_clip_value": 1.0,
@@ -29,21 +29,22 @@
         "validation_split": 0.05,
         "shuffle": false,
         "label_mode": "categorical",
-        "num_workers": 12
-        
+        "cacheAllDataToRAM": false,
+        "num_workers": 12,
+        "balanced_sampling": true
     },
     "wandb": {
         "project": "Classifier",
         "name": "AmmarConfig",
         "use_wandb": false
     },
-    "directory": "keras_dataset/",
+    "training_dataset": "/storage/ammarkov/datasets/MagicianProcessedDatasets/MagicianAltinayOnlyDataset/",
     "class_weight": false,
     "loss": "focal",
     "penalize_false_clean": 0.0,
     "accelerator": "auto",
     "name": "allclass",
-    "model": "small_cnn",
+    "model": "custom",
     "devices": 1,
     "selected_classes": [ ]
   }

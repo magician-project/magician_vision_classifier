@@ -29,6 +29,7 @@
         "validation_split": 0.05,
         "shuffle": false,
         "label_mode": "categorical",
+        "cacheAllDataToRAM": true,
         "num_workers": 12
         
     },
@@ -37,7 +38,7 @@
         "name": "AmmarConfig",
         "use_wandb": false
     },
-    "directory": "binary_dataset/",
+    "training_dataset": "binary_dataset/",
     "class_weight": false,
     "loss": "focal",
     "penalize_false_clean": 16.0,
