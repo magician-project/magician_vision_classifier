@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 import pytorch_lightning as pl
 import torch
-from trainClassifierTorch import Classifier
+from trainMagicianVisionClassifierTorch import Classifier
 #from numba import njit #Test
 from readData import readPolarPNMToRGBALive#,readPolarPNMToRGBAResized
 from SharedMemoryManager import SharedMemoryManager
@@ -556,9 +556,11 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
     original_image = torch.as_tensor(rgba_image, dtype=torch.uint8)
     height, width, _ = original_image.shape
 
-    tilesH = (height - tile_size) // step
-    tilesW = (width - tile_size)  // step
-    expected_tiles = (tilesH) * (tilesW)
+    y_indices = torch.arange(0, height - tile_size, step)
+    x_indices = torch.arange(0, width  - tile_size, step)
+    tilesH = len(y_indices)
+    tilesW = len(x_indices)
+    expected_tiles = tilesH * tilesW
 
     #if len(predictions) != expected_tiles:
     if not (verifyTileNumber(len(predictions), original_image, tile_size, step)):
@@ -568,9 +570,6 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
     responses = {"points": [], "classes": [], "classIDs": [],  "confidences": []}
     heatmap = original_image[:, :, :3].clone()
     activations = torch.zeros(len(class_id_to_name), dtype=torch.int32)
-
-    y_indices = torch.arange(0, height - tile_size, step)
-    x_indices = torch.arange(0, width  - tile_size, step)
 
     predicted_classes = torch.as_tensor(predictions, dtype=torch.int32)
     totalActivations = 0
@@ -636,9 +635,11 @@ def process_predictions_erode(predictions, confidences, class_id_to_name, cleanC
     original_image   = torch.as_tensor(rgba_image, dtype=torch.uint8)
     height, width, _ = original_image.shape
 
-    tilesH           = (height - tile_size) // step
-    tilesW           = (width - tile_size)  // step
-    expected_tiles   = (tilesH) * (tilesW)
+    y_indices = torch.arange(0, height - tile_size, step)
+    x_indices = torch.arange(0, width - tile_size, step)
+    tilesH           = len(y_indices)
+    tilesW           = len(x_indices)
+    expected_tiles   = tilesH * tilesW
 
     #if len(predictions) != expected_tiles:
     if not (verifyTileNumber(len(predictions), original_image, tile_size, step)):
@@ -648,9 +649,6 @@ def process_predictions_erode(predictions, confidences, class_id_to_name, cleanC
     responses = {"points": [], "classes": [], "classIDs": [],  "confidences": []}
     heatmap = original_image[:, :, :3].clone()
     activations = torch.zeros(len(class_id_to_name), dtype=torch.int32)
-
-    y_indices = torch.arange(0, height - tile_size, step)
-    x_indices = torch.arange(0, width - tile_size, step)
 
     predicted_classes = torch.as_tensor(predictions, dtype=torch.int32)
     totalActivations = 0
@@ -819,10 +817,17 @@ def draw_heatmap(rgba_image, responses, class_id_to_color, size=10):
 def classify_tiles(model, rgba_image, tile_size=64, step=0,
                    chunks=0, majorityVote=True,
                    thresholdMaxProbability=0.50,
-                   forceLowMaxProbToThisClass=None):
+                   forceLowMaxProbToThisClass=None,
+                   return_torch=False,
+                   return_tiles=False):
     """
     Classify tiles efficiently, returning integer class IDs.
-    Matches exactly the number of tiles produced by tile_and_cast_data_torch.
+
+    return_torch : if True, return GPU tensors instead of numpy arrays (avoids
+                  GPU→CPU copy when the caller immediately wraps back to tensor).
+    return_tiles : if True, return the tile tensor (N, C, tile_size, tile_size) as
+                  a third return value so the caller can reuse it for stage-2 without
+                  re-running unfold.
     """
     start = time.time()
 
@@ -834,14 +839,13 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
     if npTiles.shape[1:] != (channels, tile_size, tile_size):
         raise ValueError(f"Expected {channels}x{tile_size}x{tile_size}, got {npTiles.shape[1:]}")
 
-    softmax = torch.nn.Softmax(dim=1)
     low_activations = 0
 
     # Predict in one pass or in chunks
     if chunks == 0:
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             preds = model(npTiles)
-        probs = softmax(preds)
+        probs = torch.nn.functional.softmax(preds.float(), dim=1)
         max_probs, predictions = torch.max(probs, dim=1)
         if forceLowMaxProbToThisClass is not None and thresholdMaxProbability > 0.0:
             mask = max_probs < thresholdMaxProbability
@@ -850,29 +854,43 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
     else:
         preds_list = []
         for chunk in npTiles.chunk(chunks):
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 preds_list.append(model(chunk))
         preds = torch.cat(preds_list)
-        probs = softmax(preds)
+        probs = torch.nn.functional.softmax(preds.float(), dim=1)
         max_probs, predictions = torch.max(probs, dim=1)
         if forceLowMaxProbToThisClass is not None and thresholdMaxProbability > 0.0:
             mask = max_probs < thresholdMaxProbability
             low_activations += mask.sum().item()
             predictions[mask] = forceLowMaxProbToThisClass
 
-    max_probs   = max_probs.cpu().numpy()
-    predictions = predictions.cpu().numpy()
     print(f"Low-confidence tiles reassigned: {low_activations}")
 
-    # Spatial smoothing (optional)
+    # Spatial smoothing (optional) — must happen before optional CPU conversion
     if majorityVote:
         h, w, _ = rgba_image.shape
         tilesHorizontally = (w - tile_size) // step
         tilesVertically   = (h - tile_size) // step
-        predictions = majority_vote_2d_pytorch(predictions, tilesHorizontally, tilesVertically, window_size=3)
+        predictions_np = majority_vote_2d_pytorch(
+            predictions.cpu().numpy(), tilesHorizontally, tilesVertically, window_size=3)
+        max_probs_np = max_probs.cpu().numpy().flatten()
+        print(f"classify_tiles done in {time.time() - start:.2f}s, got {len(predictions_np)} tiles")
+        if return_tiles:
+            return predictions_np.flatten(), max_probs_np, npTiles
+        return predictions_np.flatten(), max_probs_np
 
     print(f"classify_tiles done in {time.time() - start:.2f}s, got {len(predictions)} tiles")
-    return predictions.flatten(), max_probs.flatten()
+
+    if return_torch:
+        if return_tiles:
+            return predictions, max_probs, npTiles
+        return predictions, max_probs
+
+    out_preds = predictions.cpu().numpy().flatten()
+    out_confs = max_probs.cpu().numpy().flatten()
+    if return_tiles:
+        return out_preds, out_confs, npTiles
+    return out_preds, out_confs
 
 
 
@@ -920,8 +938,10 @@ def runSingle(image,
                                               forceLowMaxProbToThisClass=cleanClassID,
                                              )
     print(bcolors.OKGREEN)
-    hz = 1/(time.time()-start+1e-4)
-    print("%s / step=%u / inference @ %0.2f Hz" % (name,step,hz))
+    elapsed = time.time() - start + 1e-4
+    hz = 1.0 / elapsed
+    tiles_per_sec = len(predictions) / elapsed
+    print("%s / step=%u / inference @ %0.2f Hz  (%d tiles, %.0f tiles/sec)" % (name, step, hz, len(predictions), tiles_per_sec))
     print(bcolors.ENDC)
 
     if (log):
@@ -1132,17 +1152,39 @@ class ClassifierPnm:
         return model
 
     @staticmethod
+    def _is_valid_pth(path):
+        """Return True if the file is a readable zip/pickle (PyTorch checkpoint)."""
+        try:
+            import zipfile
+            if zipfile.is_zipfile(path):
+                return True
+            # Older pickle-based checkpoints start with the magic bytes \x80\x02
+            with open(path, 'rb') as f:
+                header = f.read(2)
+            return header == b'\x80\x02'
+        except Exception:
+            return False
+
+    @staticmethod
     def model_scan(directoryPath):
-        """Return list of base names for matching .pth and .json pairs in directory."""
+        """Return list of base names for matching, valid .pth and .json pairs in directory."""
         if not os.path.isdir(directoryPath):
             print(f"Directory not found: {directoryPath}")
             return []
 
         files = os.listdir(directoryPath)
-        pth_files = {os.path.splitext(f)[0] for f in files if f.endswith('.pth')}
+        pth_files  = {os.path.splitext(f)[0] for f in files if f.endswith('.pth')}
         json_files = {os.path.splitext(f)[0] for f in files if f.endswith('.json')}
         matches = sorted(pth_files.intersection(json_files))
-        return matches
+
+        valid = []
+        for name in matches:
+            pth_path = os.path.join(directoryPath, f"{name}.pth")
+            if ClassifierPnm._is_valid_pth(pth_path):
+                valid.append(name)
+            else:
+                print(f"[WARN] Skipping corrupted/incomplete checkpoint: {pth_path}")
+        return valid
  
     def reload_model(self, directoryPath, name):
         """Unload previous model and reload a new model + config from given name."""
@@ -1176,7 +1218,12 @@ class ClassifierPnm:
         #-----------------------------------------------------------------
         self.model_path = model_path
         print(f"Reloading model '{name}' from {directoryPath} ...")
-        self.model = self.load_model()
+        try:
+            self.model = self.load_model()
+        except (RuntimeError, EOFError, Exception) as e:
+            print(f"Failed to load model '{name}': {e}")
+            print(f"The file '{model_path}' may be corrupted or incomplete.")
+            return False
         self.class_colors = getNDifferentColors(len(self.tile_classes))
         print(f"Reload complete: {name}")
         return True

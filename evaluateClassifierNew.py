@@ -57,7 +57,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 
-from trainClassifierTorch import (
+from trainMagicianVisionClassifierTorch import (
     Classifier,
     RGBAImageFolder,
     checkIfFileExists,
@@ -197,7 +197,6 @@ def instantiate_classifier_from_config(config_json: dict, class_names):
         tile_size=tile_size,
         num_classes=len(class_names),
         dropout_rate=dropout_rate,
-        train=False,
         lr=lr,
         AoLP=config_json.get("AoLP", False),
         DoLP=config_json.get("DoLP", False),
@@ -716,70 +715,289 @@ def parse_metadata_keys(arg):
     return keys if keys else list(DEFAULT_METADATA_KEYS)
 
 
-def main():
-    if len(sys.argv) < 4:
-        print(
-            "Usage: python3 evaluateClassifierNew.py "
-            "<model.ckpt|model.pth> <config.json> <evaluation_dir> [batch_size] [metadata_keys_csv] [bin_size]"
-        )
-        sys.exit(1)
+# ---------------------------------------------------------------------------
+# Ensemble helpers
+# ---------------------------------------------------------------------------
 
-    checkpoint_path = sys.argv[1]
-    config_path = sys.argv[2]
-    eval_root = sys.argv[3]
-    batch_size = int(sys.argv[4]) if len(sys.argv) > 4 else 16
-    metadata_keys = parse_metadata_keys(sys.argv[5]) if len(sys.argv) > 5 else list(DEFAULT_METADATA_KEYS)
-    bin_size = int(sys.argv[6]) if len(sys.argv) > 6 else DEFAULT_BIN_SIZE
+def scan_ensemble_models(model_dir: str):
+    """Return list of (pth_path, cfg_path) for all valid allclass_*.pth pairs."""
+    import zipfile
+    pairs = []
+    for name in sorted(os.listdir(model_dir)):
+        if not (name.startswith("allclass_") and name.endswith(".pth")):
+            continue
+        base     = name[:-4]
+        pth_path = os.path.join(model_dir, f"{base}.pth")
+        cfg_path = os.path.join(model_dir, f"{base}.json")
+        if not os.path.isfile(cfg_path):
+            print(f"[Ensemble] Skipping {name}: no matching .json")
+            continue
+        if not zipfile.is_zipfile(pth_path):
+            print(f"[Ensemble] Skipping {name}: corrupted / not a zip")
+            continue
+        pairs.append((pth_path, cfg_path))
+    return pairs
+
+
+def load_ensemble(pairs, device):
+    """Load every (pth, cfg) pair into an eval-mode Classifier. Returns list of (classifier, class_names)."""
+    members = []
+    for pth_path, cfg_path in pairs:
+        cfg = load_hyperparameters(cfg_path)
+        if "classes" not in cfg or not cfg["classes"]:
+            print(f"[Ensemble] Skipping {pth_path}: no classes in config")
+            continue
+        cls_names = list(cfg["classes"])
+        clf = instantiate_classifier_from_config(cfg, cls_names)
+        clf = load_checkpoint_weights(clf, pth_path, device=device)
+        clf.to(device)
+        clf.eval()
+        print(f"[Ensemble] Loaded {os.path.basename(pth_path)}  ({len(cls_names)} classes)")
+        members.append((clf, cls_names))
+    return members
+
+
+@torch.no_grad()
+def predict_dataset_ensemble(
+    ensemble_members,        # list of (classifier, class_names)
+    model_class_names,       # union / reference class list for reporting
+    dataset,
+    eval_to_model_class,
+    batch_size=16,
+    device="cpu",
+    strict=True,
+    progress_desc="Evaluating [ensemble]",
+):
+    """
+    Run every ensemble member on each batch, do majority voting per sample,
+    and return arrays in the same shape as predict_dataset_aligned.
+
+    Majority vote: for each sample the winning class is the mode across members.
+    If strict=True and a clean-class majority exists, it overrides to clean.
+    """
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        drop_last=False,
+        collate_fn=metadata_collate_fn,
+    )
+
+    # Build a mapping from each member's class index → reference model_class index
+    # Members may have different class sets.
+    ref_name_to_idx = {name: i for i, name in enumerate(model_class_names)}
+    clean_ref_idx   = next((i for i, n in enumerate(model_class_names)
+                            if n.lower() in ("class_clean", "clean")), None)
+
+    member_maps = []   # per-member: local_idx → ref_idx (or None)
+    for _, cls_names in ensemble_members:
+        m = {}
+        for local_idx, name in enumerate(cls_names):
+            ref_idx = ref_name_to_idx.get(name)
+            if ref_idx is not None:
+                m[local_idx] = ref_idx
+        member_maps.append(m)
+
+    y_true_out  = []
+    y_pred_out  = []
+    y_prob_out  = []
+    metadata_out = []
+    skipped      = 0
+    num_ref      = len(model_class_names)
+    M            = len(ensemble_members)
+
+    progress_bar = tqdm(loader, desc=progress_desc, unit="batch", leave=True, dynamic_ncols=True)
+
+    for x, y, meta_list in progress_bar:
+        x     = x.to(device)
+        B     = x.shape[0]
+        # votes[b, ref_cls] = vote count across members
+        votes = torch.zeros(B, num_ref, dtype=torch.float32, device=device)
+
+        for (clf, _), m_map in zip(ensemble_members, member_maps):
+            logits = clf(x)
+            probs  = torch.softmax(logits, dim=1)
+            preds  = torch.argmax(probs, dim=1)   # [B]
+            for b in range(B):
+                local_pred = int(preds[b].item())
+                ref_pred   = m_map.get(local_pred)
+                if ref_pred is not None:
+                    votes[b, ref_pred] += 1.0
+
+        # Majority vote per sample
+        if strict and clean_ref_idx is not None:
+            clean_majority = votes[:, clean_ref_idx] > (M / 2)
+            voted = torch.argmax(votes, dim=1)
+            voted[clean_majority] = clean_ref_idx
+        else:
+            voted = torch.argmax(votes, dim=1)
+
+        voted_np = voted.cpu().numpy()
+        y_eval   = y.cpu().numpy().tolist()
+        # Build simple prob vector from vote fractions for compatibility
+        prob_np  = (votes / votes.sum(dim=1, keepdim=True).clamp(min=1)).cpu().numpy()
+
+        for i, eval_idx in enumerate(y_eval):
+            eval_idx = int(eval_idx)
+            if eval_idx not in eval_to_model_class:
+                skipped += 1
+                continue
+            gt_ref = eval_to_model_class[eval_idx]
+            y_true_out.append(gt_ref)
+            y_pred_out.append(int(voted_np[i]))
+            y_prob_out.append(prob_np[i].tolist())
+            if i < len(meta_list) and isinstance(meta_list[i], dict):
+                metadata_out.append(meta_list[i])
+            else:
+                metadata_out.append({})
+
+        progress_bar.set_postfix(used=len(y_true_out), skipped=skipped)
+
+    prob_dim = len(y_prob_out[0]) if y_prob_out else num_ref
+    return (
+        np.array(y_true_out,  dtype=np.int64),
+        np.array(y_pred_out,  dtype=np.int64),
+        np.array(y_prob_out,  dtype=np.float32) if y_prob_out else np.zeros((0, prob_dim), dtype=np.float32),
+        metadata_out,
+        skipped,
+    )
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Evaluate a trained classifier (or ensemble) on one or more datasets.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Single-model (original usage):
+  python3 evaluateClassifierNew.py model.pth config.json /path/to/eval_dir [batch] [meta_csv] [bin_size]
+
+Ensemble mode:
+  python3 evaluateClassifierNew.py --ensemble /path/to/model_dir /path/to/eval_dir [batch] [meta_csv] [bin_size]
+  python3 evaluateClassifierNew.py --ensemble /path/to/model_dir /path/to/eval_dir 16 Distance1,Light1 25
+        """,
+    )
+    parser.add_argument("--ensemble", metavar="MODEL_DIR",
+                        help="Directory containing allclass_*.pth + .json pairs. "
+                             "Enables ensemble majority-vote mode.")
+    # Positional args work for both modes; in ensemble mode pos[0] is eval_root
+    parser.add_argument("args", nargs="*")
+    parsed = parser.parse_args()
+
+    ensemble_mode = parsed.ensemble is not None
+
+    if ensemble_mode:
+        # --ensemble MODEL_DIR  eval_root  [batch] [meta] [bin]
+        pos = parsed.args
+        if len(pos) < 1:
+            parser.error("--ensemble mode requires at least: eval_root")
+        model_dir      = parsed.ensemble
+        eval_root      = pos[0]
+        batch_size     = int(pos[1]) if len(pos) > 1 else 16
+        metadata_keys  = parse_metadata_keys(pos[2]) if len(pos) > 2 else list(DEFAULT_METADATA_KEYS)
+        bin_size       = int(pos[3]) if len(pos) > 3 else DEFAULT_BIN_SIZE
+        checkpoint_path = None
+        config_path     = None
+    else:
+        # Legacy positional: model.pth config.json eval_root [batch] [meta] [bin]
+        pos = parsed.args
+        if len(pos) < 3:
+            parser.print_help()
+            sys.exit(1)
+        checkpoint_path = pos[0]
+        config_path     = pos[1]
+        eval_root       = pos[2]
+        batch_size      = int(pos[3]) if len(pos) > 3 else 16
+        metadata_keys   = parse_metadata_keys(pos[4]) if len(pos) > 4 else list(DEFAULT_METADATA_KEYS)
+        bin_size        = int(pos[5]) if len(pos) > 5 else DEFAULT_BIN_SIZE
+        model_dir       = None
+
     binned_keys = set(DEFAULT_BINNED_KEYS)
 
-    if not checkIfFileExists(checkpoint_path):
-        print(f"Checkpoint not found: {checkpoint_path}")
-        sys.exit(1)
-    if not checkIfFileExists(config_path):
-        print(f"Config not found: {config_path}")
-        sys.exit(1)
+    # --- Validate paths ---
+    if ensemble_mode:
+        if not checkIfPathIsDirectory(model_dir):
+            print(f"Ensemble model directory not found: {model_dir}")
+            sys.exit(1)
+    else:
+        if not checkIfFileExists(checkpoint_path):
+            print(f"Checkpoint not found: {checkpoint_path}")
+            sys.exit(1)
+        if not checkIfFileExists(config_path):
+            print(f"Config not found: {config_path}")
+            sys.exit(1)
+
     if not checkIfPathIsDirectory(eval_root):
         print(f"Evaluation directory not found: {eval_root}")
         sys.exit(1)
 
-    config_json = load_hyperparameters(config_path)
-    seed_everything(int(config_json["hparams"].get("seed", 1234)))
-
     device = default_device()
-    print(f"Using device: {device}")
-    print(f"Metadata keys for grouped evaluation: {metadata_keys}")
-    print(f"Binned metadata keys              : {sorted(list(binned_keys))}")
-    print(f"Numeric metadata bin size         : {bin_size}")
+    print(f"Using device     : {device}")
+    print(f"Mode             : {'ENSEMBLE' if ensemble_mode else 'single-model'}")
+    print(f"Metadata keys    : {metadata_keys}")
+    print(f"Binned keys      : {sorted(binned_keys)}")
+    print(f"Bin size         : {bin_size}")
 
-    eval_datasets = discover_eval_datasets(eval_root)
-    if not eval_datasets:
-        print(f"No valid datasets found inside: {eval_root}")
-        sys.exit(1)
+    # --- Load model(s) ---
+    if ensemble_mode:
+        pairs = scan_ensemble_models(model_dir)
+        if not pairs:
+            print(f"No valid allclass_*.pth models found in: {model_dir}")
+            sys.exit(1)
+        print(f"\nFound {len(pairs)} ensemble members:")
+        for pth, cfg in pairs:
+            print(f"  {os.path.basename(pth)}")
 
-    print("\nDiscovered evaluation datasets:")
-    for ds in eval_datasets:
-        print(f"  - {ds}")
+        ensemble_members = load_ensemble(pairs, device)
+        if not ensemble_members:
+            print("No ensemble members loaded successfully.")
+            sys.exit(1)
 
-    if "classes" not in config_json or not config_json["classes"]:
-        raise ValueError("Config JSON does not contain trained class names. Expected config_json['classes'] to exist.")
+        # Union of all class names across members, preserving order of first occurrence
+        seen = {}
+        for _, cls_names in ensemble_members:
+            for n in cls_names:
+                if n not in seen:
+                    seen[n] = len(seen)
+        model_class_names = list(seen.keys())
+        print(f"\nUnion class set ({len(model_class_names)} classes): {model_class_names}")
 
-    model_class_names = list(config_json["classes"])
-    print("\nModel classes from config JSON:", model_class_names)
+        # Seed from first member's config (best effort)
+        first_cfg = load_hyperparameters(pairs[0][1])
+        seed_everything(int(first_cfg["hparams"].get("seed", 1234)))
+        model_name = f"ensemble_{len(ensemble_members)}models"
+        tile_size  = int(first_cfg["hparams"].get("tile_size", 0))
+        epochs     = 0
+        config_json = first_cfg   # used only for load_dataset below
+    else:
+        config_json = load_hyperparameters(config_path)
+        seed_everything(int(config_json["hparams"].get("seed", 1234)))
 
-    state_dict = get_state_dict_from_checkpoint(checkpoint_path, device)
-    checkpoint_num_outputs, checkpoint_head_key = infer_num_outputs_from_state_dict(state_dict)
-    print(f"Checkpoint head: {checkpoint_head_key} -> {checkpoint_num_outputs} outputs")
+        model_class_names = list(config_json["classes"])
+        print(f"\nModel classes: {model_class_names}")
 
-    if len(model_class_names) != checkpoint_num_outputs:
-        raise ValueError(
-            f"Mismatch between config classes ({len(model_class_names)}) and checkpoint outputs ({checkpoint_num_outputs}).\n"
-            f"Config classes: {model_class_names}"
-        )
+        state_dict = get_state_dict_from_checkpoint(checkpoint_path, device)
+        checkpoint_num_outputs, checkpoint_head_key = infer_num_outputs_from_state_dict(state_dict)
+        print(f"Checkpoint head: {checkpoint_head_key} -> {checkpoint_num_outputs} outputs")
 
-    classifier = instantiate_classifier_from_config(config_json, model_class_names)
-    classifier = load_checkpoint_weights(classifier, checkpoint_path, device=device)
-    classifier.to(device)
-    classifier.eval()
+        if len(model_class_names) != checkpoint_num_outputs:
+            raise ValueError(
+                f"Mismatch between config classes ({len(model_class_names)}) "
+                f"and checkpoint outputs ({checkpoint_num_outputs})."
+            )
+
+        classifier = instantiate_classifier_from_config(config_json, model_class_names)
+        classifier = load_checkpoint_weights(classifier, checkpoint_path, device=device)
+        classifier.to(device)
+        classifier.eval()
+
+        model_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
+        tile_size  = int(config_json["hparams"].get("tile_size", 0))
+        epochs     = int(config_json.get("epochs", 0))
 
     aggregate_true = []
     aggregate_pred = []
@@ -788,9 +1006,13 @@ def main():
     report_root = os.path.join(os.getcwd(), "evaluation_reports")
     os.makedirs(report_root, exist_ok=True)
 
-    model_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
-    tile_size = int(config_json["hparams"].get("tile_size", 0))
-    epochs = int(config_json.get("epochs", 0))
+    eval_datasets = discover_eval_datasets(eval_root)
+    if not eval_datasets:
+        print(f"No valid datasets found under: {eval_root}")
+        sys.exit(1)
+    print(f"\nDatasets to evaluate ({len(eval_datasets)}):")
+    for d in eval_datasets:
+        print(f"  {d}")
 
     for dataset_dir in eval_datasets:
         dataset = load_dataset(dataset_dir, config_json)
@@ -813,15 +1035,26 @@ def main():
             print(f"Skipping {dataset_dir}: no shared class names with trained model")
             continue
 
-        y_true, y_pred, _, metadata_rows, skipped_samples = predict_dataset_aligned(
-            classifier=classifier,
-            dataset=dataset,
-            eval_to_model_class=eval_to_model_class,
-            batch_size=batch_size,
-            num_workers=0,
-            device=device,
-            progress_desc=f"Evaluating {safe_name}",
-        )
+        if ensemble_mode:
+            y_true, y_pred, _, metadata_rows, skipped_samples = predict_dataset_ensemble(
+                ensemble_members=ensemble_members,
+                model_class_names=model_class_names,
+                dataset=dataset,
+                eval_to_model_class=eval_to_model_class,
+                batch_size=batch_size,
+                device=device,
+                progress_desc=f"Evaluating {safe_name}",
+            )
+        else:
+            y_true, y_pred, _, metadata_rows, skipped_samples = predict_dataset_aligned(
+                classifier=classifier,
+                dataset=dataset,
+                eval_to_model_class=eval_to_model_class,
+                batch_size=batch_size,
+                num_workers=0,
+                device=device,
+                progress_desc=f"Evaluating {safe_name}",
+            )
 
         print(f"Aligned samples used : {len(y_true)}")
         print(f"Skipped samples      : {skipped_samples}")
