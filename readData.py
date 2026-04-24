@@ -15,22 +15,31 @@ import numpy as np
 Check if a file exists
 """
 def checkIfFileExists(filename):
-    return os.path.isfile(filename) 
+    """Return True if *filename* exists and is a regular file."""
+    return os.path.isfile(filename)
 
 """
 Check if a path exists
 """
 def checkIfPathExists(filename):
-    return os.path.exists(filename) 
+    """Return True if *filename* exists (file or directory)."""
+    return os.path.exists(filename)
 
 
 """
 Check if a path exists
 """
 def checkIfPathIsDirectory(filename):
+    """Return True if *filename* exists and is a directory."""
     return os.path.isdir(filename) 
 
 def highlightImage(image, json_file,tile_size=32,step=3):
+    """
+    Highlight tiles in an image that contain annotated point clicks.
+
+    Tiles overlapping any annotated point are set to white (255).
+    Returns the modified image.
+    """
     point_clicks = list()
     point_classes = list()
 
@@ -78,17 +87,42 @@ def highlightImage(image, json_file,tile_size=32,step=3):
     return image
 
 def check_threshold(array, threshold):
-    # Check if any pixel in any channel is above the threshold
+    """Return True if any pixel in any channel exceeds the given threshold value."""
     return np.any(array > threshold)
 
 def check_variation(tile, threshold):
-    # Calculate the standard deviation of pixel values in each channel
+    """
+    Return True if any channel has standard deviation above the threshold.
+
+    Used to filter out uniform (featureless) tiles.
+    """
     std_dev = np.std(tile, axis=(0, 1))
-    
+
     # Check if the standard deviation is greater than zero in any channel
     return np.any(std_dev > threshold)
 
 def tileImages(image, json_file,tiles=[],tile_classes=[],tile_size=32,step=3,border=0,low_value_tile_threshold=30,ignoreBackground=False):
+    """
+    Slide a window over an image, extracting tiles and annotating them with class labels.
+
+    Tiles overlapping annotated point clicks are labeled with the corresponding
+    point class. Tiles below the brightness threshold or ignored backgrounds are
+    optionally skipped.
+
+    Args:
+        image: Input image array (H, W, C).
+        json_file: JSON file with pointClicks and pointClasses annotations.
+        tiles: Existing tile list (extended in place).
+        tile_classes: Existing class list (extended in place).
+        tile_size: Width/height of each square tile in pixels.
+        step: Horizontal and vertical slide step between tiles.
+        border: Reserved parameter (not used).
+        low_value_tile_threshold: Skip tiles where all pixels are below this value.
+        ignoreBackground: If True, skip tiles with no annotations.
+
+    Returns:
+        (tiles, tile_classes) — extended lists of tile arrays and class strings.
+    """
     point_clicks = list()
     point_classes = list()
 
@@ -142,6 +176,7 @@ def tileImages(image, json_file,tiles=[],tile_classes=[],tile_size=32,step=3,bor
 
 
 def saveTiles(tiles,tile_classes):
+    """Save each tile as a numbered PNG file. (Not currently used.)"""
     # Display or save the tiles as needed
     for i, (tile, tile_class) in enumerate(zip(tiles, tile_classes)):
       if tile is not None:
@@ -155,6 +190,12 @@ def saveTiles(tiles,tile_classes):
 
 
 def loadMoreClasses(filename,classes_dict):
+    """
+    Extract class names from a JSON annotation file and merge into *classes_dict*.
+
+    Reads pointClicks and pointClasses from the JSON, adding each unique class
+    name as a key in the dictionary.
+    """
     with open("%s.json"%filename) as json_data:
         data          = json.load(json_data)
         point_clicks  = data.get("pointClicks", [])
@@ -167,6 +208,12 @@ def loadMoreClasses(filename,classes_dict):
 
 
 def loadMoreClassesFromTiles(tile_classes,classes_dict):
+    """
+    Merge class names from tile labels into *classes_dict*.
+
+    Similar to loadMoreClasses but extracts classes directly from tile_class
+    strings rather than JSON annotations.
+    """
     for cl in tile_classes:
            #print("Add `",cl,"` class ")
            classes_dict[cl]=True 
@@ -175,6 +222,12 @@ def loadMoreClassesFromTiles(tile_classes,classes_dict):
 
 
 def convertClassDictToOneHotList(classes_dict,tile_classes):
+    """
+    Convert a class name dict and tile class list to a one-hot encoded matrix.
+
+    Creates a (num_samples, num_classes + 1) matrix where the +1 accounts for
+    the empty-string (no-class) label mapped to index 0.
+    """
     classToIndex = dict()
     classToIndex[""]=0
     for i,key in enumerate(classes_dict.keys(), start=1):
@@ -192,23 +245,29 @@ def convertClassDictToOneHotList(classes_dict,tile_classes):
     return onehot,numberOfClasses 
 
 
-def debayerPolarImage(image): 
- # Split the A, B, C, and D values into separate monochrome images
- polarization_90_deg   = image[0::2, 0::2]
- polarization_45_deg   = image[0::2, 1::2]
- polarization_135_deg  = image[1::2, 0::2]
- polarization_0_deg    = image[1::2, 1::2]
- return polarization_0_deg,polarization_45_deg,polarization_90_deg,polarization_135_deg      
+def debayerPolarImage(image):
+    """
+    De-bayer a polarization image into 4 separate monochrome channels.
+
+    Extracts the 0°, 45°, 90°, and 135° polarization channels from a Bayer-like
+    pattern. The input is expected to be a 2D array with alternating polarization
+    filters in a 2x2 mosaic pattern.
+
+    Returns:
+        (polarization_0_deg, polarization_45_deg, polarization_90_deg, polarization_135_deg)
+    """
 
 def readPolarPNMToRGBALive(image):
+    """
+    Convert a debayered polarization PNM image to a 4-channel RGBA array.
+
+    De-bayers the input (expects 2D array), then assembles the 4 polarization
+    channels (0°, 45°, 90°, 135°) into an (H/2, W/2, 4) uint8 array.
+    """
     # Load the image
     image = np.squeeze(image)
-
-    # If already 4-channel (pre-debayered), return as-is
-    if image.ndim == 3 and image.shape[2] == 4:
-        return image
-
-    #This expects a 1 channel (bayered) image
+  
+    #This expects a 1 channel (bayered) image 
     height, width = image.shape
 
     # Split into polarization images
@@ -228,12 +287,18 @@ def readPolarPNMToRGBALive(image):
 
 
 def readPolarPNMToRGBA(image_path):
+    """
+    Load a polarization PNM image from disk and convert to RGBA.
+
+    Wrapper around readPolarPNMToRGBALive that reads the file with OpenCV.
+    Returns None if the file cannot be read.
+    """
     # Load the image
     image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
 
     if image is None:
         print("Error: Unable to read the image.")
-        return None 
+        return None
 
     return readPolarPNMToRGBALive(image)
 
@@ -242,6 +307,12 @@ def readPolarPNMToRGBA(image_path):
 
 
 def loadMoreImages(filename,i,tiles=[],tile_classes=[],tile_size=32,step=4,dumpHighlights=False,ignoreBackground=False):
+  """
+    Load a polarized image, convert to RGBA, and extract annotated tiles.
+
+    Handles both polarized PNM images and standard images (PNG/JPEG). If
+    dumpHighlights is True, saves before/after highlight versions of the image.
+  """
   if (".png" in filename) or (".pnm" in filename) or (".jpeg" in filename) or (".jpeg" in filename):
    rgba_image = readPolarPNMToRGBA(filename) 
    if rgba_image is None:
@@ -261,6 +332,7 @@ def loadMoreImages(filename,i,tiles=[],tile_classes=[],tile_size=32,step=4,dumpH
 
 
 def count_class_appearances(onehot, num_classes):
+    """Count the number of samples per class from a one-hot encoded matrix."""
     score = list()
     for i in range(0, num_classes):
         score.append(0) 

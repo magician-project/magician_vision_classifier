@@ -90,9 +90,11 @@ CHESSBOARD_SQUARE_M      = 0.024        # 24 mm square size
 
 def resize_to_fit_screen(img, max_w=1280, max_h=720, only_shrink=True):
     """
-    Resize image to fit within (max_w, max_h) while preserving aspect ratio.
-    - only_shrink=True: don't upscale small images.
-    Returns (resized_img, scale).
+    Resize an image to fit within (max_w, max_h) while preserving aspect ratio.
+
+    When only_shrink=True and the image is smaller than the limits, it is returned
+    unchanged. Uses INTER_AREA for downscaling and INTER_LINEAR for upscaling.
+    Returns (resized_img, scale_factor).
     """
     h, w = img.shape[:2]
     scale = min(max_w / float(w), max_h / float(h))
@@ -113,6 +115,9 @@ def filter_type(det_type: str):
     Strip the 'class_' prefix and trailing severity suffix from a detection label.
 
     Example: 'class_NegativeDentClassB' -> ('NegativeDent', 'ClassB')
+
+    Args:
+        det_type: Raw detection type string (e.g. 'class_NegativeDentClassB').
 
     Returns:
         (clean_type, det_class) where det_class is one of 'ClassA/B/C' or 'Unknown'.
@@ -136,15 +141,17 @@ def filter_type(det_type: str):
 _SEVERITY_MAP: dict[str, int] = {"ClassA": 1, "ClassB": 2, "ClassC": 3}
 
 def class_to_severity(det_class: str) -> int:
-    """Map a severity class label to the DetectionM integer severity field."""
+    """Map a severity class label (ClassA/B/C) to the DetectionM integer severity field."""
     return _SEVERITY_MAP.get(det_class, 0)
 
 
 def idw_depth(x: float, y: float, xy_list, d_list, p: float = 2.0) -> float:
     """
-    Inverse Distance Weighting interpolation using 3 samples.
-    xy_list: [(x0,y0),(x1,y1),(x2,y2)]
-    d_list:  [d0,d1,d2]
+    Inverse Distance Weighting (IDW) interpolation at point (x, y) from 3 known samples.
+
+    Each sample is a (pixel_x, pixel_y) position with a measured depth value.
+    Returns NaN if no finite samples are available. Uses power parameter *p*
+    (default 2.0, matching LASER_IDW_POWER).
     """
     # Exact hit
     for (sx, sy), d in zip(xy_list, d_list):
@@ -167,9 +174,11 @@ def idw_depth(x: float, y: float, xy_list, d_list, p: float = 2.0) -> float:
 
 def estimatePoseSingleMarkers(corners_list, marker_length, K, dist):
     """
-    Compatibility wrapper for cv2.aruco.estimatePoseSingleMarkers, which was
-    removed in OpenCV 4.7+.  Returns (rvecs, tvecs) as lists of (3,) arrays,
-    one entry per marker.
+    Estimate camera pose from ArUco marker corners (OpenCV 4.7+ compatible).
+
+    Wraps cv2.aruco.estimatePoseSingleMarkers when available; falls back to
+    cv2.solvePnP with IPPE_SQUARE for newer OpenCV versions where the function
+    was removed. Returns (rvecs, tvecs) as lists of (3,) arrays.
     """
     if hasattr(cv2.aruco, "estimatePoseSingleMarkers"):
         rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
@@ -197,7 +206,13 @@ def estimatePoseSingleMarkers(corners_list, marker_length, K, dist):
 
 
 def make_approx_camera_matrix(width, height):
-    """Return an approximate pinhole camera matrix and zero distortion coefficients."""
+    """
+    Return an approximate pinhole camera matrix (K) and zero distortion coefficients (dist).
+
+    Uses fx = fy = 0.9 * max(width, height) with principal point at image center.
+    This is a rough estimate suitable for ArUco pose estimation when a calibrated
+    camera matrix is not available.
+    """
     fx = fy = 0.9 * max(width, height)
     cx = width  / 2.0
     cy = height / 2.0
@@ -209,7 +224,11 @@ def make_approx_camera_matrix(width, height):
 
 
 def rvec_to_quaternion(rvec):
-    """Convert an OpenCV Rodrigues rotation vector to a (qx, qy, qz, qw) quaternion."""
+    """
+    Convert an OpenCV Rodrigues rotation vector to a (qx, qy, qz, qw) quaternion.
+
+    Returns identity (0, 0, 0, 1) for zero-norm rotation vectors.
+    """
     rvec = np.asarray(rvec, dtype=np.float64).reshape(3)
     angle = float(np.linalg.norm(rvec))
     if angle < 1e-10:
@@ -226,9 +245,19 @@ def rvec_to_quaternion(rvec):
 # ROS Node
 # ========================================================
 class DefectPublisher(Node):
-    """ROS2 node that publishes Detection (+ optional DetectionM) and exposes runtime tuning services."""
+    """
+    ROS2 node for real-time defect detection and classification.
+
+    Subscribes to laser depth sensors (optional), publishes Detection messages
+    for each detected defect, and optionally publishes DetectionM messages with
+    interpolated depth. Exposes runtime tuning services via ROS2 services
+    (visualization, pause, FPS, step size, threshold control).
+
+    Supports both single-model and two-stage ensemble inference.
+    """
 
     def __init__(self):
+        """Initialize the ROS2 node, publishers, services, and laser subscriptions."""
         super().__init__("magician_vision_classifier")
 
         # Publishers
@@ -317,6 +346,7 @@ class DefectPublisher(Node):
     # Laser subscriptions
     # -------------------------
     def _setup_laser_subscriptions(self):
+        """Create ROS2 subscriptions for 3 laser depth sensors."""
         def make_cb(i):
             def _cb(msg: Float32):
                 with self._lock:
@@ -331,6 +361,7 @@ class DefectPublisher(Node):
     # Service callbacks  
     # -------------------------
     def _set_visualization_cb(self, request, response):
+        """Service callback to toggle visualization on/off."""
         with self._lock:
             self._visualization_enabled = bool(request.data)
         response.success = True
@@ -339,6 +370,7 @@ class DefectPublisher(Node):
         return response
 
     def _pause_inference_cb(self, request, response):
+        """Service callback to pause/resume inference."""
         with self._lock:
             self._inference_paused = bool(request.data)
         response.success = True
@@ -347,6 +379,7 @@ class DefectPublisher(Node):
         return response
 
     def _set_two_stage_cb(self, request, response):
+        """Service callback to toggle two-stage ensemble mode on/off."""
         with self._lock:
             self._two_stage_enabled = bool(request.data)
         response.success = True
@@ -355,6 +388,7 @@ class DefectPublisher(Node):
         return response
  
     def _set_fps_cb(self, request, response):
+        """Service callback to set target FPS (0 = no limiting)."""
         fps = float(request.data)
         with self._lock:
             self._target_fps = max(0.0, fps)  # 0 => no limiting
@@ -364,6 +398,7 @@ class DefectPublisher(Node):
         return response
 
     def _set_step_cb(self, request, response):
+        """Service callback to set tile step size (minimum 1)."""
         step = int(request.data)
         with self._lock:
             self._step_size = max(1, step)
@@ -373,6 +408,7 @@ class DefectPublisher(Node):
         return response
 
     def _set_threshold_cb(self, request, response):
+        """Service callback to set the confidence threshold for low-activation tiles."""
         thr = float(request.data)
         with self._lock:
             self._threshold = thr
@@ -382,6 +418,12 @@ class DefectPublisher(Node):
         return response
 
     def _save_current_frame(self, prefix: str):
+        """
+        Save the last received frame as a PNG with a timestamped filename.
+
+        Thread-safe: acquires the lock to read the frame pointer.
+        Returns (success: bool, message: str).
+        """
         # Take a snapshot under the lock so the main thread can't replace the frame
         # while we are reading it (data race between main loop and ROS spin thread).
         with self._lock:
@@ -406,6 +448,7 @@ class DefectPublisher(Node):
             return False, str(e)
 
     def _scan_markers_cb(self, request, response):
+        """Service callback to activate marker scanning for MARKER_SCAN_DURATION_S seconds."""
         with self._lock:
             self._marker_scan_until = time.monotonic() + MARKER_SCAN_DURATION_S
         response.success = True
@@ -414,6 +457,7 @@ class DefectPublisher(Node):
         return response
 
     def _remember_defect_cb(self, request, response):
+        """Service callback to save the current frame tagged as a defect."""
         success, msg = self._save_current_frame("defect")
         response.success = success
         response.message = msg
@@ -421,6 +465,7 @@ class DefectPublisher(Node):
         return response
 
     def _remember_clean_cb(self, request, response):
+        """Service callback to save the current frame tagged as clean."""
         success, msg = self._save_current_frame("clean")
         response.success = success
         response.message = msg
@@ -431,34 +476,42 @@ class DefectPublisher(Node):
     # Thread-safe getters
     # -------------------------
     def get_step_size(self):
+        """Thread-safe getter for the tile step size."""
         with self._lock:
             return self._step_size
 
     def get_max_probability_threshold(self):
+        """Thread-safe getter for the max probability threshold."""
         with self._lock:
             return self._threshold
 
     def get_target_fps(self):
+        """Thread-safe getter for the target FPS limit."""
         with self._lock:
             return self._target_fps
 
     def visualization_enabled(self):
+        """Thread-safe getter for the visualization toggle."""
         with self._lock:
             return self._visualization_enabled
 
     def inference_paused(self):
+        """Thread-safe getter for the inference pause state."""
         with self._lock:
             return self._inference_paused
 
     def two_stage_enabled(self):
+        """Thread-safe getter for the two-stage ensemble mode."""
         with self._lock:
             return self._two_stage_enabled
 
     def get_laser_depths(self):
+        """Thread-safe getter for the latest laser depth readings."""
         with self._lock:
             return list(self._laser_depths)
 
     def is_marker_scanning(self):
+        """Check whether marker scanning is currently active."""
         with self._lock:
             return time.monotonic() < self._marker_scan_until
 
@@ -466,7 +519,11 @@ class DefectPublisher(Node):
     # Publishers
     # -------------------------
     def _get_camera_matrix(self, frame):
-        """Return (K, dist) for the given frame, reusing cached values per resolution."""
+        """
+        Return a cached approximate camera matrix for the given frame resolution.
+
+        Caches (K, dist) per (height, width) to avoid recomputing on every frame.
+        """
         h, w = frame.shape[:2]
         key = (h, w)
         if key not in self._cam_matrix_cache:
@@ -474,7 +531,11 @@ class DefectPublisher(Node):
         return self._cam_matrix_cache[key]
 
     def publish_marker(self, marker_id: str, tvec, rvec):
-        """Publish a Marker message with position (tvec) and orientation (rvec -> quaternion)."""
+        """
+        Publish a Marker ROS2 message with 3D position and orientation.
+
+        Converts the rvec (Rodrigues vector) to a quaternion for the pose message.
+        """
         msg = Marker()
         msg.id = str(marker_id)
 
@@ -492,7 +553,12 @@ class DefectPublisher(Node):
         self.publisher_markers.publish(msg)
 
     def scan_and_publish_markers(self, frame):
-        """Detect ArUco markers and chessboard in *frame*, publish a Marker msg for each hit."""
+        """
+        Detect ArUco markers in the current frame and publish Marker messages.
+
+        Uses the cached camera matrix for pose estimation. Chessboard detection
+        is present but disabled (too slow for real-time).
+        """
         self.get_logger().info("Scanning frame for markers...")
 
         if len(frame.shape) == 2 or frame.shape[2] == 1:
@@ -547,6 +613,7 @@ class DefectPublisher(Node):
         self.get_logger().info("Marker scan complete.")
 
     def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z=0.0):
+        """Publish a Detection message with 2D bounding box, type, class, and optional depth."""
         try:
             msg = Detection()
             msg.x           = int(x)
@@ -562,6 +629,7 @@ class DefectPublisher(Node):
             self.get_logger().error(f"Failed to publish detection: {e}")
 
     def publish_detection_m(self, cx, cy, severity, depth_z):
+        """Publish a DetectionM message with severity, pixel position, and interpolated depth."""
         if (not USE_LASERS) or (self.publisher_m is None):
             return
         try:
@@ -587,6 +655,13 @@ class DefectPublisher(Node):
 # Main
 # ========================================================
 def main():
+    # Configure PyTorch global settings before any model is loaded.
+    # TF32 on Ampere+ GPUs gives ~3× matmul throughput with negligible accuracy loss.
+    torch.set_float32_matmul_precision("high")
+    # cuDNN auto-tunes the fastest convolution algorithm for each fixed input shape.
+    # Since tile_size is constant per model, this pays off after the first forward pass.
+    torch.backends.cudnn.benchmark = True
+
     # Initialize ROS2
     rclpy.init()
     ros_node = DefectPublisher()
@@ -616,8 +691,6 @@ def main():
         ],
     )
 
-    # Use the same precision setting as training for consistent numeric behaviour.
-    torch.set_float32_matmul_precision("high")
     tile_size = 0  # updated inside the inference block each iteration
 
     # Shared memory frame source

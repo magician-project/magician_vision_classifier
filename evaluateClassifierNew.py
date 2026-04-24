@@ -38,6 +38,7 @@ import os
 import random
 import math
 import sys
+import time
 from collections import Counter, defaultdict
 
 import matplotlib
@@ -78,18 +79,26 @@ DEFAULT_METADATA_KEYS = ["Distance1", "Distance2", "Distance3", "DistanceAverage
 DEFAULT_BINNED_KEYS = {"Distance1", "Distance2", "Distance3", "DistanceAverage"}
 DEFAULT_BIN_SIZE = 25
 
+# Benchmark sweep defaults
+BENCHMARK_BATCH_SIZES = [1, 4, 16, 64, 256, 512, 1024, 2048, 4096]
+BENCHMARK_STEP_SIZES  = [1, 2, 4, 8, 16]
+_BENCH_WARMUP_BATCHES = 3
+
 
 def seed_everything(seed: int):
+    """Set seeds for reproducibility across PyTorch, NumPy, and Python random."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
 
 def default_device():
+    """Return 'cuda' if available, otherwise 'cpu'."""
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def is_imagefolder_dataset(path: str) -> bool:
+    """Check whether *path* is an ImageFolder-style dataset (class subdirs with images)."""
     if not os.path.isdir(path):
         return False
     valid_ext = (".png", ".jpg", ".jpeg")
@@ -109,14 +118,23 @@ def is_imagefolder_dataset(path: str) -> bool:
 
 
 def is_hdf5_dataset(path: str) -> bool:
+    """Check whether *path* contains an HDF5 dataset (dataset.h5)."""
     return HAS_HDF5 and os.path.isfile(os.path.join(path, "dataset.h5"))
 
 
 def is_valid_dataset_dir(path: str) -> bool:
+    """Return True if *path* is either an HDF5 or ImageFolder dataset."""
     return is_hdf5_dataset(path) or is_imagefolder_dataset(path)
 
 
 def discover_eval_datasets(eval_root: str):
+    """
+    Discover datasets under *eval_root*.
+
+    If *eval_root* itself is a valid dataset, return it as a single-element list.
+    Otherwise, scan each immediate subdirectory for valid datasets and return them
+    sorted by name.
+    """
     datasets = []
     if is_valid_dataset_dir(eval_root):
         datasets.append(eval_root)
@@ -131,6 +149,7 @@ def discover_eval_datasets(eval_root: str):
 
 
 def make_transform():
+    """Return a ToTensor transform (scales pixel values to [0, 1])."""
     return transforms.Compose([transforms.ToTensor()])
 
 
@@ -160,6 +179,7 @@ def load_dataset(dataset_dir: str, config_json: dict):
 
 
 def print_class_distribution(dataset, title="Dataset"):
+    """Print the per-class sample count for a dataset."""
     print(f"\n--- {title} Class Distribution ---")
     targets = dataset.targets
     classes = dataset.classes
@@ -175,6 +195,7 @@ def print_class_distribution(dataset, title="Dataset"):
 
 
 def get_clean_class_id(class_names):
+    """Return the index of the 'class_clean' or 'Clean' class, or 0 if not found."""
     for i, name in enumerate(class_names):
         if name in ("class_clean", "Clean"):
             return i
@@ -182,6 +203,7 @@ def get_clean_class_id(class_names):
 
 
 def instantiate_classifier_from_config(config_json: dict, class_names):
+    """Build a Classifier from a JSON config and class list, ready for inference."""
     dropout_rate = config_json["hparams"]["dropout_rate"]
     tile_size = config_json["hparams"]["tile_size"]
     lr = config_json["optimizer"]["learning_rate"]
@@ -214,6 +236,12 @@ def instantiate_classifier_from_config(config_json: dict, class_names):
 
 
 def get_state_dict_from_checkpoint(checkpoint_path: str, device: str):
+    """
+    Load a PyTorch checkpoint and extract the state_dict.
+
+    Handles both plain state_dicts and Lightning-style dicts with a
+    'state_dict' key.
+    """
     ckpt = torch.load(checkpoint_path, map_location=device)
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         return ckpt["state_dict"]
@@ -221,6 +249,13 @@ def get_state_dict_from_checkpoint(checkpoint_path: str, device: str):
 
 
 def infer_num_outputs_from_state_dict(state_dict: dict):
+    """
+    Infer the number of classifier output classes from the checkpoint's
+    weight matrix shape.
+
+    Tries common key names used by PyTorch Lightning models.
+    Returns (num_outputs, key_name).
+    """
     candidate_keys = ["model.fc.weight", "model.classifier.weight", "fc.weight", "classifier.weight"]
     for key in candidate_keys:
         if key in state_dict and hasattr(state_dict[key], "shape") and len(state_dict[key].shape) >= 2:
@@ -232,6 +267,7 @@ def infer_num_outputs_from_state_dict(state_dict: dict):
 
 
 def load_checkpoint_weights(classifier: Classifier, checkpoint_path: str, device: str):
+    """Load checkpoint weights into *classifier* with strict=False and print missing/unexpected keys."""
     state_dict = get_state_dict_from_checkpoint(checkpoint_path, device)
     missing, unexpected = classifier.load_state_dict(state_dict, strict=False)
     print("\nCheckpoint load summary:")
@@ -245,6 +281,15 @@ def load_checkpoint_weights(classifier: Classifier, checkpoint_path: str, device
 
 
 def build_eval_to_model_mapping(eval_class_names, model_class_names):
+    """
+    Map evaluation-dataset class indices to trained-model class indices.
+
+    Returns:
+        eval_to_model    : dict mapping eval_idx -> model_idx for shared classes
+        shared_class_names : list of class names present in both eval and model
+        missing_in_model  : classes in eval dataset but not in the trained model
+        missing_in_eval   : classes in the trained model but not in the eval dataset
+    """
     model_name_to_idx = {name: i for i, name in enumerate(model_class_names)}
     eval_to_model = {}
     shared_class_names = []
@@ -257,6 +302,241 @@ def build_eval_to_model_mapping(eval_class_names, model_class_names):
             missing_in_model.append(cls_name)
     missing_in_eval = [name for name in model_class_names if name not in set(eval_class_names)]
     return eval_to_model, shared_class_names, missing_in_model, missing_in_eval
+
+
+@torch.no_grad()
+def run_throughput_benchmark(
+    classifier,
+    dataset,
+    eval_to_model_class: dict,
+    batch_sizes=None,
+    step_sizes=None,
+    tile_size: int = 48,
+    image_width: int = 1224,
+    image_height: int = 1024,
+    device: str = "cpu",
+    num_timing_batches: int = 50,
+    precomputed_accuracy: float = None,
+    precomputed_bal_accuracy: float = None,
+    use_fp16: bool = False,
+):
+    """
+    Benchmark inference throughput for a live tiling pipeline.
+
+    For each batch_size:
+        Measure actual time_per_batch (tpb, seconds) by running num_timing_batches
+        forward passes.  All batches are pre-loaded into CPU RAM before timing
+        starts so that HDF5 / PNG disk-read latency does not inflate tpb.
+        tpb therefore reflects: PCIe host→device transfer + GPU forward pass.
+        The result is cached — each batch_size is timed only once.
+
+    For each step_size:
+        Compute num_tiles analytically using the same formula as tile_and_cast_data_torch:
+            tiles_y = ceil((image_height - tile_size) / step_size)
+            tiles_x = ceil((image_width  - tile_size) / step_size)
+            num_tiles = tiles_y * tiles_x
+
+    Effective FPS = 1.0 / (ceil(num_tiles / batch_size) * tpb)
+        This is the rate at which a SINGLE IMAGE can be fully scanned and classified,
+        not a per-sample rate.  High step_size → fewer tiles → higher FPS.
+        Large batch_size → fewer batches per image → higher FPS (up to OOM).
+
+    Precision:
+        use_fp16=True applies torch.amp.autocast(float16) to match the live pipeline
+        precision.  Without this, FP32 timing on Tensor Core GPUs can be 2× slower
+        than the FP16 the live system actually uses.
+
+    Accuracy is taken from precomputed_accuracy/precomputed_bal_accuracy when provided
+    (avoiding a redundant dataset pass — ModelAnalysis already has these values).
+
+    Returns list of dicts:
+        batch_size, step_size, num_tiles, time_per_batch_ms, fps (Hz),
+        effective_fps (Hz), accuracy, balanced_accuracy, num_samples, oom
+    """
+    from torch.utils.data import Subset
+
+    if batch_sizes is None:
+        batch_sizes = BENCHMARK_BATCH_SIZES
+    if step_sizes is None:
+        step_sizes = BENCHMARK_STEP_SIZES
+
+    classifier.eval()
+    classifier.to(device)
+    all_indices = list(range(len(dataset)))
+
+    # --- Accuracy: use caller's precomputed values or run one dataset pass ---
+    if precomputed_accuracy is not None and precomputed_bal_accuracy is not None:
+        global_acc     = precomputed_accuracy
+        global_bal_acc = precomputed_bal_accuracy
+        num_eval_samples = len(dataset)
+    else:
+        ref_loader = DataLoader(dataset, batch_size=min(64, max(batch_sizes)),
+                                shuffle=False, num_workers=0, drop_last=False,
+                                collate_fn=metadata_collate_fn)
+        yt_list, yp_list = [], []
+        for x, y, *_ in ref_loader:
+            preds = classifier(x.to(device)).argmax(dim=1).cpu().numpy()
+            for i, ev in enumerate(y.numpy()):
+                ev = int(ev)
+                if ev not in eval_to_model_class:
+                    continue
+                yt_list.append(eval_to_model_class[ev])
+                yp_list.append(int(preds[i]))
+        if yt_list:
+            yt = np.array(yt_list, dtype=np.int64)
+            yp = np.array(yp_list, dtype=np.int64)
+            global_acc     = float(accuracy_score(yt, yp))
+            global_bal_acc = float(balanced_accuracy_score(yt, yp))
+            num_eval_samples = len(yt_list)
+        else:
+            global_acc = global_bal_acc = 0.0
+            num_eval_samples = 0
+
+    # --- time_per_batch: measured once per batch_size, cached ---
+    _tpb_cache: dict[int, float] = {}
+
+    def _measure_tpb(bs: int):
+        """Return seconds-per-batch for pure GPU inference, or None on OOM.
+
+        Timing methodology:
+          1. Pre-load all required batches from the dataset into CPU RAM.  This
+             decouples HDF5 chunk reads / PNG decodes from the GPU timer; those
+             I/O costs must NOT appear in tpb because the live pipeline works on
+             in-memory tiles, not on-disk samples.
+          2. Warmup: run _BENCH_WARMUP_BATCHES forward passes so CUDA kernels are
+             compiled/selected and the allocator is pre-warmed.
+          3. Timed loop: cycle through pre-loaded CPU batches num_timing_batches
+             times.  A single torch.cuda.synchronize() at the end waits for ALL
+             GPU work (which is queued asynchronously) before reading the clock.
+             This avoids per-batch sync overhead while still getting the right
+             wall-clock total (GPU work is pipelined inside the loop, then flushed
+             once at the end).
+          4. tpb = total_elapsed / num_timing_batches  (seconds per batch).
+
+        The measured tpb includes: PCIe host→device transfer + GPU forward pass.
+        It does NOT include: disk I/O, tensor construction, softmax, or CPU→GPU
+        result copy — matching what the live pipeline actually pays per batch.
+        """
+        # Pre-load enough batches for warmup + timing into CPU RAM.
+        # Capped at 20 timing batches per batch-size to bound RAM usage:
+        #   bs=64  → 64×23×9216 bytes ≈ 13 MB   (trivial)
+        #   bs=4096 → 4096×23×9216 bytes ≈ 870 MB (large but acceptable once)
+        # Timing batches are cycled if num_timing_batches > preloaded count.
+        _preload_timing = min(num_timing_batches, 20)
+        n_needed = bs * (_BENCH_WARMUP_BATCHES + _preload_timing)
+        reps     = n_needed // len(all_indices) + 1
+        indices  = (all_indices * reps)[:n_needed]
+        loader   = DataLoader(Subset(dataset, indices),
+                              batch_size=bs, shuffle=False, num_workers=0,
+                              drop_last=False, collate_fn=metadata_collate_fn)
+
+        # Collect all batches eagerly — I/O happens here, outside the timer.
+        try:
+            cpu_batches = [x for x, *_ in loader]
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+                return None
+            raise
+
+        # Autocast to match live pipeline precision (FP16 on Tensor Core GPUs).
+        autocast_ctx = (
+            torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+            if use_fp16 and device == "cuda"
+            else torch.amp.autocast(device_type="cuda", enabled=False)
+            if device == "cuda"
+            else torch.amp.autocast(device_type="cpu", enabled=False)
+        )
+
+        warmup_batches = cpu_batches[:_BENCH_WARMUP_BATCHES]
+        timing_batches = cpu_batches[_BENCH_WARMUP_BATCHES:] or cpu_batches
+
+        try:
+            # Warmup: prime CUDA kernel cache / cudnn autotuner.
+            for x in warmup_batches:
+                with autocast_ctx:
+                    classifier(x.to(device))
+            if device == "cuda":
+                torch.cuda.synchronize()
+
+            # Timed loop: queue all GPU work, then flush once with synchronize().
+            # Cycling timing_batches covers the case where num_timing_batches >
+            # len(timing_batches) without extra RAM allocation.
+            t0, counted = time.perf_counter(), 0
+            for i in range(num_timing_batches):
+                x = timing_batches[i % len(timing_batches)]
+                with autocast_ctx:
+                    classifier(x.to(device))
+                counted += 1
+            if device == "cuda":
+                torch.cuda.synchronize()   # Single flush — measures GPU throughput
+            return (time.perf_counter() - t0) / max(counted, 1)
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+                return None
+            raise
+
+    # --- Sweep (batch_size, step_size) ---
+    combos = [(b, s) for b in batch_sizes for s in step_sizes]
+    pbar = tqdm(combos, desc="    Benchmark", unit="combo",
+                dynamic_ncols=True, leave=True)
+
+    results = []
+    for batch_size, step_size in pbar:
+        # Tile count matches torch.arange(0, dim - tile_size, step)
+        tiles_y   = max(0, math.ceil((image_height - tile_size) / step_size))
+        tiles_x   = max(0, math.ceil((image_width  - tile_size) / step_size))
+        num_tiles = tiles_y * tiles_x
+        if num_tiles == 0:
+            continue
+
+        if batch_size not in _tpb_cache:
+            _tpb_cache[batch_size] = _measure_tpb(batch_size)
+        tpb = _tpb_cache[batch_size]
+
+        if tpb is None:
+            # OOM — record the failure and skip remaining step_sizes for this
+            # batch_size (they'd OOM too, but we still want them plotted as X)
+            pbar.set_postfix(batch=batch_size, step=step_size, status="OOM")
+            results.append({
+                "batch_size"        : batch_size,
+                "step_size"         : step_size,
+                "num_tiles"         : num_tiles,
+                "time_per_batch_ms" : None,
+                "fps"               : None,
+                "effective_fps"     : None,
+                "accuracy"          : global_acc,
+                "balanced_accuracy" : global_bal_acc,
+                "num_samples"       : num_eval_samples,
+                "oom"               : True,
+            })
+            continue
+
+        num_batches = math.ceil(num_tiles / batch_size)
+        fps = 1.0 / (num_batches * tpb) if tpb > 0 else 0.0
+
+        pbar.set_postfix(batch=batch_size, step=step_size,
+                         tiles=num_tiles, fps=f"{fps:.2f}",
+                         bal_acc=f"{global_bal_acc:.3f}")
+
+        results.append({
+            "batch_size"        : batch_size,
+            "step_size"         : step_size,
+            "num_tiles"         : num_tiles,
+            "time_per_batch_ms" : tpb * 1000.0,
+            "fps"               : fps,
+            "effective_fps"     : fps,
+            "accuracy"          : global_acc,
+            "balanced_accuracy" : global_bal_acc,
+            "num_samples"       : num_eval_samples,
+            "oom"               : False,
+        })
+
+    return results
 
 
 @torch.no_grad()
@@ -343,10 +623,18 @@ def predict_dataset_aligned(
 
 
 def safe_div(a, b):
+    """Safe division that returns 0.0 on zero denominator."""
     return float(a) / float(b) if b else 0.0
 
 
 def build_detailed_stats(y_true, y_pred, model_class_names, shared_class_names=None):
+    """
+    Compute full classification statistics (accuracy, precision, recall, F1, TP/TN/FP/FN).
+
+    Returns a dict with keys: accuracy, balanced_accuracy, num_samples,
+    confusion_matrix, confusion_matrix_normalized, classification_report,
+    per_class (list of per-class dicts), labels, label_model_indices.
+    """
     if shared_class_names is None:
         shared_class_names = list(model_class_names)
 
@@ -439,6 +727,7 @@ def build_detailed_stats(y_true, y_pred, model_class_names, shared_class_names=N
 
 
 def print_metrics(title, metrics, class_names):
+    """Print formatted classification metrics including confusion matrix and per-class stats."""
     print("\n" + "=" * 90)
     print(title)
     print("=" * 90)
@@ -477,6 +766,7 @@ def print_metrics(title, metrics, class_names):
 
 
 def save_json_report(out_path, dataset_path, class_names, metrics, extra=None):
+    """Save a JSON report with dataset info, class names, metrics, and optional extra fields."""
     payload = {"dataset": dataset_path, "classes": class_names, "metrics": metrics}
     if extra is not None:
         payload["extra"] = extra
@@ -486,6 +776,7 @@ def save_json_report(out_path, dataset_path, class_names, metrics, extra=None):
 
 
 def build_full_model_confusion_matrix(y_true, y_pred, model_class_names):
+    """Build a (K, K) confusion matrix in the full model class space."""
     num_classes = len(model_class_names)
     matrix = np.zeros((num_classes, num_classes), dtype=int)
     for true_idx, pred_idx in zip(y_true, y_pred):
@@ -495,6 +786,12 @@ def build_full_model_confusion_matrix(y_true, y_pred, model_class_names):
 
 
 def build_eval_dataset_confusion_matrix(y_true, y_pred, eval_class_names, model_class_names):
+    """
+    Build a confusion matrix in the evaluation-dataset class space.
+
+    Predictions for classes not in the eval dataset are binned into an
+    'OTHER_TRAINED_CLASSES' column. Returns (matrix, labels).
+    """
     eval_model_indices = [model_class_names.index(name) for name in eval_class_names]
     model_to_eval_col = {model_idx: col_idx for col_idx, model_idx in enumerate(eval_model_indices)}
     other_col = len(eval_class_names)
@@ -516,6 +813,7 @@ def build_eval_dataset_confusion_matrix(y_true, y_pred, eval_class_names, model_
 
 
 def write_confusion_json(json_path, title, labels, matrix):
+    """Save a confusion matrix as a JSON file."""
     payload = {"title": title, "labels": labels, "matrix": np.asarray(matrix, dtype=int).tolist()}
     with open(json_path, "w") as f:
         json.dump(payload, f, indent=2)
@@ -523,6 +821,10 @@ def write_confusion_json(json_path, title, labels, matrix):
 
 
 def plot_confusion_matrices(base_path_without_ext, title, labels, matrix):
+    """
+    Render 4 confusion matrix heatmaps (raw, row-normalized, total-normalized, hybrid)
+    and save as PNGs alongside a base JSON.
+    """
     matrix = np.array(matrix, dtype=float)
 
     def _save(fig_name, heat_matrix, annot, fmt, plot_title):
@@ -560,6 +862,7 @@ def plot_confusion_matrices(base_path_without_ext, title, labels, matrix):
 
 
 def save_confusion_artifacts(report_root, safe_name, title, suffix, labels, matrix):
+    """Save confusion matrix JSON + PNG plots and return the JSON path."""
     json_path = os.path.join(report_root, f"{safe_name}{suffix}.json")
     base_path = os.path.join(report_root, f"{safe_name}{suffix}")
     write_confusion_json(json_path, title, labels, matrix)
@@ -568,6 +871,7 @@ def save_confusion_artifacts(report_root, safe_name, title, suffix, labels, matr
 
 
 def normalize_metadata_value(value):
+    """Normalize a metadata value: None/empty/whitespace strings become 'MISSING'."""
     if value is None:
         return "MISSING"
     if isinstance(value, str):
@@ -580,6 +884,11 @@ def normalize_metadata_value(value):
 
 
 def bucket_numeric_metadata(value, bin_size=25):
+    """
+    Bucket a numeric metadata value into a string range label.
+
+    E.g. value=67, bin_size=25 -> "0050-0074"
+    """
     value = normalize_metadata_value(value)
     try:
         v = float(value)
@@ -591,6 +900,12 @@ def bucket_numeric_metadata(value, bin_size=25):
 
 
 def transform_metadata_value(key, value, binned_keys=None, bin_size=25):
+    """
+    Transform a metadata value for grouping.
+
+    Keys in *binned_keys* are bucketed into numeric ranges; all others are
+    normalized as strings.
+    """
     if binned_keys is None:
         binned_keys = set(DEFAULT_BINNED_KEYS)
     if key in binned_keys:
@@ -609,6 +924,12 @@ def build_metadata_group_reports(
     bin_size=25,
     min_samples=1,
 ):
+    """
+    Group evaluation results by metadata property values and compute per-group metrics.
+
+    Returns a dict keyed by metadata property name, each value mapping group-value
+    strings to their metrics dicts.
+    """
     reports = {}
 
     if binned_keys is None:
@@ -657,6 +978,7 @@ def build_metadata_group_reports(
 
 
 def print_metadata_group_summary_less_verbose(metadata_group_reports):
+    """Print a compact metadata group summary (accuracy + balanced accuracy per group)."""
     print("\n" + "=" * 90)
     print("METADATA GROUP SUMMARY")
     print("=" * 90)
@@ -677,6 +999,7 @@ def print_metadata_group_summary_less_verbose(metadata_group_reports):
 
 
 def print_metadata_group_summary(metadata_group_reports):
+    """Print a verbose metadata group summary including per-class stats."""
     print("\n" + "=" * 90)
     print("METADATA GROUP SUMMARY")
     print("=" * 90)
@@ -709,6 +1032,7 @@ def print_metadata_group_summary(metadata_group_reports):
                 )
 
 def parse_metadata_keys(arg):
+    """Parse a comma-separated metadata key string or return defaults."""
     if arg is None:
         return list(DEFAULT_METADATA_KEYS)
     keys = [x.strip() for x in arg.split(",") if x.strip()]
@@ -720,7 +1044,12 @@ def parse_metadata_keys(arg):
 # ---------------------------------------------------------------------------
 
 def scan_ensemble_models(model_dir: str):
-    """Return list of (pth_path, cfg_path) for all valid allclass_*.pth pairs."""
+    """
+    Scan *model_dir* for valid ensemble model pairs (allclass_*.pth + .json).
+
+    Skips files without a matching .json or those that are not valid zip files.
+    Returns list of (pth_path, cfg_path) tuples.
+    """
     import zipfile
     pairs = []
     for name in sorted(os.listdir(model_dir)):
@@ -740,7 +1069,11 @@ def scan_ensemble_models(model_dir: str):
 
 
 def load_ensemble(pairs, device):
-    """Load every (pth, cfg) pair into an eval-mode Classifier. Returns list of (classifier, class_names)."""
+    """
+    Load every (pth, cfg) pair into an eval-mode Classifier.
+
+    Returns list of (classifier, class_names) tuples for valid ensemble members.
+    """
     members = []
     for pth_path, cfg_path in pairs:
         cfg = load_hyperparameters(cfg_path)

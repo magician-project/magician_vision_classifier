@@ -73,6 +73,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 def _default_device() -> str:
+    """Return 'cuda' if available, otherwise 'cpu'."""
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -93,8 +94,9 @@ def _discover_model_pairs(models_dir: str) -> list[tuple[str, str]]:
 
 def _load_dataset(dataset_dir: str):
     """
-    Load the dataset without any class filtering so all models are compared
-    on the same full label space.
+    Load a dataset (HDF5 or PNG ImageFolder) without class filtering.
+
+    Ensures all models are compared against the same full label space.
     """
     transform = transforms.Compose([transforms.ToTensor()])
     h5 = os.path.join(dataset_dir, "dataset.h5")
@@ -106,6 +108,7 @@ def _load_dataset(dataset_dir: str):
 
 
 def _count_parameters(model: torch.nn.Module) -> int:
+    """Count the number of trainable parameters in a PyTorch model."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
@@ -157,46 +160,63 @@ def _run_inference(
     device: str,
     eval_to_model_class: dict[int, int],
     desc: str,
+    use_fp16: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Two-pass inference:
       Pass 1 — warmup (first _WARMUP_BATCHES batches).
       Pass 2 — timed, full dataset; builds y_true / y_pred / probs arrays.
 
+    eval_to_model_class maps dataset class indices → model class indices.
+    Samples whose dataset class is not in this mapping are skipped.
+    For binary/catch-all models the caller should extend this mapping so
+    that every dataset class is covered (mapping unknown classes to the
+    model's catch-all index), ensuring all models produce the same N.
+
     Returns:
-        y_true        : (N,) int64  — ground-truth in *model* class space
-        y_pred        : (N,) int64  — argmax predictions
+        y_true_ds     : (N,) int64  — ground-truth in *dataset* class space
+        y_pred        : (N,) int64  — argmax predictions (model class space)
         probs         : (N, K) float32 — full softmax probability vectors
         ms_per_sample : float  — milliseconds per sample (pass 2 only)
     """
     clf.eval()
     clf.to(device)
 
+    # autocast context mirrors what the live pipeline uses in classify_tiles()
+    autocast_ctx = (
+        torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+        if use_fp16 and device == "cuda"
+        else torch.amp.autocast(device_type="cuda", enabled=False)
+        if device == "cuda"
+        else torch.amp.autocast(device_type="cpu", enabled=False)
+    )
+
     # ── Warmup ──────────────────────────────────────────────────────────────
     for i, (x, *_) in enumerate(loader):
-        clf(x.to(device))
+        with autocast_ctx:
+            clf(x.to(device))
         if i + 1 >= _WARMUP_BATCHES:
             break
     if device == "cuda":
         torch.cuda.synchronize()
 
     # ── Timed prediction pass ────────────────────────────────────────────────
-    y_true_list: list[int] = []
-    y_pred_list: list[int] = []
-    prob_list:   list[np.ndarray] = []
+    y_true_ds_list: list[int] = []   # dataset-space ground-truth indices
+    y_pred_list:    list[int] = []
+    prob_list:      list[np.ndarray] = []
 
     t0 = time.perf_counter()
     for x, y, *_ in tqdm(loader, desc=f"  {desc}", unit="batch", leave=False, dynamic_ncols=True):
         x = x.to(device)
-        logits = clf(x)
-        p = torch.softmax(logits, dim=1).cpu().numpy()  # (B, K_model)
+        with autocast_ctx:
+            logits = clf(x)
+        p = torch.softmax(logits.float(), dim=1).cpu().numpy()  # (B, K_model)
 
         for i, eval_idx in enumerate(y.numpy()):
             eval_idx = int(eval_idx)
             if eval_idx not in eval_to_model_class:
                 continue
-            gt = eval_to_model_class[eval_idx]
-            y_true_list.append(gt)
+            y_true_ds_list.append(eval_idx)   # keep original dataset class index
             y_pred_list.append(int(p[i].argmax()))
             prob_list.append(p[i])
 
@@ -204,15 +224,15 @@ def _run_inference(
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
 
-    if not y_true_list:
+    if not y_true_ds_list:
         empty = np.zeros((0, 0), dtype=np.float32)
         return np.array([], np.int64), np.array([], np.int64), empty, 0.0
 
-    ms_per_sample = 1000.0 * elapsed / len(y_true_list)
+    ms_per_sample = 1000.0 * elapsed / len(y_true_ds_list)
     return (
-        np.array(y_true_list, dtype=np.int64),
-        np.array(y_pred_list, dtype=np.int64),
-        np.array(prob_list,  dtype=np.float32),
+        np.array(y_true_ds_list, dtype=np.int64),
+        np.array(y_pred_list,    dtype=np.int64),
+        np.array(prob_list,      dtype=np.float32),
         ms_per_sample,
     )
 
@@ -277,12 +297,18 @@ def main():
     dataset_dir = sys.argv[1]
     models_dir  = sys.argv[2] if len(sys.argv) > 2 else "."
     batch_size  = int(sys.argv[3]) if len(sys.argv) > 3 else 64
+    use_fp16    = "--fp16" in sys.argv
     device      = _default_device()
+
+    if device == "cuda":
+        # Auto-tune cuDNN convolution algorithms for the fixed tile shapes.
+        torch.backends.cudnn.benchmark = True
 
     print(f"Dataset  : {dataset_dir}")
     print(f"Models   : {models_dir}")
     print(f"Device   : {device}")
     print(f"Batch    : {batch_size}")
+    print(f"FP16     : {use_fp16}  ({'matches live pipeline' if use_fp16 else 'FP32 — use --fp16 for live-pipeline-accurate numbers'})")
 
     # ── Locate model pairs ──────────────────────────────────────────────────
     pairs = _discover_model_pairs(models_dir)
@@ -342,6 +368,25 @@ def main():
             print("  [ERROR] zero class overlap — skipping.")
             continue
 
+        # ── Catch-all handling for binary / coarse models ───────────────────
+        # A binary model trained as "clean vs defect" has a model-exclusive
+        # class (e.g. "defect" / "class_defect") that is the catch-all for
+        # every dataset class the model was never taught individually.
+        # Map those dataset-exclusive classes → the model's catch-all index
+        # so no samples are skipped and all models produce the same N.
+        catchall_model_indices: list[int] = []
+        catchall_ds_indices:    list[int] = []
+        if miss_model and miss_eval:
+            catchall_model_indices = [model_classes.index(n) for n in miss_model]
+            catchall_ds_indices    = [dataset_classes.index(n) for n in miss_eval]
+            # Pick the first model-exclusive class as the primary catch-all;
+            # all dataset-exclusive classes are routed to it.
+            primary_catchall_idx = catchall_model_indices[0]
+            for ds_name in miss_eval:
+                eval_to_model[dataset_classes.index(ds_name)] = primary_catchall_idx
+            print(f"  [INFO] Catch-all: {len(miss_eval)} dataset class(es) → "
+                  f"model class '{miss_model[0]}' (idx {primary_catchall_idx})")
+
         # Instantiate and load weights
         try:
             clf = _instantiate_classifier(config_json, model_classes)
@@ -352,37 +397,41 @@ def main():
 
         num_params = _count_parameters(clf)
 
-        # Run timed inference (model outputs are in *model_classes* space)
-        y_true_model, y_pred_model, probs_model, ms_per_sample = _run_inference(
-            clf, loader, device, eval_to_model, desc=model_name
+        # Run timed inference.
+        # _run_inference returns y_true already in *dataset* class space.
+        y_true_ds, y_pred_model, probs_model, ms_per_sample = _run_inference(
+            clf, loader, device, eval_to_model, desc=model_name, use_fp16=use_fp16
         )
 
-        if len(y_true_model) == 0:
+        if len(y_true_ds) == 0:
             print("  [WARN] no aligned samples produced — skipping.")
             del clf
             continue
 
         # ── Re-align probability vectors to the dataset class space ─────────
-        # probs_model columns correspond to model_classes indices;
-        # we scatter them into the dataset_classes layout.
-        N = len(y_true_model)
+        # probs_model columns correspond to model_classes indices; scatter
+        # them into the full dataset_classes layout.
+        # For catch-all model classes, distribute their probability equally
+        # across all dataset classes they represent (the user confirmed that
+        # the only shared semantics between binary and multi-class models is
+        # the "clean" class — everything else is "non-clean").
+        N = len(y_true_ds)
         aligned_probs = np.zeros((N, num_dataset_classes), dtype=np.float32)
+
         for model_cls_idx, model_cls_name in enumerate(model_classes):
             if model_cls_name in dataset_classes:
+                # Direct 1-to-1 mapping for shared classes (e.g. "clean")
                 ds_idx = dataset_classes.index(model_cls_name)
                 aligned_probs[:, ds_idx] = probs_model[:, model_cls_idx]
+            elif model_cls_idx in catchall_model_indices and catchall_ds_indices:
+                # Distribute this catch-all class's probability equally across
+                # all dataset-exclusive classes it represents
+                share = probs_model[:, model_cls_idx] / len(catchall_ds_indices)
+                for ds_idx in catchall_ds_indices:
+                    aligned_probs[:, ds_idx] += share
 
         y_pred_aligned = aligned_probs.argmax(axis=1).astype(np.int64)
-
-        # Re-map y_true from model space → dataset space
-        model_to_ds = {
-            model_classes.index(name): dataset_classes.index(name)
-            for name in shared
-        }
-        y_true_ds = np.array(
-            [model_to_ds.get(int(t), int(t)) for t in y_true_model],
-            dtype=np.int64,
-        )
+        # y_true_ds is already in dataset class space — no remapping needed
 
         # Verify consistency across models (same sample order expected)
         if y_true_global is None:
@@ -406,6 +455,7 @@ def main():
             "tile_size"          : config_json["hparams"].get("tile_size", 0),
             "num_params"         : num_params,
             "ms_per_sample"      : ms_per_sample,
+            "precision"          : "fp16" if use_fp16 else "fp32",
             "accuracy"           : stats["accuracy"],
             "balanced_accuracy"  : stats["balanced_accuracy"],
             "num_aligned_samples": int(N),

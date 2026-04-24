@@ -99,10 +99,10 @@ def evaluate_dumped_tiles(model, tiles_dir, classes, device='cuda', batch_size=1
     model.eval()
     model.to(device)
 
-    # Transformation: RGBA -> Tensor
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
+    # HWC uint8 → CHW uint8 tensor; /255 normalisation is done inside the model.
+    transform = transforms.Lambda(
+        lambda img: torch.from_numpy(img).permute(2, 0, 1).contiguous()
+    )
 
     # Collect all .png tiles
     all_files = [os.path.join(tiles_dir, f) for f in os.listdir(tiles_dir) if f.lower().endswith('.png')]
@@ -174,16 +174,32 @@ def evaluate_dumped_tiles(model, tiles_dir, classes, device='cuda', batch_size=1
 
 #-------------------------------------------------------------------------------
 def checkIfPathExists(filename):
+    """Return True if the given path exists (file or directory)."""
     return os.path.exists(filename)
 #-------------------------------------------------------------------------------
 def checkIfPathIsDirectory(filename):
-    return os.path.isdir(filename) 
+    """Return True if the given path exists and is a directory."""
+    return os.path.isdir(filename)
 #-------------------------------------------------------------------------------
 def checkIfFileExists(filename):
+    """Return True if the given path exists and is a file."""
     return os.path.isfile(filename)
 #-------------------------------------------------------------------------------
 
 def load_hyperparameters(config_file):
+    """
+    Load and parse a JSON configuration file containing model hyperparameters,
+    dataloader settings, optimizer config, and training options.
+
+    Args:
+        config_file: Path to a .json configuration file.
+
+    Returns:
+        Parsed dict with all configuration values.
+
+    Exits:
+        sys.exit(1) if the file does not exist.
+    """
     if not checkIfFileExists(config_file):
         print("Config file not found")
         sys.exit(1)
@@ -250,13 +266,24 @@ class CategoricalFocalLoss(nn.Module):
 
 
 class CustomCNN(nn.Module):
+    """
+    A lightweight 4-layer convolutional network with adaptive global pooling
+    and a two-tier fully-connected head. Designed for small tile images.
+
+    Architecture:
+        Conv2d → BN → ReLU → MaxPool (×4 stages, channels double each stage)
+        → AdaptiveAvgPool2d(1,1) → Flatten
+        → Linear → InstanceNorm1d → ReLU → Dropout
+        → Linear → InstanceNorm1d → ReLU → Dropout
+        → Linear → num_classes logits
+    """
     def __init__(self, in_channels=4, intended_tile_size=64, num_classes=4, dropout_rate=0.5, base_channels=32, final_dense_layer=512):
         super(CustomCNN, self).__init__()
-  
+
         print("Custom CNN (",base_channels,",",final_dense_layer,") constructor")
         self.channels  = in_channels
         self.tile_size = intended_tile_size
- 
+
         c1 = base_channels
         self.conv1 = nn.Conv2d(in_channels, c1, kernel_size=3, padding=1)
         self.bn1   = nn.BatchNorm2d(c1)
@@ -288,6 +315,20 @@ class CustomCNN(nn.Module):
         self.out = nn.Linear(intermediateLayerChannels, num_classes)
 
     def forward(self, x):
+        """
+        Forward pass through the CNN backbone + FC head.
+        Validates input dimensions then streams through 4 conv stages,
+        global average pooling, and a two-tier FC head.
+
+        Args:
+            x: Input tensor of shape (B, channels, tile_size, tile_size).
+
+        Returns:
+            Logits tensor of shape (B, num_classes).
+
+        Raises:
+            ValueError: If input spatial/channel dimensions don't match expected.
+        """
         if x.shape[1:] != (self.channels, self.tile_size, self.tile_size):  # Sanity check on desired input size
           raise ValueError(f"Input size must be {self.channels}x{self.tile_size}x{self.tile_size}, got {x.shape[1:]}")
         x = self.pool1(F.relu(self.bn1(self.conv1(x))))
@@ -311,6 +352,15 @@ class CustomCNN(nn.Module):
 
 
 class Classifier(pl.LightningModule):
+    """
+    A PyTorch Lightning module wrapping a variety of pretrained vision backbones
+    (ResNet, ConvNeXt, EfficientNet, Swin, RegNet, MobileNet, ShuffleNet, SqueezeNet,
+    DenseNet, MNASNet) or a custom CNN for tile-level image classification.
+
+    Supports polarization-derived input channels (AoLP, DoLP, Unpolarized, Max/Min/Range
+    Polarization) computed on-the-fly from the base 4 Stokes channels. Also supports
+    input noise augmentation and false-clean penalization for imbalanced datasets.
+    """
     def __init__(self,
                       model='resnet18',
                       loss='focal',
@@ -464,6 +514,16 @@ class Classifier(pl.LightningModule):
         self.auroc     = AUROC(task='MULTICLASS',     num_classes=num_classes)
 
     def add_input_noise(self, x):
+        """
+        Add Gaussian noise to the input during training for regularization.
+        Only active when self.training is True and noise_std > 0.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Input tensor with noise added.
+        """
         if self.training and self.noise_std > 0.0:
             noise = torch.randn_like(x) * self.noise_std
             if self.noise_clip is not None:
@@ -477,7 +537,16 @@ class Classifier(pl.LightningModule):
         All polarization-derived features are computed from the original 4 channels only.
         Expects x shape: [B, >=4, H, W] at input (normally [B,4,H,W]).
         Returns x shape: [B, self.in_channels, H, W]
+
+        Accepts uint8 input (0-255) and normalises to float32 [0,1] on the GPU.
+        This keeps PCIe transfer bandwidth 4× lower than sending float32 tensors.
         """
+        # Dequantize uint8 → float32 on the device where x already lives.
+        # The multiplication is a single fused kernel; cost is negligible vs. the
+        # conv ops that follow.  float() preserves the current device and layout.
+        if x.dtype == torch.uint8:
+            x = x.float() * (1.0 / 255.0)
+
         if x.shape[1] < 4:
             raise ValueError(f"Expected at least 4 channels for polarization input, got {x.shape[1]}")
 
@@ -524,10 +593,34 @@ class Classifier(pl.LightningModule):
         return x
 
     def forward(self, x):
+        """
+        Canonical forward pass: build input features (polarization channels + noise),
+        then pass through the backbone model.
+
+        Args:
+            x: Input tensor, typically uint8 [B, 4, H, W] or float [B, 4, H, W].
+
+        Returns:
+            Logits tensor of shape (B, num_classes).
+        """
         x = self.build_input_features(x)
         return self.model(x)
 
     def training_step(self, batch, _batch_idx):
+        """
+        Compute training loss with optional false-clean penalization.
+
+        If penalize_false_clean > 0, adds a penalty term that discourages the model
+        from assigning high clean-class probability to non-clean samples. The penalty
+        is -log(1 - P(clean)) for each non-clean sample.
+
+        Args:
+            batch: (x, y) tensor pair from the DataLoader.
+            _batch_idx: Unused batch index required by Lightning.
+
+        Returns:
+            Scalar loss tensor.
+        """
         x, y = batch
 
         x = self.add_input_noise(x)
@@ -554,6 +647,18 @@ class Classifier(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, _batch_idx):
+        """
+        Execute one validation batch: compute loss and update metric accumulators.
+        Noise is intentionally skipped (training-only). Metric .compute() is deferred
+        to on_validation_epoch_end to avoid per-batch warnings on small/imbalanced batches.
+
+        Args:
+            batch: (x, y) tensor pair from the validation DataLoader.
+            _batch_idx: Unused batch index required by Lightning.
+
+        Returns:
+            Scalar validation loss tensor.
+        """
         x, y = batch
 
         # Use self(x) — goes through the canonical forward() path.
@@ -562,24 +667,34 @@ class Classifier(pl.LightningModule):
         loss  = self.criterion(y_hat, y)
         self.log('val_loss', loss, sync_dist=True)
 
+        # Only accumulate state per batch — do NOT call .compute() here.
+        # Computing per-batch fires "no positive samples" warnings whenever a
+        # small batch happens to contain only one class (common with imbalanced
+        # datasets).  Epoch-level values are logged in on_validation_epoch_end.
         self.accuracy.update(y_hat, y)
-        self.log('val_accuracy',  self.accuracy.compute(),  prog_bar=True, sync_dist=True)
-
         self.recall.update(y_hat, y)
-        self.log('val_recall',    self.recall.compute(),    prog_bar=True, sync_dist=True)
-
         self.precision.update(y_hat, y)
-        self.log('val_precision', self.precision.compute(), prog_bar=True, sync_dist=True)
-
         self.auroc.update(y_hat, y)
-        self.log('val_auroc', self.auroc.compute(), prog_bar=True, sync_dist=True)
 
         return loss
 
     def calculate_stokes(self, x):
         """
-        Calculate the Stokes parameters from the input tensor.
-        Assuming x is a tensor of shape (batch_size, 4, height, width).
+        Compute the 4 Stokes parameters (S0, S1, S2, S3) from the 4-channel
+        polarization input. The input channels are assumed to be:
+          [I_total, 0°_linear, 45°_linear, Right_circular]
+
+        Stokes formulas:
+          S0 = I_total
+          S1 = I(0°) - I(90°)   → x[:,1] - x[:,2]
+          S2 = I(45°) - I(135°) → x[:,1] + x[:,2]
+          S3 = 2*I(right_circ) - I_total
+
+        Args:
+            x: Tensor of shape (batch_size, 4, height, width).
+
+        Returns:
+            Stokes tensor of shape (batch_size, 4, height, width).
         """
         S0 = x[:, 0, :, :]
         S1 = x[:, 1, :, :] - x[:, 2, :, :]
@@ -589,8 +704,15 @@ class Classifier(pl.LightningModule):
 
     def calculate_DoLP(self, x):
         """
-        Calculate the Degree of Linear Polarization (DoLP) from the Stokes parameters.
-        Assuming x is a tensor of shape (batch_size, 4, height, width).
+        Compute the Degree of Linear Polarization from Stokes parameters.
+        DoLP = sqrt(S1^2 + S2^2) / S0, representing the fraction of light that
+        is linearly polarized. Value range: [0, 1].
+
+        Args:
+            x: Stokes tensor of shape (batch_size, 4, height, width).
+
+        Returns:
+            DoLP tensor of shape (batch_size, height, width).
         """
         S0 = x[:, 0, :, :]
         S1 = x[:, 1, :, :]
@@ -601,8 +723,15 @@ class Classifier(pl.LightningModule):
 
     def calculate_AoLP(self, x):
         """
-        Calculate the Angle of Linear Polarization (AoLP) from the Stokes parameters.
-        Assuming x is a tensor of shape (batch_size, 4, height, width).
+        Compute the Angle of Linear Polarization from Stokes parameters.
+        AoLP = 0.5 * atan2(S2, S1), representing the orientation angle of the
+        electric field oscillation. Value range: [-pi/4, pi/4].
+
+        Args:
+            x: Stokes tensor of shape (batch_size, 4, height, width).
+
+        Returns:
+            AoLP tensor of shape (batch_size, height, width).
         """
         S1 = x[:, 1, :, :]
         S2 = x[:, 2, :, :]
@@ -610,14 +739,25 @@ class Classifier(pl.LightningModule):
         return AoLP
 
     def on_validation_epoch_end(self):
-        # Reset ALL metrics to prevent cross-epoch accumulation.
-        # (Previously only accuracy was reset — recall/precision/auroc were silently wrong.)
+        # Compute epoch-level metrics from the accumulated state of all validation
+        # batches, then reset for the next epoch.  Computing here (not per-batch)
+        # avoids "no positive samples" warnings that fire when individual batches
+        # happen to contain only one class.
+        self.log('val_accuracy',  self.accuracy.compute(),  prog_bar=True, sync_dist=True)
+        self.log('val_recall',    self.recall.compute(),    prog_bar=True, sync_dist=True)
+        self.log('val_precision', self.precision.compute(), prog_bar=True, sync_dist=True)
+        self.log('val_auroc',     self.auroc.compute(),     prog_bar=True, sync_dist=True)
         self.accuracy.reset()
         self.recall.reset()
         self.precision.reset()
         self.auroc.reset()
 
     def configure_optimizers(self):
+        """
+        Configure the AdamW optimizer for all parameters in the Classifier module.
+        Using self.parameters() (not self.model.parameters()) ensures that any new
+        learnable parameters added directly to Classifier (not the backbone) are included.
+        """
         # Optimize self.parameters() (all module params) rather than just self.model.parameters(),
         # so any future additions to Classifier itself are covered automatically.
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
@@ -683,6 +823,17 @@ def load_png_comment_metadata(image_path):
         return {}
 
 def metadata_collate_fn(batch):
+    """
+    Collate function for DataLoader that handles batches with or without metadata.
+    Stacks image tensors, converts labels to long, and collects metadata dicts.
+
+    Args:
+        batch: List of (x, y) or (x, y, metadata) tuples from RGBAImageFolder.
+
+    Returns:
+        (xs, ys, metas) where xs is stacked tensor, ys is label tensor,
+        and metas is a list of metadata dicts.
+    """
     xs = []
     ys = []
     metas = []
@@ -703,6 +854,18 @@ def metadata_collate_fn(batch):
     return xs, ys, metas
 
 def load_rgba_image_pil(path):
+    """
+    Open a PNG/JPG image with PIL and convert it to RGBA mode.
+
+    Args:
+        path: File path to the image.
+
+    Returns:
+        A PIL Image in RGBA mode.
+
+    Raises:
+        ValueError: If conversion to RGBA fails.
+    """
     with Image.open(path) as img:
         try:
             img = img.convert('RGBA')  # Convert to RGBA
@@ -713,19 +876,41 @@ def load_rgba_image_pil(path):
 
 
 def load_rgba_image(image_path):
+    """
+    Load an image using OpenCV as RGBA uint8 in HWC order.
+    OpenCV loads in BGRA order, so we convert to BGRA to preserve correct channel
+    semantics (the rest of the pipeline expects standard RGBA ordering).
+
+    The image stays as uint8 to minimize PCIe transfer bandwidth — normalization
+    to float32 [0, 1] happens inside Classifier.build_input_features() on GPU.
+
+    Args:
+        image_path: Path to the image file.
+
+    Returns:
+        Numpy array of shape (H, W, 4) with dtype uint8, values 0-255.
+    """
     import cv2
     rgba_image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
 
-    rgba_image = cv2.cvtColor(rgba_image, cv2.COLOR_RGBA2BGRA) #Undo opencv crazyness.. <---------------FLIP RGBA to BGRA
-    #rgba_image = rgba_image/255.0
-    rgba_image = (rgba_image.astype('float32') / 255.0)
-    #rgba_image = torch.tensor(rgba_image).float().to(device, dtype=torch.float32)
-    #print(image_path," -> ",rgba_image.shape)
-    return rgba_image
+    rgba_image = cv2.cvtColor(rgba_image, cv2.COLOR_RGBA2BGRA)  # undo OpenCV channel ordering
+    # Keep as uint8 — normalization (/255) happens inside the model on GPU to
+    # reduce CPU→GPU transfer bandwidth by 4× (1 byte vs 4 bytes per pixel).
+    return rgba_image  # HWC uint8, values 0–255
 
 
 class RGBAImageFolder(datasets.DatasetFolder):
+    """
+    ImageFolder-style dataset that loads RGBA images via OpenCV.
+    Supports optional PNG comment/metadata extraction from embedded text chunks.
+    """
     def __init__(self, root, transform=None, return_metadata=False):
+        """
+        Args:
+            root: Root directory with class subdirectories.
+            transform: Optional transform to apply to loaded images (e.g. tensor conversion).
+            return_metadata: If True, also load PNG comment metadata and return (x, y, meta).
+        """
         super(RGBAImageFolder, self).__init__(
             root,
             loader=load_rgba_image,
@@ -735,6 +920,15 @@ class RGBAImageFolder(datasets.DatasetFolder):
         self.return_metadata = return_metadata
 
     def __getitem__(self, index):
+        """
+        Load a single image, apply transforms, and optionally extract metadata.
+
+        Args:
+            index: Sample index.
+
+        Returns:
+            (sample, target) or (sample, target, metadata) if return_metadata is True.
+        """
         path, target = self.samples[index]
 
         sample = self.loader(path)
@@ -762,7 +956,13 @@ def _human_bytes(num_bytes: int) -> str:
 
 
 def _get_available_ram_bytes() -> int:
-    """Returns available system RAM in bytes."""
+    """
+    Get the amount of available system RAM in bytes.
+    Tries psutil first, then falls back to /proc/meminfo on Linux.
+
+    Returns:
+        Available RAM in bytes, or 0 if detection fails.
+    """
     # Prefer psutil if installed
     try:
         import psutil  # type: ignore
@@ -785,7 +985,16 @@ def _get_available_ram_bytes() -> int:
 
 
 def _get_path_size_bytes(path: str) -> int:
-    """Returns the total size of files under path (or the file itself) in bytes."""
+    """
+    Calculate the total size in bytes of all files under a path (directory or file).
+    Skips files that raise OSError on access (permission issues, etc.).
+
+    Args:
+        path: File or directory path.
+
+    Returns:
+        Total size in bytes, or 0 if calculation fails.
+    """
     try:
         if os.path.isfile(path):
             return os.path.getsize(path)
@@ -851,12 +1060,20 @@ class RAMPreloadedDataset(Dataset):
     """
     Preloads an entire dataset into RAM (samples are cached as returned by the wrapped dataset).
 
+    Use this to eliminate disk I/O bottlenecks during training at the cost of RAM.
+    Ideal when the dataset fits comfortably in memory and training runs many epochs.
+
     Notes:
-    - This will increase startup time and RAM usage.
-    - If you use DataLoader(num_workers>0), each worker may end up with its own copy depending on
-      multiprocessing start method. For true single-copy behavior, prefer num_workers=0.
+    - Increases startup time and RAM usage proportionally to dataset size.
+    - With DataLoader(num_workers>0), each worker may hold its own copy depending on
+      the multiprocessing start method. For true single-copy behavior, use num_workers=0.
     """
     def __init__(self, dataset, show_progress=True):
+        """
+        Args:
+            dataset: The wrapped dataset to preload.
+            show_progress: If True, show a tqdm progress bar during caching.
+        """
         super().__init__()
         self._dataset = dataset
         self.classes = getattr(dataset, 'classes', None)
@@ -887,21 +1104,31 @@ class RAMPreloadedDataset(Dataset):
         print("[OK] Dataset cached to RAM. Starting training...\n")
 
     def __len__(self):
+        """Return the number of cached samples."""
         return len(self._cached)
 
     def __getitem__(self, idx):
+        """Return a cached sample by index."""
         return self._cached[idx]
 
 
 class CombinedDataset(Dataset):
     """
-    Concatenates multiple datasets and exposes:
-      - classes
-      - class_to_idx
-      - targets  (concatenated)
-    Assumes all sub-datasets share the same class list & mapping.
+    Concatenates multiple datasets into a single Dataset, exposing:
+      - classes / class_to_idx (must be consistent across all sub-datasets)
+      - targets (concatenated from all sub-datasets)
+
+    Indexing is O(number of sub-datasets) via a linear scan through cumulative offsets.
+    This is efficient for typical use cases (a handful of datasets).
     """
     def __init__(self, datasets):
+        """
+        Args:
+            datasets: List of dataset objects, all sharing the same classes/class_to_idx.
+
+        Raises:
+            ValueError: If no datasets provided or class mappings are inconsistent.
+        """
         super().__init__()
         if len(datasets) == 0:
             raise ValueError("CombinedDataset received 0 datasets")
@@ -943,9 +1170,23 @@ class CombinedDataset(Dataset):
                 self.targets.extend(list(t))
 
     def __len__(self):
+        """Return the total number of samples across all sub-datasets."""
         return self._total_len
 
     def __getitem__(self, idx):
+        """
+        Forward an index to the correct sub-dataset and return the sample.
+
+        Args:
+            idx: Global index into the combined dataset.
+
+        Returns:
+            The sample tuple from the appropriate sub-dataset.
+
+        Raises:
+            IndexError: If idx is out of bounds.
+            RuntimeError: If no sub-dataset contains the index (shouldn't happen).
+        """
         if idx < 0 or idx >= self._total_len:
             raise IndexError(idx)
 
@@ -962,15 +1203,28 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
     """
     Yields batches where every class is represented at least once.
 
-    - slots_per_class = batch_size // num_classes  (guaranteed per-class slots)
-    - extra_slots     = batch_size  % num_classes  (filled randomly from all indices)
+    Mechanism:
+      slots_per_class = batch_size // num_classes   (guaranteed per-class slots)
+      extra_slots     = batch_size % num_classes     (filled randomly from all indices)
 
-    One epoch = ceil(largest_class_size / slots_per_class) batches, so the
-    majority class is seen roughly once; minority classes are oversampled
-    proportionally.  This prevents any batch from being entirely dominated by
-    the clean/majority class.
+    One epoch produces ceil(largest_class_size / slots_per_class) batches.
+    The majority class is seen roughly once per epoch; minority classes are
+    oversampled proportionally. This prevents any batch from being entirely
+    dominated by the clean/majority class.
+
+    Usage:
+        Pass as `batch_sampler=` to DataLoader (do NOT set shuffle=True).
     """
     def __init__(self, targets, num_classes: int, batch_size: int):
+        """
+        Args:
+            targets: List of integer class labels for all samples.
+            num_classes: Total number of distinct classes.
+            batch_size: Desired batch size (must be >= num_classes).
+
+        Raises:
+            ValueError: If batch_size < num_classes or any class has zero samples.
+        """
         if batch_size < num_classes:
             raise ValueError(
                 f"batch_size ({batch_size}) must be >= num_classes ({num_classes}) "
@@ -994,9 +1248,18 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
         self._len = max(len(ci) for ci in self.class_indices) // self.slots_per_class
 
     def __len__(self):
+        """Return the number of batches per epoch."""
         return self._len
 
     def __iter__(self):
+        """
+        Generate one epoch of balanced batches.
+
+        Each class index pool is shuffled at the start of every epoch. When a pool
+        is exhausted, it is re-shuffled and replayed from the beginning. Extra slots
+        (batch_size % num_classes) are filled by random sampling from all indices.
+        Each batch is finally shuffled to avoid class-order bias.
+        """
         pools = [random.sample(ci, len(ci)) for ci in self.class_indices]
         ptrs  = [0] * self.num_classes
         all_flat = [idx for ci in self.class_indices for idx in ci]
@@ -1077,6 +1340,11 @@ if __name__ == "__main__":
     tile_size         = config_json['hparams']['tile_size']
     val_split         = config_json['dataloader']['validation_split']
     num_workers       = config_json['dataloader']['num_workers']
+    # 0 in the config means "auto": use available cores, capped at 16 to avoid
+    # oversubscription.  Note: RAMPreloadedDataset overrides this to 1 later to
+    # prevent each worker from holding its own copy of the in-RAM dataset.
+    if num_workers == 0:
+        num_workers = min(os.cpu_count() or 1, 16)
     balanced_sampling = config_json['dataloader'].get('balanced_sampling', False)
     gradient_clip_val = config_json['hparams']['gradient_clip_value']
     class_weight      = config_json['class_weight']
@@ -1117,11 +1385,12 @@ if __name__ == "__main__":
         device = 'cpu'
     directory =  config_json['training_dataset']
 
-    # Define the transform
-    transform = transforms.Compose([
-                                    transforms.ToTensor(),  # Convert images to PyTorch tensors
-                                   #transforms.Normalize(mean=[0.2164, 0.2316, 0.2423, 0.2299], std=[0.0188, 0.0199, 0.0206, 0.0198]),
-                                  ])
+    # Rearrange HWC uint8 numpy array → CHW uint8 tensor.
+    # We do NOT divide by 255 here; normalisation happens inside Classifier.forward()
+    # on the GPU, so the DataLoader transfers 4× less data over PCIe.
+    transform = transforms.Lambda(
+        lambda img: torch.from_numpy(img).permute(2, 0, 1).contiguous()
+    )
 
     H5PYFilename = '%s/dataset.h5' % directory 
     if (checkIfFileExists(H5PYFilename)):

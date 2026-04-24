@@ -20,7 +20,15 @@ from trainClassifierTorch import load_hyperparameters, RGBAImageFolder
 
 
 class HDF5Dataset(Dataset):
+    """
+    PyTorch Dataset backed by an HDF5 file.
+
+    Supports both legacy float32 images (auto-converted to uint8) and native
+    uint8 images. Optionally reads per-sample JSON metadata and class names
+    stored as HDF5 attributes.
+    """
     def __init__(self, h5_path):
+        """Open the HDF5 file in read-only mode and extract images, labels, metadata, and class names."""
         self.file = h5py.File(h5_path, "r")
         self.images = self.file["images"]
         self.labels = self.file["labels"]
@@ -39,9 +47,15 @@ class HDF5Dataset(Dataset):
         self.targets = [int(x) for x in self.labels[:]]
 
     def __len__(self):
+        """Return the total number of samples in the HDF5 dataset."""
         return len(self.labels)
 
     def _decode_metadata(self, idx):
+        """
+        Decode the JSON metadata string for sample *idx*.
+
+        Handles bytes, str, and other types; returns an empty dict on any error.
+        """
         if self.metadata is None:
             return {}
 
@@ -64,7 +78,23 @@ class HDF5Dataset(Dataset):
             return {}
 
     def __getitem__(self, idx):
-        x = torch.tensor(self.images[idx], dtype=torch.float32)
+        """
+        Return the image tensor, label, and optional metadata for sample *idx*.
+
+        Images are returned as uint8 tensors (normalisation happens on the GPU).
+        Legacy float32 images are auto-converted to uint8 for consistency.
+        Returns (x, y) or (x, y, meta) depending on whether metadata is available.
+        """
+        # Return uint8 tensors — normalisation (/255) happens inside the model on
+        # the GPU, keeping CPU→GPU transfer bandwidth 4× lower than float32.
+        # HDF5 files written before this change stored float32; detect that case
+        # and convert back to uint8 so downstream code stays consistent.
+        raw = self.images[idx]
+        if raw.dtype == np.float32:
+            # Legacy float32 HDF5 (values already in [0,1]) — re-quantise to uint8.
+            x = torch.from_numpy((raw * 255.0).clip(0, 255).astype(np.uint8))
+        else:
+            x = torch.from_numpy(raw.astype(np.uint8))
         y = torch.tensor(self.labels[idx], dtype=torch.long)
 
         if self.metadata is not None:
@@ -74,6 +104,7 @@ class HDF5Dataset(Dataset):
         return x, y
 
     def close(self):
+        """Close the underlying HDF5 file handle."""
         try:
             if hasattr(self, "file") and self.file is not None:
                 self.file.close()
@@ -81,6 +112,7 @@ class HDF5Dataset(Dataset):
             pass
 
     def __del__(self):
+        """Destructor: ensure the HDF5 file handle is closed."""
         self.close()
 
 
@@ -97,9 +129,10 @@ if __name__ == "__main__":
     )
     directory = config_json["directory"]
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
+    # HWC uint8 numpy → CHW uint8 tensor; no /255 (done in model on GPU).
+    transform = transforms.Lambda(
+        lambda img: torch.from_numpy(img).permute(2, 0, 1).contiguous()
+    )
 
     # Important: ask the loader to also return PNG metadata
     dataset = RGBAImageFolder(root=directory, transform=transform, return_metadata=True)
@@ -119,10 +152,12 @@ if __name__ == "__main__":
     output_path = os.path.join(directory, "dataset.h5")
 
     with h5py.File(output_path, "w") as f:
+        # Store as uint8 — 4× smaller file and 4× less I/O vs float32.
+        # Normalisation (/255) happens inside the model on the GPU.
         img_dset = f.create_dataset(
             "images",
             shape=(n_samples, c, h, w),
-            dtype=np.float32,
+            dtype=np.uint8,
             compression="gzip",
             chunks=(1, c, h, w),
         )

@@ -76,8 +76,8 @@ def tile_and_cast_selected_tiles_torch(image, selected_indices, tile_size=24, st
     tiles = tiles.permute(1, 2, 3, 4, 0).contiguous()
     tiles = tiles.view(-1, tile_size, tile_size, C)
 
-    # Cast to float32 (same as old function)
-    tiles = tiles.to(torch.float32)
+    # Keep as uint8 — normalisation (/255) happens inside the model on the GPU.
+    tiles = tiles.to(torch.uint8)
 
     # Return only the selected tiles
     return tiles[selected_indices]
@@ -192,15 +192,21 @@ def majority_vote_final(predictions, confidences, tilesW, tilesH, window_size=3)
 # -------------------------------------------------------------------------------------
 def run_models_async(models, x):
     """
-    Runs a list of models asynchronously using CUDA streams.
-    Each model can have a different architecture.
-    Returns a list of their outputs.
+    Run all models in *models* concurrently on separate CUDA streams.
+
+    Input *x* is converted to channels_last memory format (zero-copy stride update)
+    before fanning out to streams. Uses FP16 autocast. Requires CUDA.
     """
     assert torch.cuda.is_available(), "CUDA required for async inference"
     device = next(models[0].parameters()).device
 
     streams = [torch.cuda.Stream(device=device) for _ in models]
     results = [None] * len(models)
+
+    # Convert input once to channels-last before fanning out to streams.
+    # Each model was loaded with .to(memory_format=torch.channels_last) so the
+    # layout must match here; the conversion is zero-copy (stride update only).
+    x = x.to(memory_format=torch.channels_last)
 
     for i, (model, stream) in enumerate(zip(models, streams)):
         with torch.cuda.stream(stream):
@@ -213,8 +219,9 @@ def run_models_async(models, x):
 # -------------------------------------------------------------------------------------
 def parallel_classify_tiles(classifiers, rgba_image, tile_size, step, majorityVote=False, max_workers=None):
     """
-    Runs classify_tiles() for each model in parallel threads.
-    Returns a list of predictions (torch tensors, GPU-resident).
+    Run classify_tiles() for each model in parallel CPU threads.
+
+    Returns a list of GPU-resident prediction tensors, one per classifier.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     results = [None] * len(classifiers)
@@ -307,8 +314,15 @@ class EnsembleClassifierPnm:
 
     @staticmethod
     def _benchmark_clf(model, n_tiles, tile_size, device):
-        """Return Hz for one forward pass of `model` with a batch of n_tiles dummy tiles."""
-        dummy = torch.rand(n_tiles, 4, tile_size, tile_size, device=device)
+        """
+        Benchmark a single classifier's throughput.
+
+        Returns Hz (forward passes per second) for a batch of *n_tiles* dummy
+        uint8 tiles. Synchronizes CUDA before/after timing if on GPU.
+        """
+        # Use uint8 dummy input to match the live-pipeline data format.
+        dummy = torch.randint(0, 256, (n_tiles, 4, tile_size, tile_size),
+                              dtype=torch.uint8, device=device)
         if device == "cuda":
             torch.cuda.synchronize()
         t0 = time.time()
@@ -320,11 +334,11 @@ class EnsembleClassifierPnm:
 
     def apply_min_hz(self, min_hz):
         """
-        Re-filter the active classifier list using `min_hz`.
+        Re-filter the active classifier list using a minimum throughput threshold.
 
-        Benchmarks are cached in self.model_perf; only models not yet measured
-        are benchmarked.  Safe to call at any time without reloading weights.
-        0.0 (or negative) keeps all models.
+        Benchmarks any model not yet measured (cached in self.model_perf), then
+        keeps only those meeting or exceeding *min_hz* Hz. Safe to call at any time
+        without reloading weights. A value of 0.0 or negative keeps all models.
         """
         self.min_hz = min_hz
 
@@ -349,7 +363,7 @@ class EnsembleClassifierPnm:
         self.classifiers = kept
 
     def print_perf(self):
-        """Print a formatted per-model performance table."""
+        """Print a formatted per-model throughput table with ASCII bar charts."""
         if not self.model_perf:
             print("[Ensemble] No performance data yet.")
             return
@@ -373,11 +387,12 @@ class EnsembleClassifierPnm:
     @torch.no_grad()
     def ensemble_vote_and_answer_for_all_tiles(self, num_models, global_number_of_tiles, all_predictions, all_confidences, non_clean_indices, cleanClassID, strict=True):
         """
-        Vectorised ensemble voting — no Python loop over tiles.
+        Vectorised ensemble voting across models for non-clean tile positions.
 
-        all_predictions : [M, N_selected] int tensor on GPU
-        all_confidences : [M, N_selected] float tensor on GPU
-        non_clean_indices : 1-D index tensor into the global tile grid
+        Performs majority vote across the model dimension, optionally enforces a
+        clean-class override in strict mode, and computes per-tile confidence as
+        the mean confidence of models agreeing with the winner. Scatters results
+        into full-grid output tensors at non-clean tile positions.
         """
         dev = all_predictions.device
 
@@ -416,11 +431,16 @@ class EnsembleClassifierPnm:
     @torch.no_grad()
     def forward(self, image, majorityVote=False, legend=True, strict=True, parallel=False, multimodel=True , debugExecuteSecondStage=False, log=True):
         """
-        Step 1: Run initial classifier
-        Step 2: Identify non-clean tiles
-        Step 3: Run ensemble classifiers on those tiles
-        Step 4: Vote on non-clean predictions
-        Step 5: Produce final heatmap
+        Two-stage ensemble inference: prefilter (binary clean/non-clean) then ensemble voting.
+
+        Pipeline:
+          1. Run the first binary classifier on the full image to identify non-clean tiles.
+          2. If all tiles are clean, skip ensemble voting and return the prefilter result.
+          3. Otherwise, run all ensemble classifiers on only the non-clean tile subset.
+             Supports three execution modes: async CUDA streams (multimodel=True, default),
+             CPU thread pool (parallel=True), or serial (multimodel=False, parallel=False).
+          4. Majority-vote across ensemble predictions and scatter into full-grid output.
+          5. Optionally apply spatial majority-vote smoothing and generate a heatmap.
         """
         start = time.time()
 
@@ -430,8 +450,9 @@ class EnsembleClassifierPnm:
         # --- Prepare image tensor (upload uint8, normalize on GPU) ---
         rgba_image = readPolarPNMToRGBALive(image)
         rgba_image = cv2.cvtColor(rgba_image, cv2.COLOR_RGBA2BGRA)
+        # Keep as uint8 tensor — tile_and_cast_data_torch and classify_tiles pass
+        # it through unchanged; normalisation (/255) happens inside the model on GPU.
         rgba_image = torch.as_tensor(rgba_image, device=self.device, dtype=torch.uint8)
-        rgba_image = rgba_image.to(dtype=torch.float32) / 255.0
 
         # --- Step 2: Get predictions from first binary (clean/non-clean) model ---
         # return_torch=True  → stays on GPU, no PCIe round-trip
@@ -590,7 +611,7 @@ class EnsembleClassifierPnm:
                                                          self.classes,
                                                          self.class_id_to_color,
                                                          self.cleanClassID,
-                                                         rgba_image * 255.0,
+                                                         rgba_image,  # uint8, no scaling needed
                                                          tile_size=self.tile_size,
                                                          step=self.step,
                                                         )
