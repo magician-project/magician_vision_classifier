@@ -128,6 +128,40 @@ def _png_to_b64(path: str) -> str:
         return base64.b64encode(f.read()).decode()
 
 
+def _save_benchmark_step_plot(bench_results: list[dict], model_name: str, out_path: str):
+    """
+    Render a 2-D step-size → FPS plot for raw-dataset evaluation results.
+    A second y-axis shows balanced accuracy per step.
+    """
+    if not bench_results:
+        return
+
+    steps   = [r["step_size"]          for r in bench_results]
+    fps     = [r["effective_fps"]      for r in bench_results]
+    bal_acc = [r["balanced_accuracy"]  for r in bench_results]
+
+    fig, ax1 = plt.subplots(figsize=(7, 4))
+    color_fps = "steelblue"
+    color_acc = "darkorange"
+
+    ax1.plot(steps, fps, "o-", color=color_fps, linewidth=2, markersize=6, label="Effective FPS")
+    ax1.set_xlabel("Step size")
+    ax1.set_ylabel("Effective FPS", color=color_fps)
+    ax1.tick_params(axis="y", labelcolor=color_fps)
+    ax1.set_xticks(steps)
+
+    ax2 = ax1.twinx()
+    ax2.plot(steps, bal_acc, "s--", color=color_acc, linewidth=1.5, markersize=5, label="BalAcc")
+    ax2.set_ylabel("Balanced Accuracy", color=color_acc)
+    ax2.tick_params(axis="y", labelcolor=color_acc)
+    ax2.set_ylim(0, 1.05)
+
+    ax1.set_title(f"{model_name}\nStep-size throughput sweep", fontsize=10, fontweight="bold")
+    fig.tight_layout()
+    plt.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close()
+
+
 def _save_benchmark_3d_plot(bench_results: list[dict], model_name: str, out_path: str):
     """
     Render a 3-D scatter of throughput benchmark results (batch × step → FPS).
@@ -859,8 +893,12 @@ def run_report(cfg: ReportConfig):
         bench_data = meta.get("benchmark", [])
         bench_b64  = ""
         if bench_data:
+            is_raw = "batch_size" not in bench_data[0]
             bench_path = out_dir / f"{model_name}_benchmark_3d.png"
-            _save_benchmark_3d_plot(bench_data, model_name, str(bench_path))
+            if is_raw:
+                _save_benchmark_step_plot(bench_data, model_name, str(bench_path))
+            else:
+                _save_benchmark_3d_plot(bench_data, model_name, str(bench_path))
             bench_b64 = _png_to_b64(str(bench_path))
 
         ms = meta["ms_per_sample"]

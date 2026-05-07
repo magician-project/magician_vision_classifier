@@ -45,7 +45,7 @@ from magician_vision_classifier.srv import SetInt64
 from magician_vision_classifier.srv import SetFloat64
 
 
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Header
 from geometry_msgs.msg import Pose
 
 from magician_vision_classifier.msg import Detection      # Custom ROS message
@@ -612,10 +612,12 @@ class DefectPublisher(Node):
         #     print("[Markers] No chessboard found.")
         self.get_logger().info("Marker scan complete.")
 
-    def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z=0.0):
+    def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z=0.0, ts=0):
         """Publish a Detection message with 2D bounding box, type, class, and optional depth."""
         try:
             msg = Detection()
+            msg.header.stamp    = ts #self.get_clock().now().to_msg()
+            msg.header.frame_id = "camera"
             msg.x           = int(x)
             msg.y           = int(y)
             msg.w           = int(w)
@@ -628,12 +630,14 @@ class DefectPublisher(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to publish detection: {e}")
 
-    def publish_detection_m(self, cx, cy, severity, depth_z):
+    def publish_detection_m(self, cx, cy, severity, depth_z, ts):
         """Publish a DetectionM message with severity, pixel position, and interpolated depth."""
         if (not USE_LASERS) or (self.publisher_m is None):
             return
         try:
             msg = DetectionM()
+            msg.header.stamp    = ts #self.get_clock().now().to_msg()
+            msg.header.frame_id = "camera"
             msg.severity = int(severity)
 
             pose = Pose()
@@ -709,6 +713,7 @@ def main():
             loop_start = time.perf_counter()
 
             frame = smm.read_from_shared_memory()
+            frameTimestamp = smm.unix_timestamp
 
             # Get image to work on
             if frame is None or smm.frame_size == 0:
@@ -774,7 +779,7 @@ def main():
                         z = float("nan")
 
                     severity = class_to_severity(det_class)
-                    ros_node.publish_detection_m(cx, cy, severity, z)
+                    ros_node.publish_detection_m(cx, cy, severity, z, ts)
 
 
                 # Existing 2D detection
@@ -786,7 +791,8 @@ def main():
                     det_type=det_type,
                     det_class=det_class,
                     probability=confidence,
-                    depth_z = z
+                    depth_z = z,
+                    ts = frameTimestamp
                 )
 
             # Visualization
