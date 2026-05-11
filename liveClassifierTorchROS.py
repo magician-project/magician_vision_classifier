@@ -48,9 +48,10 @@ from magician_vision_classifier.srv import SetFloat64
 from std_msgs.msg import Float32, Header
 from geometry_msgs.msg import Pose
 
-from magician_vision_classifier.msg import Detection      # Custom ROS message
-from magician_vision_classifier.msg import DetectionM     # Custom ROS message (uint8 severity, geometry_msgs/Pose location)
-from magician_vision_classifier.msg import Marker         # Custom ROS message (string id, geometry_msgs/Pose pose)
+from magician_vision_classifier.msg import BackgroundActivations # Custom ROS message
+from magician_vision_classifier.msg import Detection             # Custom ROS message
+from magician_vision_classifier.msg import DetectionM            # Custom ROS message (uint8 severity, geometry_msgs/Pose location)
+from magician_vision_classifier.msg import Marker                # Custom ROS message (string id, geometry_msgs/Pose pose)
 
 # ========================================================
 # Laser fusion globals (project-specific / fixed hardware)
@@ -268,6 +269,7 @@ class DefectPublisher(Node):
             self.publisher_m = self.create_publisher(DetectionM, "detections_m", 10)
 
         self.publisher_markers = self.create_publisher(Marker, "markers", 10)
+        self.publisher_bg = self.create_publisher(BackgroundActivations, "background_activations", 10)
 
 
         # Last received frame (for saving)
@@ -654,6 +656,17 @@ class DefectPublisher(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to publish detection_m: {e}")
 
+    def publish_background_activations(self, avg_prob, ts):
+        """Publish average softmax probability of clean (non-activated) tiles."""
+        try:
+            msg = BackgroundActivations()
+            msg.header.stamp    = ts
+            msg.header.frame_id = "camera"
+            msg.background_probability = float(avg_prob)
+            self.publisher_bg.publish(msg)
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish background_activations: {e}")
+
 
 # ========================================================
 # Main
@@ -794,6 +807,12 @@ def main():
                     depth_z = z,
                     ts = frameTimestamp
                 )
+
+            # Publish average background (clean-tile) softmax probability
+            ros_node.publish_background_activations(
+                responses.get("background_avg_prob", 0.0),
+                frameTimestamp,
+            )
 
             # Visualization
             if ros_node.visualization_enabled():

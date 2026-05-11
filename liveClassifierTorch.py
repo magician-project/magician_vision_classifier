@@ -577,6 +577,9 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
     num_preds = len(predicted_classes)
     half_tile_size = tile_size // 2
 
+    bg_prob_sum = 0.0
+    bg_count    = 0
+
     for vTile, y in enumerate(y_indices):
         for hTile, x in enumerate(x_indices):
             if idx >= num_preds:
@@ -613,12 +616,16 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
                   occupancy[vTile, hTile] = 0
                 except Exception as e:
                   print("Failed setting occupancy:", repr(e))
-            
+            else:
+                bg_prob_sum += float(confidences[idx])
+                bg_count    += 1
 
             idx += 1
 
         if idx >= num_preds:
             break
+
+    responses["background_avg_prob"] = bg_prob_sum / bg_count if bg_count > 0 else 0.0
 
     print(f"{totalActivations}/{num_preds} activations")
     print("Per-class activations:", activations.tolist())
@@ -719,6 +726,15 @@ def process_predictions_erode(predictions, confidences, class_id_to_name, cleanC
         filtered_responses["confidences"].append(confidence)
         filtered_activations[predicted_class] += 1
 
+    predicted_classes_flat = torch.as_tensor(predictions, dtype=torch.int32)
+    bg_mask = (predicted_classes_flat == cleanClassID)
+    bg_count = int(bg_mask.sum().item())
+    if bg_count > 0:
+        bg_prob_sum = float(torch.as_tensor(confidences, dtype=torch.float32)[bg_mask].sum().item())
+        filtered_responses["background_avg_prob"] = bg_prob_sum / bg_count
+    else:
+        filtered_responses["background_avg_prob"] = 0.0
+
     print(f"{filtered_activations.sum().item()}/{num_preds} activations (after erosion)")
     print("Per-class activations:", filtered_activations.tolist())
 
@@ -756,6 +772,9 @@ def process_predictions(predictions, confidences, class_id_to_name, cleanClassID
     num_preds = len(predicted_classes)
     half_tile_size = tile_size // 2
 
+    bg_prob_sum = 0.0
+    bg_count    = 0
+
     for vTile, y in enumerate(y_indices):
         for hTile, x in enumerate(x_indices):
             if idx >= num_preds:
@@ -769,7 +788,7 @@ def process_predictions(predictions, confidences, class_id_to_name, cleanClassID
                 continue
 
             if predicted_class != cleanClassID:
-                totalActivations += 1 
+                totalActivations += 1
                 activationCoordinateX = int(x + half_tile_size)
                 activationCoordinateY = int(y + half_tile_size)
                 activations[predicted_class] += 1
@@ -781,11 +800,16 @@ def process_predictions(predictions, confidences, class_id_to_name, cleanClassID
                 responses["confidences"].append(confidence)
 
                 occupancy[vTile, hTile] = 0
+            else:
+                bg_prob_sum += float(confidences[idx])
+                bg_count    += 1
 
             idx += 1
 
         if idx >= num_preds:
             break
+
+    responses["background_avg_prob"] = bg_prob_sum / bg_count if bg_count > 0 else 0.0
 
     print(f"{totalActivations}/{num_preds} activations")
     print("Per-class activations:", activations.tolist())
