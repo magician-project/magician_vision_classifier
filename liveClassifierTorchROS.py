@@ -666,11 +666,32 @@ class DefectPublisher(Node):
 
     def publish_background_activations(self, avg_prob, ts):
         """Publish average softmax probability of clean (non-activated) tiles."""
+
+        """
+        1. Inference (classify_tiles, line ~872): The model runs a forward pass on all tiles, then softmax is applied over the class dimension:
+          probs = torch.nn.functional.softmax(preds.float(), dim=1)
+          max_probs, predictions = torch.max(probs, dim=1)
+          1. max_probs is the winning class's softmax probability for each tile (range 0–1).
+          2. Filtering to background tiles (line ~619–621 in generate_heatmap):
+          else:  # predicted_class == cleanClassID
+              bg_prob_sum += float(confidences[idx])  # confidences = max_probs
+              bg_count    += 1
+          2. Only tiles predicted as cleanClassID contribute. Their confidence is their max softmax probability (i.e., the probability assigned to the clean/background class by the
+           model).
+          3. Averaging (line 628):
+          responses["background_avg_prob"] = bg_prob_sum / bg_count if bg_count > 0 else 0.0
+
+          So what does 0.98 mean?
+
+          It means the background tiles are classified as "clean" with 98% average confidence. This is completely normal — when most of the scene is background, the model is very
+          sure those tiles are clean, so their softmax scores cluster near 1.0. A lower value (e.g. 0.60–0.75) would indicate the background tiles are ambiguous, which could be a
+          signal of noise or a degraded model.
+        """
         try:
             msg = BackgroundActivations()
             msg.header.stamp    = unix_ns_to_ros_time(ts)
             msg.header.frame_id = "camera"
-            msg.background_probability = float(avg_prob)
+            msg.background_probability = 1.0 - float(avg_prob)
             self.publisher_bg.publish(msg)
         except Exception as e:
             self.get_logger().error(f"Failed to publish background_activations: {e}")
