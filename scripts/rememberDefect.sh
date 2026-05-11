@@ -6,10 +6,8 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$DIR"
 
 #Let's load a sane virtual environment
-source install/setup.bash 
+source install/setup.bash
 
-ros2 service call /magician_vision_classifier/scan_markers std_srvs/srv/Trigger 
+ros2 service call /magician_vision_classifier/remember_defect std_srvs/srv/Trigger
 
 exit 0
-
-
