@@ -719,8 +719,8 @@ def main():
 
     # Initialize Neural Networks (both modes)
     single_classifier = ClassifierPnm(
-        model_path=f"{PATH}/allclass_resnet18.pth",
-        cfg_path=f"{PATH}/allclass_resnet18.json",
+        model_path=f"{PATH}/allclass_convnext_tiny.pth",
+        cfg_path=f"{PATH}/allclass_convnext_tiny.json",
     )
 
     ensemble_classifier = EnsembleClassifierPnm(
@@ -749,6 +749,7 @@ def main():
     )
 
     majority_voting = True
+    autosaveDefectSnapshots = True
 
     try:
         while True:
@@ -836,6 +837,10 @@ def main():
                     depth_z = z,
                     ts = frameTimestamp
                 )
+
+            # Autosave one snapshot per frame whenever a defect is detected
+            if autosaveDefectSnapshots and points:
+                ros_node._save_current_frame("autosaved_defect")
 
             # Publish average background (clean-tile) softmax probability
             ros_node.publish_background_activations(
