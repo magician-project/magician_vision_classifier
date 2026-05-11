@@ -47,11 +47,19 @@ from magician_vision_classifier.srv import SetFloat64
 
 from std_msgs.msg import Float32, Header
 from geometry_msgs.msg import Pose
+from builtin_interfaces.msg import Time as RosTime
 
 from magician_vision_classifier.msg import BackgroundActivations # Custom ROS message
 from magician_vision_classifier.msg import Detection             # Custom ROS message
 from magician_vision_classifier.msg import DetectionM            # Custom ROS message (uint8 severity, geometry_msgs/Pose location)
 from magician_vision_classifier.msg import Marker                # Custom ROS message (string id, geometry_msgs/Pose pose)
+
+def unix_ns_to_ros_time(ns):
+    t = RosTime()
+    t.sec = int(ns // 1_000_000_000)
+    t.nanosec = int(ns % 1_000_000_000)
+    return t
+
 
 # ========================================================
 # Laser fusion globals (project-specific / fixed hardware)
@@ -618,7 +626,7 @@ class DefectPublisher(Node):
         """Publish a Detection message with 2D bounding box, type, class, and optional depth."""
         try:
             msg = Detection()
-            msg.header.stamp    = ts #self.get_clock().now().to_msg()
+            msg.header.stamp    = unix_ns_to_ros_time(ts)
             msg.header.frame_id = "camera"
             msg.x           = int(x)
             msg.y           = int(y)
@@ -638,7 +646,7 @@ class DefectPublisher(Node):
             return
         try:
             msg = DetectionM()
-            msg.header.stamp    = ts #self.get_clock().now().to_msg()
+            msg.header.stamp    = unix_ns_to_ros_time(ts)
             msg.header.frame_id = "camera"
             msg.severity = int(severity)
 
@@ -660,7 +668,7 @@ class DefectPublisher(Node):
         """Publish average softmax probability of clean (non-activated) tiles."""
         try:
             msg = BackgroundActivations()
-            msg.header.stamp    = ts
+            msg.header.stamp    = unix_ns_to_ros_time(ts)
             msg.header.frame_id = "camera"
             msg.background_probability = float(avg_prob)
             self.publisher_bg.publish(msg)
@@ -792,7 +800,7 @@ def main():
                         z = float("nan")
 
                     severity = class_to_severity(det_class)
-                    ros_node.publish_detection_m(cx, cy, severity, z, ts)
+                    ros_node.publish_detection_m(cx, cy, severity, z, frameTimestamp)
 
 
                 # Existing 2D detection
