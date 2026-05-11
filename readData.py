@@ -256,6 +256,12 @@ def debayerPolarImage(image):
     Returns:
         (polarization_0_deg, polarization_45_deg, polarization_90_deg, polarization_135_deg)
     """
+    polarization_90_deg  = image[0::2, 0::2]
+    polarization_45_deg  = image[0::2, 1::2]
+    polarization_135_deg = image[1::2, 0::2]
+    polarization_0_deg   = image[1::2, 1::2]
+    return polarization_0_deg, polarization_45_deg, polarization_90_deg, polarization_135_deg
+
 
 def readPolarPNMToRGBALive(image):
     """
@@ -264,10 +270,13 @@ def readPolarPNMToRGBALive(image):
     De-bayers the input (expects 2D array), then assembles the 4 polarization
     channels (0°, 45°, 90°, 135°) into an (H/2, W/2, 4) uint8 array.
     """
-    # Load the image
     image = np.squeeze(image)
-  
-    #This expects a 1 channel (bayered) image 
+
+    # If already 4-channel (pre-debayered), return as-is
+    if image.ndim == 3 and image.shape[2] == 4:
+        return image
+
+    #This expects a 1 channel (bayered) image
     height, width = image.shape
 
     # Split into polarization images
