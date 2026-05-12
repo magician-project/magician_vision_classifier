@@ -286,11 +286,14 @@ class DefectPublisher(Node):
         # Where to store images
         self._output_path = "./data"
         os.makedirs(self._output_path, exist_ok=True)
+        self._snapshot_path = "./snapshots"
+        os.makedirs(self._snapshot_path, exist_ok=True)
 
         # Internal execution state
         self._visualization_enabled = False
         self._inference_paused = False
         self._two_stage_enabled = False
+        self._autosave_defect_snapshots = False
 
         # Runtime tunables (dynamic via services)
         self._target_fps = 23.0
@@ -332,6 +335,8 @@ class DefectPublisher(Node):
         self.create_service(Trigger,    "magician_vision_classifier/remember_defect", self._remember_defect_cb)
         self.create_service(Trigger,    "magician_vision_classifier/remember_clean", self._remember_clean_cb)
         self.create_service(Trigger,    "magician_vision_classifier/scan_markers", self._scan_markers_cb)
+        self.create_service(SetBool,    "magician_vision_classifier/set_autosave_defect_snapshots", self._set_autosave_defect_snapshots_cb)
+        self.create_service(Trigger,    "magician_vision_classifier/snapshot", self._snapshot_cb)
 
         # ------------------------------------------------
         # Services (NEW): runtime tuning
@@ -345,6 +350,8 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/set_threshold (SetFloat64)")
         self.get_logger().info("  magician_vision_classifier/remember_defect (Trigger)")
         self.get_logger().info("  magician_vision_classifier/remember_clean (Trigger)")
+        self.get_logger().info("  magician_vision_classifier/set_autosave_defect_snapshots (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/snapshot (Trigger)")
 
 
         if USE_LASERS and self.publisher_m is not None:
@@ -482,6 +489,44 @@ class DefectPublisher(Node):
         self.get_logger().info(msg)
         return response
 
+    def _set_autosave_defect_snapshots_cb(self, request, response):
+        """Service callback to enable/disable automatic saving of frames when a defect is detected."""
+        with self._lock:
+            self._autosave_defect_snapshots = bool(request.data)
+        response.success = True
+        response.message = ("Autosave defect snapshots ENABLED" if request.data else "Autosave defect snapshots DISABLED")
+        self.get_logger().info(response.message)
+        return response
+
+    def _snapshot_cb(self, request, response):
+        """Service callback to save the current frame on demand to the snapshots directory."""
+        with self._lock:
+            frame = self._last_frame
+
+        if frame is None:
+            response.success = False
+            response.message = "No frame available to save."
+            self.get_logger().warning(response.message)
+            return response
+
+        now = datetime.now()
+        filename = (
+            f"snapshot_"
+            f"{now.year:04d}_{now.month:02d}_{now.day:02d}_"
+            f"{now.hour:02d}_{now.minute:02d}_{now.second:02d}_"
+            f"{int(now.microsecond / 1000):03d}.png"
+        )
+        full_path = os.path.join(self._snapshot_path, filename)
+        try:
+            cv2.imwrite(full_path, frame)
+            response.success = True
+            response.message = f"Saved: {full_path}"
+        except Exception as e:
+            response.success = False
+            response.message = str(e)
+        self.get_logger().info(response.message)
+        return response
+
     # -------------------------
     # Thread-safe getters
     # -------------------------
@@ -514,6 +559,11 @@ class DefectPublisher(Node):
         """Thread-safe getter for the two-stage ensemble mode."""
         with self._lock:
             return self._two_stage_enabled
+
+    def autosave_defect_snapshots_enabled(self):
+        """Thread-safe getter for the autosave defect snapshots toggle."""
+        with self._lock:
+            return self._autosave_defect_snapshots
 
     def get_laser_depths(self):
         """Thread-safe getter for the latest laser depth readings."""
@@ -749,13 +799,12 @@ def main():
     )
 
     majority_voting = True
-    autosaveDefectSnapshots = True
 
     try:
         while True:
             loop_start = time.perf_counter()
 
-            frame = smm.read_from_shared_memory()
+            frame          = smm.read_from_shared_memory()
             frameTimestamp = smm.unix_timestamp
 
             # Get image to work on
@@ -839,7 +888,7 @@ def main():
                 )
 
             # Autosave one snapshot per frame whenever a defect is detected
-            if autosaveDefectSnapshots and points:
+            if ros_node.autosave_defect_snapshots_enabled() and points:
                 ros_node._save_current_frame("autosaved_defect")
 
             # Publish average background (clean-tile) softmax probability
