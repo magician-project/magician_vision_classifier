@@ -294,6 +294,7 @@ class DefectPublisher(Node):
         self._inference_paused = False
         self._two_stage_enabled = False
         self._autosave_defect_snapshots = False
+        self._frame_limiter = True
 
         # Runtime tunables (dynamic via services)
         self._target_fps = 23.0
@@ -337,6 +338,7 @@ class DefectPublisher(Node):
         self.create_service(Trigger,    "magician_vision_classifier/scan_markers", self._scan_markers_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_autosave_defect_snapshots", self._set_autosave_defect_snapshots_cb)
         self.create_service(Trigger,    "magician_vision_classifier/snapshot", self._snapshot_cb)
+        self.create_service(SetBool,    "magician_vision_classifier/set_frame_limiter", self._set_frame_limiter_cb)
 
         # ------------------------------------------------
         # Services (NEW): runtime tuning
@@ -352,6 +354,7 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/remember_clean (Trigger)")
         self.get_logger().info("  magician_vision_classifier/set_autosave_defect_snapshots (SetBool)")
         self.get_logger().info("  magician_vision_classifier/snapshot (Trigger)")
+        self.get_logger().info("  magician_vision_classifier/set_frame_limiter (SetBool)")
 
 
         if USE_LASERS and self.publisher_m is not None:
@@ -498,6 +501,15 @@ class DefectPublisher(Node):
         self.get_logger().info(response.message)
         return response
 
+    def _set_frame_limiter_cb(self, request, response):
+        """Service callback to enable/disable the duplicate-frame limiter (False = unlimited framerate)."""
+        with self._lock:
+            self._frame_limiter = bool(request.data)
+        response.success = True
+        response.message = ("Frame limiter ENABLED" if request.data else "Frame limiter DISABLED (unlimited framerate)")
+        self.get_logger().info(response.message)
+        return response
+
     def _snapshot_cb(self, request, response):
         """Service callback to save the current frame on demand to the snapshots directory."""
         with self._lock:
@@ -564,6 +576,11 @@ class DefectPublisher(Node):
         """Thread-safe getter for the autosave defect snapshots toggle."""
         with self._lock:
             return self._autosave_defect_snapshots
+
+    def frame_limiter_enabled(self):
+        """Thread-safe getter for the frame limiter toggle."""
+        with self._lock:
+            return self._frame_limiter
 
     def get_laser_depths(self):
         """Thread-safe getter for the latest laser depth readings."""
@@ -799,6 +816,7 @@ def main():
     )
 
     majority_voting = True
+    last_processed_timestamp = None
 
     try:
         while True:
@@ -812,6 +830,11 @@ def main():
                 ros_node.get_logger().warning("Couldn't read frame from Shared Memory")
                 time.sleep(0.1)
                 continue
+
+            if ros_node.frame_limiter_enabled() and frameTimestamp == last_processed_timestamp:
+                time.sleep(0.001)
+                continue
+            last_processed_timestamp = frameTimestamp
 
             ros_node._last_frame = frame.copy()
 
