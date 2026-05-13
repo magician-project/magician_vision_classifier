@@ -301,6 +301,7 @@ class DefectPublisher(Node):
         self._target_fps = 23.0
         self._step_size = 18
         self._threshold = 0.6  # min softmax confidence for a tile prediction to be kept; tiles below this are reassigned to the low-confidence class
+        self._majority_voting = True
 
         self._lock = threading.Lock()
 
@@ -351,6 +352,7 @@ class DefectPublisher(Node):
         self.create_service(Trigger,    "magician_vision_classifier/snapshot", self._snapshot_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_frame_limiter", self._set_frame_limiter_cb)
         self.create_service(SetString,  "magician_vision_classifier/set_model", self._set_model_cb)
+        self.create_service(SetBool,    "magician_vision_classifier/set_majority_voting", self._set_majority_voting_cb)
 
         # ------------------------------------------------
         # Services (NEW): runtime tuning
@@ -368,6 +370,7 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/snapshot (Trigger)")
         self.get_logger().info("  magician_vision_classifier/set_frame_limiter (SetBool)")
         self.get_logger().info("  magician_vision_classifier/set_model (SetString)")
+        self.get_logger().info("  magician_vision_classifier/set_majority_voting (SetBool)")
 
 
         if USE_LASERS and self.publisher_m is not None:
@@ -442,13 +445,24 @@ class DefectPublisher(Node):
 
     def _set_threshold_cb(self, request, response):
         """Set the min softmax confidence threshold; tiles whose max-class probability falls below this are reassigned to the low-confidence class instead of keeping the model's prediction."""
-        thr = float(request.data)
+        thr = max(0.0, min(1.0, float(request.data)))
         with self._lock:
             self._threshold = thr
         response.success = True
         response.message = f"Max probability threshold set to {self._threshold}"
         self.get_logger().info(response.message)
         return response
+
+    @staticmethod
+    def _make_timestamped_basename(prefix: str) -> str:
+        """Return a filename stem like '<prefix>_YYYY_MM_DD_HH_MM_SS_mmm' using the current wall time."""
+        now = datetime.now()
+        return (
+            f"{prefix}_"
+            f"{now.year:04d}_{now.month:02d}_{now.day:02d}_"
+            f"{now.hour:02d}_{now.minute:02d}_{now.second:02d}_"
+            f"{int(now.microsecond / 1000):03d}"
+        )
 
     def _save_current_frame(self, prefix: str):
         """
@@ -472,13 +486,7 @@ class DefectPublisher(Node):
         if frame is None:
             return False, "No frame available to save."
 
-        now = datetime.now()
-        basename = (
-            f"{prefix}_"
-            f"{now.year:04d}_{now.month:02d}_{now.day:02d}_"
-            f"{now.hour:02d}_{now.minute:02d}_{now.second:02d}_"
-            f"{int(now.microsecond / 1000):03d}"
-        )
+        basename  = self._make_timestamped_basename(prefix)
         png_path  = os.path.join(self._output_path, f"{basename}.png")
         json_path = os.path.join(self._output_path, f"{basename}.json")
 
@@ -562,6 +570,15 @@ class DefectPublisher(Node):
         self.get_logger().info(response.message)
         return response
 
+    def _set_majority_voting_cb(self, request, response):
+        """Service callback to enable/disable majority voting across inference tiles."""
+        with self._lock:
+            self._majority_voting = bool(request.data)
+        response.success = True
+        response.message = ("Majority voting ENABLED" if request.data else "Majority voting DISABLED")
+        self.get_logger().info(response.message)
+        return response
+
     def _set_model_cb(self, request, response):
         """Service callback to hot-swap the single classifier model at runtime."""
         name = request.data.strip()
@@ -599,6 +616,10 @@ class DefectPublisher(Node):
         with self._model_lock:
             ok = self._single_classifier.reload_model(directory, stem)
 
+        if ok:
+            with self._lock:
+                self._model_dir = directory
+
         response.success = ok
         response.message = (f"Model reloaded: {stem}" if ok
                             else f"Failed to reload model: {stem}")
@@ -616,14 +637,10 @@ class DefectPublisher(Node):
             self.get_logger().warning(response.message)
             return response
 
-        now = datetime.now()
-        filename = (
-            f"snapshot_"
-            f"{now.year:04d}_{now.month:02d}_{now.day:02d}_"
-            f"{now.hour:02d}_{now.minute:02d}_{now.second:02d}_"
-            f"{int(now.microsecond / 1000):03d}.png"
+        full_path = os.path.join(
+            self._snapshot_path,
+            self._make_timestamped_basename("snapshot") + ".png",
         )
-        full_path = os.path.join(self._snapshot_path, filename)
         try:
             cv2.imwrite(full_path, frame)
             response.success = True
@@ -676,6 +693,11 @@ class DefectPublisher(Node):
         """Thread-safe getter for the frame limiter toggle."""
         with self._lock:
             return self._frame_limiter
+
+    def majority_voting_enabled(self):
+        """Thread-safe getter for the majority voting toggle."""
+        with self._lock:
+            return self._majority_voting
 
     def get_laser_depths(self):
         """Thread-safe getter for the latest laser depth readings."""
@@ -731,7 +753,7 @@ class DefectPublisher(Node):
         Uses the cached camera matrix for pose estimation. Chessboard detection
         is present but disabled (too slow for real-time).
         """
-        self.get_logger().info("Scanning frame for markers...")
+        self.get_logger().debug("Scanning frame for markers...")
 
         if len(frame.shape) == 2 or frame.shape[2] == 1:
             gray = frame if len(frame.shape) == 2 else frame[:, :, 0]
@@ -782,7 +804,7 @@ class DefectPublisher(Node):
         #         print("[Markers] PnP solve failed for chessboard.")
         # else:
         #     print("[Markers] No chessboard found.")
-        self.get_logger().info("Marker scan complete.")
+        self.get_logger().debug("Marker scan complete.")
 
     def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z=0.0, ts=0):
         """Publish a Detection message with 2D bounding box, type, class, and optional depth."""
@@ -828,27 +850,6 @@ class DefectPublisher(Node):
 
     def publish_background_activations(self, avg_prob, ts):
         """Publish average softmax probability of clean (non-activated) tiles."""
-
-        """
-        1. Inference (classify_tiles, line ~872): The model runs a forward pass on all tiles, then softmax is applied over the class dimension:
-          probs = torch.nn.functional.softmax(preds.float(), dim=1)
-          max_probs, predictions = torch.max(probs, dim=1)
-          1. max_probs is the winning class's softmax probability for each tile (range 0–1).
-          2. Filtering to background tiles (line ~619–621 in generate_heatmap):
-          else:  # predicted_class == cleanClassID
-              bg_prob_sum += float(confidences[idx])  # confidences = max_probs
-              bg_count    += 1
-          2. Only tiles predicted as cleanClassID contribute. Their confidence is their max softmax probability (i.e., the probability assigned to the clean/background class by the
-           model).
-          3. Averaging (line 628):
-          responses["background_avg_prob"] = bg_prob_sum / bg_count if bg_count > 0 else 0.0
-
-          So what does 0.98 mean?
-
-          It means the background tiles are classified as "clean" with 98% average confidence. This is completely normal — when most of the scene is background, the model is very
-          sure those tiles are clean, so their softmax scores cluster near 1.0. A lower value (e.g. 0.60–0.75) would indicate the background tiles are ambiguous, which could be a
-          signal of noise or a degraded model.
-        """
         try:
             msg = BackgroundActivations()
             msg.header.stamp    = unix_ns_to_ros_time(ts)
@@ -914,7 +915,6 @@ def main():
         connect=True,
     )
 
-    majority_voting = True
     last_processed_timestamp = None
 
     try:
@@ -948,18 +948,20 @@ def main():
                 continue
 
             # Run the neural network
+            majority_voting = ros_node.majority_voting_enabled()
             with torch.inference_mode():
                 if ros_node.two_stage_enabled():
-                    ensemble_classifier.step = ros_node.get_step_size()
-                    ensemble_classifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
-                    tile_size = ensemble_classifier.tile_size
+                    with ros_node._model_lock:
+                        ensemble_classifier.step = ros_node.get_step_size()
+                        ensemble_classifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
+                        tile_size = ensemble_classifier.tile_size
 
-                    heatmap, occupancy, responses = ensemble_classifier.forward(
-                        frame,
-                        majorityVote=majority_voting,
-                        parallel=True,
-                        multimodel=True,
-                    )
+                        heatmap, occupancy, responses = ensemble_classifier.forward(
+                            frame,
+                            majorityVote=majority_voting,
+                            parallel=True,
+                            multimodel=True,
+                        )
                 else:
                     with ros_node._model_lock:
                         single_classifier.step = ros_node.get_step_size()
