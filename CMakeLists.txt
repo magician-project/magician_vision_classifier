@@ -15,6 +15,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Marker.msg"
   "srv/SetInt64.srv"
   "srv/SetFloat64.srv"
+  "srv/SetString.srv"
   DEPENDENCIES std_msgs geometry_msgs #service_msgs
 )
 

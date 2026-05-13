@@ -43,6 +43,7 @@ from datetime import datetime
 #from example_interfaces.srv import SetFloat64
 from magician_vision_classifier.srv import SetInt64
 from magician_vision_classifier.srv import SetFloat64
+from magician_vision_classifier.srv import SetString
 
 
 from std_msgs.msg import Float32, Header
@@ -303,6 +304,11 @@ class DefectPublisher(Node):
 
         self._lock = threading.Lock()
 
+        # Model hot-swap state
+        self._single_classifier = None
+        self._model_dir = "."
+        self._model_lock = threading.Lock()
+
         # Marker scanning state
         self._marker_scan_until = 0.0   # monotonic time until which scanning is active
         _aruco_dict = cv2.aruco.getPredefinedDictionary(
@@ -339,6 +345,7 @@ class DefectPublisher(Node):
         self.create_service(SetBool,    "magician_vision_classifier/set_autosave_defect_snapshots", self._set_autosave_defect_snapshots_cb)
         self.create_service(Trigger,    "magician_vision_classifier/snapshot", self._snapshot_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_frame_limiter", self._set_frame_limiter_cb)
+        self.create_service(SetString,  "magician_vision_classifier/set_model", self._set_model_cb)
 
         # ------------------------------------------------
         # Services (NEW): runtime tuning
@@ -355,6 +362,7 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/set_autosave_defect_snapshots (SetBool)")
         self.get_logger().info("  magician_vision_classifier/snapshot (Trigger)")
         self.get_logger().info("  magician_vision_classifier/set_frame_limiter (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/set_model (SetString)")
 
 
         if USE_LASERS and self.publisher_m is not None:
@@ -507,6 +515,49 @@ class DefectPublisher(Node):
             self._frame_limiter = bool(request.data)
         response.success = True
         response.message = ("Frame limiter ENABLED" if request.data else "Frame limiter DISABLED (unlimited framerate)")
+        self.get_logger().info(response.message)
+        return response
+
+    def _set_model_cb(self, request, response):
+        """Service callback to hot-swap the single classifier model at runtime."""
+        name = request.data.strip()
+
+        # Support both a bare stem ("allclass_resnet18") and an absolute path stem
+        if os.sep in name or "/" in name:
+            directory = os.path.dirname(os.path.abspath(name))
+            stem = os.path.basename(name)
+        else:
+            directory = os.path.abspath(self._model_dir)
+            stem = name
+
+        model_path = os.path.join(directory, f"{stem}.pth")
+        cfg_path   = os.path.join(directory, f"{stem}.json")
+
+        if not os.path.isfile(model_path):
+            response.success = False
+            response.message = f"Model file not found: {model_path}"
+            self.get_logger().error(response.message)
+            return response
+
+        if not os.path.isfile(cfg_path):
+            response.success = False
+            response.message = f"Config file not found: {cfg_path}"
+            self.get_logger().error(response.message)
+            return response
+
+        if self._single_classifier is None:
+            response.success = False
+            response.message = "Single classifier not yet initialized"
+            self.get_logger().error(response.message)
+            return response
+
+        self.get_logger().info(f"Hot-swapping model to '{stem}' from {directory} ...")
+        with self._model_lock:
+            ok = self._single_classifier.reload_model(directory, stem)
+
+        response.success = ok
+        response.message = (f"Model reloaded: {stem}" if ok
+                            else f"Failed to reload model: {stem}")
         self.get_logger().info(response.message)
         return response
 
@@ -790,6 +841,10 @@ def main():
         cfg_path=f"{PATH}/allclass_convnext_tiny.json",
     )
 
+    # Expose classifier to the ROS node for hot-swap via service
+    ros_node._model_dir = PATH
+    ros_node._single_classifier = single_classifier
+
     ensemble_classifier = EnsembleClassifierPnm(
         initial_model_cfg=(
             f"{PATH}/binary_small_cnn.pth",
@@ -861,16 +916,17 @@ def main():
                         multimodel=True,
                     )
                 else:
-                    single_classifier.step = ros_node.get_step_size()
-                    single_classifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
-                    tile_size = single_classifier.tile_size
+                    with ros_node._model_lock:
+                        single_classifier.step = ros_node.get_step_size()
+                        single_classifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
+                        tile_size = single_classifier.tile_size
 
-                    heatmap, occupancy, responses = single_classifier.forward(
-                        frame,
-                        majorityVote=majority_voting,
-                        erosion_kernel=0,
-                        erosion_threshold=0,
-                    )
+                        heatmap, occupancy, responses = single_classifier.forward(
+                            frame,
+                            majorityVote=majority_voting,
+                            erosion_kernel=0,
+                            erosion_threshold=0,
+                        )
 
             # Publish detections
             points      = responses.get("points",      [])
