@@ -309,6 +309,11 @@ class DefectPublisher(Node):
         self._model_dir = "."
         self._model_lock = threading.Lock()
 
+        # Last inference results (for saving alongside frames)
+        self._last_responses = None
+        self._last_tile_size = 0
+        self._last_frame_timestamp = 0
+
         # Marker scanning state
         self._marker_scan_until = 0.0   # monotonic time until which scanning is active
         _aruco_dict = cv2.aruco.getPredefinedDictionary(
@@ -447,33 +452,72 @@ class DefectPublisher(Node):
 
     def _save_current_frame(self, prefix: str):
         """
-        Save the last received frame as a PNG with a timestamped filename.
+        Save the last received frame as a PNG with a timestamped filename, plus a
+        JSON sidecar with the same basename containing the current detections.
 
-        Thread-safe: acquires the lock to read the frame pointer.
+        The JSON structure mirrors what publish_detection emits:
+          { "tile_size": int,
+            "background_avg_prob": float,
+            "detections": [ {"x", "y", "w", "h", "type", "class_name", "probability"}, ... ] }
+
+        Thread-safe: acquires the lock to read shared pointers.
         Returns (success: bool, message: str).
         """
-        # Take a snapshot under the lock so the main thread can't replace the frame
-        # while we are reading it (data race between main loop and ROS spin thread).
         with self._lock:
-            frame = self._last_frame
+            frame           = self._last_frame
+            responses       = self._last_responses
+            tile_size       = self._last_tile_size
+            frame_timestamp = self._last_frame_timestamp
 
         if frame is None:
             return False, "No frame available to save."
 
         now = datetime.now()
-        filename = (
+        basename = (
             f"{prefix}_"
             f"{now.year:04d}_{now.month:02d}_{now.day:02d}_"
             f"{now.hour:02d}_{now.minute:02d}_{now.second:02d}_"
-            f"{int(now.microsecond / 1000):03d}.png"
+            f"{int(now.microsecond / 1000):03d}"
         )
-        full_path = os.path.join(self._output_path, filename)
+        png_path  = os.path.join(self._output_path, f"{basename}.png")
+        json_path = os.path.join(self._output_path, f"{basename}.json")
 
         try:
-            cv2.imwrite(full_path, frame)
-            return True, f"Saved: {full_path}"
+            cv2.imwrite(png_path, frame)
         except Exception as e:
             return False, str(e)
+
+        detections = []
+        if responses is not None:
+            points      = responses.get("points",      [])
+            classes     = responses.get("classes",     [])
+            confidences = responses.get("confidences", [])
+            for (x, y), description, confidence in zip(points, classes, confidences):
+                det_type, det_class = filter_type(description)
+                detections.append({
+                    "x":           int(x),
+                    "y":           int(y),
+                    "w":           int(tile_size),
+                    "h":           int(tile_size),
+                    "type":        det_type,
+                    "class_name":  det_class,
+                    "probability": float(confidence),
+                })
+
+        payload = {
+            "timestamp_ns":         int(frame_timestamp),
+            "tile_size":            int(tile_size),
+            "background_avg_prob":  float(responses.get("background_avg_prob", 0.0)) if responses else 0.0,
+            "detections":           detections,
+        }
+
+        try:
+            with open(json_path, "w") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            return True, f"Saved PNG: {png_path} (JSON failed: {e})"
+
+        return True, f"Saved: {png_path} + {json_path}"
 
     def _scan_markers_cb(self, request, response):
         """Service callback to activate marker scanning for MARKER_SCAN_DURATION_S seconds."""
@@ -892,6 +936,7 @@ def main():
             last_processed_timestamp = frameTimestamp
 
             ros_node._last_frame = frame.copy()
+            ros_node._last_frame_timestamp = frameTimestamp
 
             # Marker scanning (runs regardless of inference pause state)
             if ros_node.is_marker_scanning():
@@ -927,6 +972,10 @@ def main():
                             erosion_kernel=0,
                             erosion_threshold=0,
                         )
+
+            # Snapshot responses for _save_current_frame sidecar JSON
+            ros_node._last_responses = responses
+            ros_node._last_tile_size = tile_size
 
             # Publish detections
             points      = responses.get("points",      [])
