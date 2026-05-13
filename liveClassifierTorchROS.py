@@ -837,8 +837,8 @@ def main():
 
     # Initialize Neural Networks (both modes)
     single_classifier = ClassifierPnm(
-        model_path=f"{PATH}/allclass_convnext_tiny.pth",
-        cfg_path=f"{PATH}/allclass_convnext_tiny.json",
+        model_path=f"{PATH}/allclass_small_cnn.pth",
+        cfg_path=f"{PATH}/allclass_small_cnn.json",
     )
 
     # Expose classifier to the ROS node for hot-swap via service
