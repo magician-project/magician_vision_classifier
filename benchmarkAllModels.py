@@ -346,49 +346,62 @@ def main():
     print(f"Found {len(model_pairs)} models\n")
 
     results = []
+    total_combos = len(model_pairs) * len(step_sizes)
+    pbar = tqdm(total=total_combos, unit="combo", dynamic_ncols=True,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}")
 
     for pth, cfg in model_pairs:
         model_name = os.path.splitext(os.path.basename(pth))[0]
-        print(f"=== {model_name} ===")
+        short_name = model_name.replace("allclass_", "")
+        pbar.set_postfix_str(f"loading {short_name}")
         try:
             clf, tile_size, _ = load_model(pth, cfg, DEVICE)
         except Exception as exc:
-            print(f"  [skip] load failed: {exc}")
+            tqdm.write(f"[skip] {model_name}: load failed: {exc}")
+            for step in step_sizes:
+                results.append({
+                    "model": model_name, "step": step, "tile_size": 0,
+                    "batch_size": 0, "fps": 0.0,
+                    "num_tiles_per_frame": 0, "time_per_frame_ms": 0.0,
+                })
+                pbar.update(1)
             continue
 
         for step in step_sizes:
+            pbar.set_description(f"{short_name} / step={step}")
+            pbar.set_postfix_str("running...")
             try:
                 r = benchmark_model_step(clf, frames_rgba, tile_size, step, DEVICE)
-                print(
-                    f"  step={step:3d}  tiles={r['num_tiles']:5d}  "
-                    f"batch={r['batch_size']:5d}  "
-                    f"fps={r['fps']:7.2f}  "
+                tqdm.write(
+                    f"  {short_name:<30}  step={step:3d}  tiles={r['num_tiles']:5d}  "
+                    f"batch={r['batch_size']:5d}  fps={r['fps']:7.2f}  "
                     f"t/frame={r['time_per_frame_ms']:.1f}ms"
                 )
+                pbar.set_postfix_str(f"fps={r['fps']:.2f}")
                 results.append({
-                    "model":             model_name,
-                    "step":              step,
-                    "tile_size":         tile_size,
-                    "batch_size":        r["batch_size"],
-                    "fps":               round(r["fps"], 4),
+                    "model":               model_name,
+                    "step":                step,
+                    "tile_size":           tile_size,
+                    "batch_size":          r["batch_size"],
+                    "fps":                 round(r["fps"], 4),
                     "num_tiles_per_frame": r["num_tiles"],
-                    "time_per_frame_ms": round(r["time_per_frame_ms"], 2),
+                    "time_per_frame_ms":   round(r["time_per_frame_ms"], 2),
                 })
             except Exception as exc:
-                print(f"  step={step}  [error] {exc}")
+                tqdm.write(f"  {short_name}  step={step}  [error] {exc}")
+                pbar.set_postfix_str("error")
                 results.append({
-                    "model":             model_name,
-                    "step":              step,
-                    "tile_size":         tile_size,
-                    "batch_size":        0,
-                    "fps":               0.0,
-                    "num_tiles_per_frame": 0,
-                    "time_per_frame_ms": 0.0,
+                    "model": model_name, "step": step, "tile_size": tile_size,
+                    "batch_size": 0, "fps": 0.0,
+                    "num_tiles_per_frame": 0, "time_per_frame_ms": 0.0,
                 })
+            pbar.update(1)
 
         del clf
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
+
+    pbar.close()
 
     if not results:
         print("No results collected.")
