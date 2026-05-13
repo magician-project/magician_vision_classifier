@@ -300,7 +300,7 @@ class DefectPublisher(Node):
         # Runtime tunables (dynamic via services)
         self._target_fps = 23.0
         self._step_size = 18
-        self._threshold = 0.6
+        self._threshold = 0.6  # min softmax confidence for a tile prediction to be kept; tiles below this are reassigned to the low-confidence class
 
         self._lock = threading.Lock()
 
@@ -441,7 +441,7 @@ class DefectPublisher(Node):
         return response
 
     def _set_threshold_cb(self, request, response):
-        """Service callback to set the confidence threshold for low-activation tiles."""
+        """Set the min softmax confidence threshold; tiles whose max-class probability falls below this are reassigned to the low-confidence class instead of keeping the model's prediction."""
         thr = float(request.data)
         with self._lock:
             self._threshold = thr
