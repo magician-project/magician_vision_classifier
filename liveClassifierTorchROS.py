@@ -832,7 +832,7 @@ class DefectPublisher(Node):
             msg = DetectionM()
             msg.header.stamp    = unix_ns_to_ros_time(ts)
             msg.header.frame_id = "camera"
-            msg.severity = int(severity)
+            msg.severity = int(severity) #Detection_M accepts 1,2,3 here
 
             pose = Pose()
             pose.position.x    = float(cx)
@@ -1001,6 +1001,7 @@ def main():
                         z = float("nan")
 
                     severity = class_to_severity(det_class)
+                    #Detection_M accepts severities 1,2,3
                     ros_node.publish_detection_m(cx, cy, severity, z, frameTimestamp)
 
 
