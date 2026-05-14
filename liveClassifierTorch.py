@@ -893,12 +893,12 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
     # Spatial smoothing (optional) — must happen before optional CPU conversion
     if majorityVote:
         h, w, _ = rgba_image.shape
-        tilesHorizontally = (w - tile_size) // step
-        tilesVertically   = (h - tile_size) // step
+        tilesHorizontally = (w - tile_size) // step + 1
+        tilesVertically   = (h - tile_size) // step + 1
         predictions_np = majority_vote_2d_pytorch(
             predictions.cpu().numpy(), tilesHorizontally, tilesVertically, window_size=3)
         max_probs_np = max_probs.cpu().numpy().flatten()
-        print(f"classify_tiles done in {time.time() - start:.2f}s, got {len(predictions_np)} tiles")
+        print(f"classify_tiles done in {time.time() - start:.2f}s, got {predictions_np.size} tiles")
         if return_tiles:
             return predictions_np.flatten(), max_probs_np, npTiles
         return predictions_np.flatten(), max_probs_np
