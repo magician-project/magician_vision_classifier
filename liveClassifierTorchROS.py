@@ -921,6 +921,12 @@ def main():
         while True:
             loop_start = time.perf_counter()
 
+            if ros_node.frame_limiter_enabled():
+                ts = smm.get_timestamp()
+                if ts is not None and ts == last_processed_timestamp:
+                    time.sleep(0.001)
+                    continue
+
             frame          = smm.read_from_shared_memory()
             frameTimestamp = smm.unix_timestamp
 
