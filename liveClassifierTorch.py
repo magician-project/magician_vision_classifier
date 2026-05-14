@@ -608,7 +608,7 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
 
 
                 activations[predicted_class] += 1
-                responses["points"].append( (activationCoordinateX * 2, activationCoordinateY * 2) )
+                responses["points"].append( (activationCoordinateX, activationCoordinateY) )
                 responses["classes"].append(class_id_to_name[predicted_class])
                 responses["classIDs"].append(int(predicted_class))
                 responses["confidences"].append(confidence)
@@ -720,7 +720,7 @@ def process_predictions_erode(predictions, confidences, class_id_to_name, cleanC
         activationCoordinateX = int(x + half_tile_size)
         activationCoordinateY = int(y + half_tile_size)
 
-        filtered_responses["points"].append((activationCoordinateX * 2, activationCoordinateY * 2))
+        filtered_responses["points"].append((activationCoordinateX, activationCoordinateY))
         filtered_responses["classes"].append(class_id_to_name[predicted_class])
         filtered_responses["classIDs"].append(predicted_class)
         filtered_responses["confidences"].append(confidence)
@@ -794,7 +794,7 @@ def process_predictions(predictions, confidences, class_id_to_name, cleanClassID
                 activations[predicted_class] += 1
                 confidence = float(confidences[idx])
 
-                responses["points"].append( (activationCoordinateX * 2, activationCoordinateY * 2) )
+                responses["points"].append( (activationCoordinateX, activationCoordinateY) )
                 responses["classes"].append(class_id_to_name[predicted_class])
                 responses["classIDs"].append(int(predicted_class))
                 responses["confidences"].append(confidence)
