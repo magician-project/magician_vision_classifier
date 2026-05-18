@@ -577,6 +577,9 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
     num_preds = len(predicted_classes)
     half_tile_size = tile_size // 2
 
+    bg_prob_sum = 0.0
+    bg_count    = 0
+
     for vTile, y in enumerate(y_indices):
         for hTile, x in enumerate(x_indices):
             if idx >= num_preds:
@@ -605,7 +608,7 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
 
 
                 activations[predicted_class] += 1
-                responses["points"].append( (activationCoordinateX * 2, activationCoordinateY * 2) )
+                responses["points"].append( (activationCoordinateX, activationCoordinateY) )
                 responses["classes"].append(class_id_to_name[predicted_class])
                 responses["classIDs"].append(int(predicted_class))
                 responses["confidences"].append(confidence)
@@ -613,12 +616,16 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
                   occupancy[vTile, hTile] = 0
                 except Exception as e:
                   print("Failed setting occupancy:", repr(e))
-            
+            else:
+                bg_prob_sum += float(confidences[idx])
+                bg_count    += 1
 
             idx += 1
 
         if idx >= num_preds:
             break
+
+    responses["background_avg_prob"] = bg_prob_sum / bg_count if bg_count > 0 else 0.0
 
     print(f"{totalActivations}/{num_preds} activations")
     print("Per-class activations:", activations.tolist())
@@ -713,11 +720,20 @@ def process_predictions_erode(predictions, confidences, class_id_to_name, cleanC
         activationCoordinateX = int(x + half_tile_size)
         activationCoordinateY = int(y + half_tile_size)
 
-        filtered_responses["points"].append((activationCoordinateX * 2, activationCoordinateY * 2))
+        filtered_responses["points"].append((activationCoordinateX, activationCoordinateY))
         filtered_responses["classes"].append(class_id_to_name[predicted_class])
         filtered_responses["classIDs"].append(predicted_class)
         filtered_responses["confidences"].append(confidence)
         filtered_activations[predicted_class] += 1
+
+    predicted_classes_flat = torch.as_tensor(predictions, dtype=torch.int32)
+    bg_mask = (predicted_classes_flat == cleanClassID)
+    bg_count = int(bg_mask.sum().item())
+    if bg_count > 0:
+        bg_prob_sum = float(torch.as_tensor(confidences, dtype=torch.float32)[bg_mask].sum().item())
+        filtered_responses["background_avg_prob"] = bg_prob_sum / bg_count
+    else:
+        filtered_responses["background_avg_prob"] = 0.0
 
     print(f"{filtered_activations.sum().item()}/{num_preds} activations (after erosion)")
     print("Per-class activations:", filtered_activations.tolist())
@@ -756,6 +772,9 @@ def process_predictions(predictions, confidences, class_id_to_name, cleanClassID
     num_preds = len(predicted_classes)
     half_tile_size = tile_size // 2
 
+    bg_prob_sum = 0.0
+    bg_count    = 0
+
     for vTile, y in enumerate(y_indices):
         for hTile, x in enumerate(x_indices):
             if idx >= num_preds:
@@ -769,23 +788,28 @@ def process_predictions(predictions, confidences, class_id_to_name, cleanClassID
                 continue
 
             if predicted_class != cleanClassID:
-                totalActivations += 1 
+                totalActivations += 1
                 activationCoordinateX = int(x + half_tile_size)
                 activationCoordinateY = int(y + half_tile_size)
                 activations[predicted_class] += 1
                 confidence = float(confidences[idx])
 
-                responses["points"].append( (activationCoordinateX * 2, activationCoordinateY * 2) )
+                responses["points"].append( (activationCoordinateX, activationCoordinateY) )
                 responses["classes"].append(class_id_to_name[predicted_class])
                 responses["classIDs"].append(int(predicted_class))
                 responses["confidences"].append(confidence)
 
                 occupancy[vTile, hTile] = 0
+            else:
+                bg_prob_sum += float(confidences[idx])
+                bg_count    += 1
 
             idx += 1
 
         if idx >= num_preds:
             break
+
+    responses["background_avg_prob"] = bg_prob_sum / bg_count if bg_count > 0 else 0.0
 
     print(f"{totalActivations}/{num_preds} activations")
     print("Per-class activations:", activations.tolist())
@@ -869,12 +893,12 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
     # Spatial smoothing (optional) — must happen before optional CPU conversion
     if majorityVote:
         h, w, _ = rgba_image.shape
-        tilesHorizontally = (w - tile_size) // step
-        tilesVertically   = (h - tile_size) // step
+        tilesHorizontally = (w - tile_size) // step + 1
+        tilesVertically   = (h - tile_size) // step + 1
         predictions_np = majority_vote_2d_pytorch(
             predictions.cpu().numpy(), tilesHorizontally, tilesVertically, window_size=3)
         max_probs_np = max_probs.cpu().numpy().flatten()
-        print(f"classify_tiles done in {time.time() - start:.2f}s, got {len(predictions_np)} tiles")
+        print(f"classify_tiles done in {time.time() - start:.2f}s, got {predictions_np.size} tiles")
         if return_tiles:
             return predictions_np.flatten(), max_probs_np, npTiles
         return predictions_np.flatten(), max_probs_np

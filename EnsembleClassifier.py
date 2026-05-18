@@ -250,13 +250,14 @@ def parallel_classify_tiles(classifiers, rgba_image, tile_size, step, majorityVo
 # -------------------------------------------------------------------------------------
 class EnsembleClassifierPnm:
     def __init__(self, initial_model_cfg, model_cfg_list, tile_size=48, step=16,
-                 min_hz=0.0, benchmark_tiles=512):
+                 min_hz=0.0, benchmark_tiles=512, precache=False):
         """
         initial_model_cfg: (model_path, cfg_path) for the first classifier
         model_cfg_list:    list of (model_path, cfg_path) for ensemble models
         min_hz:            drop any ensemble model whose single-forward-pass benchmark
                            is below this threshold (0.0 = keep all, default)
         benchmark_tiles:   batch size used for the Hz benchmark (default 512)
+        precache:          run a forward-pass timing test on each model at load time
         """
         assert len(model_cfg_list) > 0, "You must provide at least one ensemble model."
 
@@ -273,6 +274,7 @@ class EnsembleClassifierPnm:
                                        cfg_path=init_cfg_path,
                                        tile_size=tile_size,
                                        step=step,
+                                       precache=precache,
                                       )
 
         self.name = "EnsembleClassifier"
@@ -280,7 +282,7 @@ class EnsembleClassifierPnm:
 
         # --- Load ALL ensemble classifiers (kept in full for re-filtering) ---
         self._all_classifiers = [
-                                   ClassifierPnm(model_path=mp, cfg_path=cp, tile_size=tile_size, step=step)
+                                   ClassifierPnm(model_path=mp, cfg_path=cp, tile_size=tile_size, step=step, precache=precache)
                                    for mp, cp in model_cfg_list
                                  ]
         self.classifiers = list(self._all_classifiers)   # active subset
@@ -342,16 +344,15 @@ class EnsembleClassifierPnm:
         """
         self.min_hz = min_hz
 
-        # Benchmark any model not yet measured
-        for clf in self._all_classifiers:
-            if clf.name not in self.model_perf or self.model_perf[clf.name] == 0.0:
-                hz = self._benchmark_clf(clf.model, self._benchmark_tiles,
-                                         self.tile_size, self.device)
-                self.model_perf[clf.name] = hz
-                print(f"[Ensemble] Benchmarked {clf.name}: {hz:.2f} Hz")
-
-        # Filter
         if min_hz > 0.0:
+            # Benchmark any model not yet measured
+            for clf in self._all_classifiers:
+                if clf.name not in self.model_perf or self.model_perf[clf.name] == 0.0:
+                    hz = self._benchmark_clf(clf.model, self._benchmark_tiles,
+                                             self.tile_size, self.device)
+                    self.model_perf[clf.name] = hz
+                    print(f"[Ensemble] Benchmarked {clf.name}: {hz:.2f} Hz")
+
             kept = [clf for clf in self._all_classifiers
                     if self.model_perf.get(clf.name, 0.0) >= min_hz]
             print(f"[Ensemble] apply_min_hz({min_hz:.1f}): "

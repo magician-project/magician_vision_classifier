@@ -221,7 +221,12 @@ class SharedMemoryManager:
           print("An exception occurred in copy_to_shared_memory:", str(e))
 
     def get_timestamp(self):
-        return self.libSharedMemoryVideoBuffers.getVideoFrameTimestamp(self.frame)
+        res = self.libSharedMemoryVideoBuffers.startReadingFromVideoBufferPointer(self.frame)
+        if not res:
+            return None
+        ts = self.libSharedMemoryVideoBuffers.getVideoFrameTimestamp(self.frame)
+        self.libSharedMemoryVideoBuffers.stopReadingFromVideoBufferPointer(self.frame)
+        return ts
 
     def set_timestamp(self, unix_timestamp=0):
         self.libSharedMemoryVideoBuffers.setVideoFrameTimestamp(self.frame, ctypes.c_ulong(unix_timestamp))

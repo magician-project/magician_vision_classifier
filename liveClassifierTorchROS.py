@@ -43,14 +43,24 @@ from datetime import datetime
 #from example_interfaces.srv import SetFloat64
 from magician_vision_classifier.srv import SetInt64
 from magician_vision_classifier.srv import SetFloat64
+#from magician_vision_classifier.srv import SetString
 
 
 from std_msgs.msg import Float32, Header
 from geometry_msgs.msg import Pose
+from builtin_interfaces.msg import Time as RosTime
 
-from magician_vision_classifier.msg import Detection      # Custom ROS message
-from magician_vision_classifier.msg import DetectionM     # Custom ROS message (uint8 severity, geometry_msgs/Pose location)
-from magician_vision_classifier.msg import Marker         # Custom ROS message (string id, geometry_msgs/Pose pose)
+from magician_vision_classifier.msg import BackgroundActivations # Custom ROS message
+from magician_vision_classifier.msg import Detection             # Custom ROS message
+from magician_vision_classifier.msg import DetectionM            # Custom ROS message (uint8 severity, geometry_msgs/Pose location)
+from magician_vision_classifier.msg import Marker                # Custom ROS message (string id, geometry_msgs/Pose pose)
+
+def unix_ns_to_ros_time(ns):
+    t = RosTime()
+    t.sec = int(ns // 1_000_000_000)
+    t.nanosec = int(ns % 1_000_000_000)
+    return t
+
 
 # ========================================================
 # Laser fusion globals (project-specific / fixed hardware)
@@ -268,6 +278,7 @@ class DefectPublisher(Node):
             self.publisher_m = self.create_publisher(DetectionM, "detections_m", 10)
 
         self.publisher_markers = self.create_publisher(Marker, "markers", 10)
+        self.publisher_bg = self.create_publisher(BackgroundActivations, "background_activations", 10)
 
 
         # Last received frame (for saving)
@@ -276,18 +287,33 @@ class DefectPublisher(Node):
         # Where to store images
         self._output_path = "./data"
         os.makedirs(self._output_path, exist_ok=True)
+        self._snapshot_path = "./snapshots"
+        os.makedirs(self._snapshot_path, exist_ok=True)
 
         # Internal execution state
         self._visualization_enabled = False
         self._inference_paused = False
         self._two_stage_enabled = False
+        self._autosave_defect_snapshots = False
+        self._frame_limiter = True
 
         # Runtime tunables (dynamic via services)
         self._target_fps = 23.0
         self._step_size = 18
-        self._threshold = 0.6
+        self._threshold = 0.6  # min softmax confidence for a tile prediction to be kept; tiles below this are reassigned to the low-confidence class
+        self._majority_voting = True
 
         self._lock = threading.Lock()
+
+        # Model hot-swap state
+        self._single_classifier = None
+        self._model_dir = "."
+        self._model_lock = threading.Lock()
+
+        # Last inference results (for saving alongside frames)
+        self._last_responses = None
+        self._last_tile_size = 0
+        self._last_frame_timestamp = 0
 
         # Marker scanning state
         self._marker_scan_until = 0.0   # monotonic time until which scanning is active
@@ -322,6 +348,11 @@ class DefectPublisher(Node):
         self.create_service(Trigger,    "magician_vision_classifier/remember_defect", self._remember_defect_cb)
         self.create_service(Trigger,    "magician_vision_classifier/remember_clean", self._remember_clean_cb)
         self.create_service(Trigger,    "magician_vision_classifier/scan_markers", self._scan_markers_cb)
+        self.create_service(SetBool,    "magician_vision_classifier/set_autosave_defect_snapshots", self._set_autosave_defect_snapshots_cb)
+        self.create_service(Trigger,    "magician_vision_classifier/snapshot", self._snapshot_cb)
+        self.create_service(SetBool,    "magician_vision_classifier/set_frame_limiter", self._set_frame_limiter_cb)
+        #self.create_service(SetString,  "magician_vision_classifier/set_model", self._set_model_cb)
+        self.create_service(SetBool,    "magician_vision_classifier/set_majority_voting", self._set_majority_voting_cb)
 
         # ------------------------------------------------
         # Services (NEW): runtime tuning
@@ -335,6 +366,11 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/set_threshold (SetFloat64)")
         self.get_logger().info("  magician_vision_classifier/remember_defect (Trigger)")
         self.get_logger().info("  magician_vision_classifier/remember_clean (Trigger)")
+        self.get_logger().info("  magician_vision_classifier/set_autosave_defect_snapshots (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/snapshot (Trigger)")
+        self.get_logger().info("  magician_vision_classifier/set_frame_limiter (SetBool)")
+        #self.get_logger().info("  magician_vision_classifier/set_model (SetString)")
+        self.get_logger().info("  magician_vision_classifier/set_majority_voting (SetBool)")
 
 
         if USE_LASERS and self.publisher_m is not None:
@@ -408,8 +444,8 @@ class DefectPublisher(Node):
         return response
 
     def _set_threshold_cb(self, request, response):
-        """Service callback to set the confidence threshold for low-activation tiles."""
-        thr = float(request.data)
+        """Set the min softmax confidence threshold; tiles whose max-class probability falls below this are reassigned to the low-confidence class instead of keeping the model's prediction."""
+        thr = max(0.0, min(1.0, float(request.data)))
         with self._lock:
             self._threshold = thr
         response.success = True
@@ -417,35 +453,79 @@ class DefectPublisher(Node):
         self.get_logger().info(response.message)
         return response
 
+    @staticmethod
+    def _make_timestamped_basename(prefix: str) -> str:
+        """Return a filename stem like '<prefix>_YYYY_MM_DD_HH_MM_SS_mmm' using the current wall time."""
+        now = datetime.now()
+        return (
+            f"{prefix}_"
+            f"{now.year:04d}_{now.month:02d}_{now.day:02d}_"
+            f"{now.hour:02d}_{now.minute:02d}_{now.second:02d}_"
+            f"{int(now.microsecond / 1000):03d}"
+        )
+
     def _save_current_frame(self, prefix: str):
         """
-        Save the last received frame as a PNG with a timestamped filename.
+        Save the last received frame as a PNG with a timestamped filename, plus a
+        JSON sidecar with the same basename containing the current detections.
 
-        Thread-safe: acquires the lock to read the frame pointer.
+        The JSON structure mirrors what publish_detection emits:
+          { "tile_size": int,
+            "background_avg_prob": float,
+            "detections": [ {"x", "y", "w", "h", "type", "class_name", "probability"}, ... ] }
+
+        Thread-safe: acquires the lock to read shared pointers.
         Returns (success: bool, message: str).
         """
-        # Take a snapshot under the lock so the main thread can't replace the frame
-        # while we are reading it (data race between main loop and ROS spin thread).
         with self._lock:
-            frame = self._last_frame
+            frame           = self._last_frame
+            responses       = self._last_responses
+            tile_size       = self._last_tile_size
+            frame_timestamp = self._last_frame_timestamp
 
         if frame is None:
             return False, "No frame available to save."
 
-        now = datetime.now()
-        filename = (
-            f"{prefix}_"
-            f"{now.year:04d}_{now.month:02d}_{now.day:02d}_"
-            f"{now.hour:02d}_{now.minute:02d}_{now.second:02d}_"
-            f"{int(now.microsecond / 1000):03d}.png"
-        )
-        full_path = os.path.join(self._output_path, filename)
+        basename  = self._make_timestamped_basename(prefix)
+        png_path  = os.path.join(self._output_path, f"{basename}.png")
+        json_path = os.path.join(self._output_path, f"{basename}.json")
 
         try:
-            cv2.imwrite(full_path, frame)
-            return True, f"Saved: {full_path}"
+            cv2.imwrite(png_path, frame)
         except Exception as e:
             return False, str(e)
+
+        detections = []
+        if responses is not None:
+            points      = responses.get("points",      [])
+            classes     = responses.get("classes",     [])
+            confidences = responses.get("confidences", [])
+            for (x, y), description, confidence in zip(points, classes, confidences):
+                det_type, det_class = filter_type(description)
+                detections.append({
+                    "x":           int(x),
+                    "y":           int(y),
+                    "w":           int(tile_size),
+                    "h":           int(tile_size),
+                    "type":        det_type,
+                    "class_name":  det_class,
+                    "probability": float(confidence),
+                })
+
+        payload = {
+            "timestamp_ns":         int(frame_timestamp),
+            "tile_size":            int(tile_size),
+            "background_avg_prob":  float(responses.get("background_avg_prob", 0.0)) if responses else 0.0,
+            "detections":           detections,
+        }
+
+        try:
+            with open(json_path, "w") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            return True, f"Saved PNG: {png_path} (JSON failed: {e})"
+
+        return True, f"Saved: {png_path} + {json_path}"
 
     def _scan_markers_cb(self, request, response):
         """Service callback to activate marker scanning for MARKER_SCAN_DURATION_S seconds."""
@@ -470,6 +550,105 @@ class DefectPublisher(Node):
         response.success = success
         response.message = msg
         self.get_logger().info(msg)
+        return response
+
+    def _set_autosave_defect_snapshots_cb(self, request, response):
+        """Service callback to enable/disable automatic saving of frames when a defect is detected."""
+        with self._lock:
+            self._autosave_defect_snapshots = bool(request.data)
+        response.success = True
+        response.message = ("Autosave defect snapshots ENABLED" if request.data else "Autosave defect snapshots DISABLED")
+        self.get_logger().info(response.message)
+        return response
+
+    def _set_frame_limiter_cb(self, request, response):
+        """Service callback to enable/disable the duplicate-frame limiter (False = unlimited framerate)."""
+        with self._lock:
+            self._frame_limiter = bool(request.data)
+        response.success = True
+        response.message = ("Frame limiter ENABLED" if request.data else "Frame limiter DISABLED (unlimited framerate)")
+        self.get_logger().info(response.message)
+        return response
+
+    def _set_majority_voting_cb(self, request, response):
+        """Service callback to enable/disable majority voting across inference tiles."""
+        with self._lock:
+            self._majority_voting = bool(request.data)
+        response.success = True
+        response.message = ("Majority voting ENABLED" if request.data else "Majority voting DISABLED")
+        self.get_logger().info(response.message)
+        return response
+
+    def _set_model_cb(self, request, response):
+        """Service callback to hot-swap the single classifier model at runtime."""
+        name = request.data.strip()
+
+        # Support both a bare stem ("allclass_resnet18") and an absolute path stem
+        if os.sep in name or "/" in name:
+            directory = os.path.dirname(os.path.abspath(name))
+            stem = os.path.basename(name)
+        else:
+            directory = os.path.abspath(self._model_dir)
+            stem = name
+
+        model_path = os.path.join(directory, f"{stem}.pth")
+        cfg_path   = os.path.join(directory, f"{stem}.json")
+
+        if not os.path.isfile(model_path):
+            response.success = False
+            response.message = f"Model file not found: {model_path}"
+            self.get_logger().error(response.message)
+            return response
+
+        if not os.path.isfile(cfg_path):
+            response.success = False
+            response.message = f"Config file not found: {cfg_path}"
+            self.get_logger().error(response.message)
+            return response
+
+        if self._single_classifier is None:
+            response.success = False
+            response.message = "Single classifier not yet initialized"
+            self.get_logger().error(response.message)
+            return response
+
+        self.get_logger().info(f"Hot-swapping model to '{stem}' from {directory} ...")
+        with self._model_lock:
+            ok = self._single_classifier.reload_model(directory, stem)
+
+        if ok:
+            with self._lock:
+                self._model_dir = directory
+
+        response.success = ok
+        response.message = (f"Model reloaded: {stem}" if ok
+                            else f"Failed to reload model: {stem}")
+        self.get_logger().info(response.message)
+        return response
+
+    def _snapshot_cb(self, request, response):
+        """Service callback to save the current frame on demand to the snapshots directory."""
+        with self._lock:
+            frame = self._last_frame
+
+        if frame is None:
+            response.success = False
+            response.message = "No frame available to save."
+            self.get_logger().warning(response.message)
+            return response
+
+        full_path = os.path.join(
+            self._snapshot_path,
+            self._make_timestamped_basename("snapshot") + ".png",
+        )
+        try:
+            cv2.imwrite(full_path, frame)
+            response.success = True
+            response.message = f"Saved: {full_path}"
+        except Exception as e:
+            response.success = False
+            response.message = str(e)
+        self.get_logger().info(response.message)
         return response
 
     # -------------------------
@@ -504,6 +683,21 @@ class DefectPublisher(Node):
         """Thread-safe getter for the two-stage ensemble mode."""
         with self._lock:
             return self._two_stage_enabled
+
+    def autosave_defect_snapshots_enabled(self):
+        """Thread-safe getter for the autosave defect snapshots toggle."""
+        with self._lock:
+            return self._autosave_defect_snapshots
+
+    def frame_limiter_enabled(self):
+        """Thread-safe getter for the frame limiter toggle."""
+        with self._lock:
+            return self._frame_limiter
+
+    def majority_voting_enabled(self):
+        """Thread-safe getter for the majority voting toggle."""
+        with self._lock:
+            return self._majority_voting
 
     def get_laser_depths(self):
         """Thread-safe getter for the latest laser depth readings."""
@@ -559,7 +753,7 @@ class DefectPublisher(Node):
         Uses the cached camera matrix for pose estimation. Chessboard detection
         is present but disabled (too slow for real-time).
         """
-        self.get_logger().info("Scanning frame for markers...")
+        self.get_logger().debug("Scanning frame for markers...")
 
         if len(frame.shape) == 2 or frame.shape[2] == 1:
             gray = frame if len(frame.shape) == 2 else frame[:, :, 0]
@@ -610,13 +804,13 @@ class DefectPublisher(Node):
         #         print("[Markers] PnP solve failed for chessboard.")
         # else:
         #     print("[Markers] No chessboard found.")
-        self.get_logger().info("Marker scan complete.")
+        self.get_logger().debug("Marker scan complete.")
 
     def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z=0.0, ts=0):
         """Publish a Detection message with 2D bounding box, type, class, and optional depth."""
         try:
             msg = Detection()
-            msg.header.stamp    = ts #self.get_clock().now().to_msg()
+            msg.header.stamp    = unix_ns_to_ros_time(ts)
             msg.header.frame_id = "camera"
             msg.x           = int(x)
             msg.y           = int(y)
@@ -636,9 +830,9 @@ class DefectPublisher(Node):
             return
         try:
             msg = DetectionM()
-            msg.header.stamp    = ts #self.get_clock().now().to_msg()
+            msg.header.stamp    = unix_ns_to_ros_time(ts)
             msg.header.frame_id = "camera"
-            msg.severity = int(severity)
+            msg.severity = int(severity) #Detection_M accepts 1,2,3 here
 
             pose = Pose()
             pose.position.x    = float(cx)
@@ -653,6 +847,17 @@ class DefectPublisher(Node):
             self.publisher_m.publish(msg)
         except Exception as e:
             self.get_logger().error(f"Failed to publish detection_m: {e}")
+
+    def publish_background_activations(self, avg_prob, ts):
+        """Publish average softmax probability of clean (non-activated) tiles."""
+        try:
+            msg = BackgroundActivations()
+            msg.header.stamp    = unix_ns_to_ros_time(ts)
+            msg.header.frame_id = "camera"
+            msg.background_probability = 1.0 - float(avg_prob)
+            self.publisher_bg.publish(msg)
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish background_activations: {e}")
 
 
 # ========================================================
@@ -677,9 +882,13 @@ def main():
 
     # Initialize Neural Networks (both modes)
     single_classifier = ClassifierPnm(
-        model_path=f"{PATH}/allclass_resnet18.pth",
-        cfg_path=f"{PATH}/allclass_resnet18.json",
+        model_path=f"{PATH}/allclass_small_cnn.pth",
+        cfg_path=f"{PATH}/allclass_small_cnn.json",
     )
+
+    # Expose classifier to the ROS node for hot-swap via service
+    ros_node._model_dir = PATH
+    ros_node._single_classifier = single_classifier
 
     ensemble_classifier = EnsembleClassifierPnm(
         initial_model_cfg=(
@@ -706,13 +915,19 @@ def main():
         connect=True,
     )
 
-    majority_voting = True
+    last_processed_timestamp = None
 
     try:
         while True:
             loop_start = time.perf_counter()
 
-            frame = smm.read_from_shared_memory()
+            if ros_node.frame_limiter_enabled():
+                ts = smm.get_timestamp()
+                if ts is not None and ts == last_processed_timestamp:
+                    time.sleep(0.001)
+                    continue
+
+            frame          = smm.read_from_shared_memory()
             frameTimestamp = smm.unix_timestamp
 
             # Get image to work on
@@ -721,7 +936,13 @@ def main():
                 time.sleep(0.1)
                 continue
 
+            if ros_node.frame_limiter_enabled() and frameTimestamp == last_processed_timestamp:
+                time.sleep(0.001)
+                continue
+            last_processed_timestamp = frameTimestamp
+
             ros_node._last_frame = frame.copy()
+            ros_node._last_frame_timestamp = frameTimestamp
 
             # Marker scanning (runs regardless of inference pause state)
             if ros_node.is_marker_scanning():
@@ -733,29 +954,36 @@ def main():
                 continue
 
             # Run the neural network
+            majority_voting = ros_node.majority_voting_enabled()
             with torch.inference_mode():
                 if ros_node.two_stage_enabled():
-                    ensemble_classifier.step = ros_node.get_step_size()
-                    ensemble_classifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
-                    tile_size = ensemble_classifier.tile_size
+                    with ros_node._model_lock:
+                        ensemble_classifier.step = ros_node.get_step_size()
+                        ensemble_classifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
+                        tile_size = ensemble_classifier.tile_size
 
-                    heatmap, occupancy, responses = ensemble_classifier.forward(
-                        frame,
-                        majorityVote=majority_voting,
-                        parallel=True,
-                        multimodel=True,
-                    )
+                        heatmap, occupancy, responses = ensemble_classifier.forward(
+                            frame,
+                            majorityVote=majority_voting,
+                            parallel=True,
+                            multimodel=True,
+                        )
                 else:
-                    single_classifier.step = ros_node.get_step_size()
-                    single_classifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
-                    tile_size = single_classifier.tile_size
+                    with ros_node._model_lock:
+                        single_classifier.step = ros_node.get_step_size()
+                        single_classifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
+                        tile_size = single_classifier.tile_size
 
-                    heatmap, occupancy, responses = single_classifier.forward(
-                        frame,
-                        majorityVote=majority_voting,
-                        erosion_kernel=0,
-                        erosion_threshold=0,
-                    )
+                        heatmap, occupancy, responses = single_classifier.forward(
+                            frame,
+                            majorityVote=majority_voting,
+                            erosion_kernel=0,
+                            erosion_threshold=0,
+                        )
+
+            # Snapshot responses for _save_current_frame sidecar JSON
+            ros_node._last_responses = responses
+            ros_node._last_tile_size = tile_size
 
             # Publish detections
             points      = responses.get("points",      [])
@@ -779,7 +1007,8 @@ def main():
                         z = float("nan")
 
                     severity = class_to_severity(det_class)
-                    ros_node.publish_detection_m(cx, cy, severity, z, ts)
+                    #Detection_M accepts severities 1,2,3
+                    ros_node.publish_detection_m(cx, cy, severity, z, frameTimestamp)
 
 
                 # Existing 2D detection
@@ -794,6 +1023,16 @@ def main():
                     depth_z = z,
                     ts = frameTimestamp
                 )
+
+            # Autosave one snapshot per frame whenever a defect is detected
+            if ros_node.autosave_defect_snapshots_enabled() and points:
+                ros_node._save_current_frame("autosaved_defect")
+
+            # Publish average background (clean-tile) softmax probability
+            ros_node.publish_background_activations(
+                responses.get("background_avg_prob", 0.0),
+                frameTimestamp,
+            )
 
             # Visualization
             if ros_node.visualization_enabled():
