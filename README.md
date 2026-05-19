@@ -79,6 +79,8 @@ Stream via shm                                            Run inference (consume
                                                   +-----------------------+
 ```
 
+![ROS node graph showing liveClassifierTorchROS.py operating alongside the other Magician ROS nodes](doc/ROSclassifier.png)
+
 **Pipeline stages:**
 
 1. **Capture:** A polarization camera with a Bayer-like filter acquires images encoding four polarization angles.
@@ -349,6 +351,14 @@ The `EnsembleClassifier.py` module implements the two-stage ensemble:
 - **Async CUDA streams** (default): All models execute concurrently on separate CUDA streams with `channels_last` memory format for maximum throughput.
 - **CPU thread pool:** Parallel classification via `ThreadPoolExecutor` for CPU-only systems.
 - **Serial:** Sequential execution for low-VRAM systems.
+
+### Field Trials — Altinay (11–15 May 2026)
+
+The images below show detections produced on samples that were **outside the training dataset**, collected during integration trials at Altinay. Both the polarization-based classification and the spatial heatmap overlay are visible.
+
+![Detection example 1 — Altinay field trial](doc/alt_def.jpg)
+
+![Detection example 2 — Altinay field trial](doc/alt_def2.jpg)
 
 ---
 
