@@ -8,6 +8,7 @@ License : "FORTH"
 
 import datetime
 import glob
+import hashlib
 import json
 import os
 import random
@@ -1708,7 +1709,16 @@ if __name__ == "__main__":
             f.write("Failed\n")
 
 
-    #Save the JSON 
+    #Compute MD5 of saved model for corruption detection
+    #------------------------------------------------------------------
+    pth_path = '%s.pth' % model_name
+    md5 = hashlib.md5()
+    with open(pth_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            md5.update(chunk)
+    config_json['model_md5'] = md5.hexdigest()
+
+    #Save the JSON
     #------------------------------------------------------------------
     print("Saving the JSON")
     with open('%s.json' % model_name, 'w') as f:
