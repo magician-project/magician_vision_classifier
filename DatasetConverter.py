@@ -16,7 +16,7 @@ import numpy as np
 from tqdm import tqdm
 from torchvision import transforms
 from torch.utils.data import Dataset
-from trainClassifierTorch import load_hyperparameters, RGBAImageFolder
+from trainMagicianVisionClassifierTorch import load_hyperparameters, RGBAImageFolder
 
 
 class HDF5Dataset(Dataset):
