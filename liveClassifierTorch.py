@@ -172,8 +172,8 @@ def printLabels(heatmap,classes,class_colors):
 
 def verifyTileNumber(numberOfTiles , original_image, tile_size, step):
     height, width, _ = original_image.shape
-    tilesH = (height - tile_size) // step
-    tilesW = (width  - tile_size) // step
+    tilesH = (height - tile_size) // step + 1
+    tilesW = (width  - tile_size) // step + 1
     expected_tiles = (tilesH) * (tilesW)
 
     if numberOfTiles != expected_tiles:
@@ -556,8 +556,8 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
     original_image = torch.as_tensor(rgba_image, dtype=torch.uint8)
     height, width, _ = original_image.shape
 
-    y_indices = torch.arange(0, height - tile_size, step)
-    x_indices = torch.arange(0, width  - tile_size, step)
+    y_indices = torch.arange(0, height - tile_size + 1, step)
+    x_indices = torch.arange(0, width  - tile_size + 1, step)
     tilesH = len(y_indices)
     tilesW = len(x_indices)
     expected_tiles = tilesH * tilesW
@@ -642,8 +642,8 @@ def process_predictions_erode(predictions, confidences, class_id_to_name, cleanC
     original_image   = torch.as_tensor(rgba_image, dtype=torch.uint8)
     height, width, _ = original_image.shape
 
-    y_indices = torch.arange(0, height - tile_size, step)
-    x_indices = torch.arange(0, width - tile_size, step)
+    y_indices = torch.arange(0, height - tile_size + 1, step)
+    x_indices = torch.arange(0, width - tile_size + 1, step)
     tilesH           = len(y_indices)
     tilesW           = len(x_indices)
     expected_tiles   = tilesH * tilesW
@@ -763,8 +763,8 @@ def process_predictions(predictions, confidences, class_id_to_name, cleanClassID
     heatmap = original_image[:, :, :3].clone()
     activations = torch.zeros(len(class_id_to_name), dtype=torch.int32)
 
-    y_indices = torch.arange(0, height - tile_size , step)
-    x_indices = torch.arange(0, width - tile_size , step)
+    y_indices = torch.arange(0, height - tile_size + 1, step)
+    x_indices = torch.arange(0, width - tile_size + 1, step)
 
     predicted_classes = torch.as_tensor(predictions, dtype=torch.int32)
     totalActivations = 0

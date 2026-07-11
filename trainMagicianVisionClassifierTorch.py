@@ -381,7 +381,9 @@ class Classifier(pl.LightningModule):
                       final_dense_layer=512,
                       clean_class=0,
                       noise_std=0.0,
-                      noise_clip=None
+                      noise_clip=None,
+                      gain_jitter=0.0,
+                      polar_flip=False
                  ):
         super(Classifier, self).__init__()
         #-----------------------------------------
@@ -405,6 +407,8 @@ class Classifier(pl.LightningModule):
         #-----------------------------------------
         self.noise_std  = noise_std
         self.noise_clip = noise_clip
+        self.gain_jitter = gain_jitter   # exposure-emulating multiplicative jitter
+        self.polar_flip  = polar_flip    # physics-consistent mirror augmentation
 
         # Dynamic input channels (base 4 polarization channels + optional derived channels)
         extra_channels = 0
@@ -532,6 +536,47 @@ class Classifier(pl.LightningModule):
             x = x + noise
         return x
 
+    def augment_train_batch(self, x):
+        """
+        Training-only augmentation on the raw 4-channel polarization batch.
+
+        gain_jitter: per-sample multiplicative gain, log-uniform in
+        [1/(1+j), 1+j], identical on all 4 channels — emulates the exposure
+        differences between recording sessions (dataset names carry exposures
+        150..4500) without breaking polarization ratios.
+
+        polar_flip: random horizontal/vertical mirror. A mirror maps the angle
+        of linear polarization theta -> -theta, i.e. S2 = I45-I135 negates, so
+        the 45deg and 135deg channels (1 and 3) MUST be swapped along with the
+        pixel flip. Verified empirically on the static-camera
+        measure65mmheight_* sets: corr(S2, mirror(S2)) = -0.86..-0.92 while the
+        invariant S1 control stays positive.
+
+        Returns float32 in [0,1] (dequantizes uint8 first so downstream
+        build_input_features skips its own dequantization consistently).
+        """
+        if not self.training or (self.gain_jitter <= 0.0 and not self.polar_flip):
+            return x
+        if x.dtype == torch.uint8:
+            x = x.float() * (1.0 / 255.0)
+
+        if self.polar_flip:
+            swap = [0, 3, 2, 1]  # 45deg <-> 135deg
+            for dim in (-1, -2):  # horizontal, then vertical mirror
+                sel = torch.rand(x.shape[0], device=x.device) < 0.5
+                if sel.any():
+                    x[sel] = x[sel].flip(dim)[:, swap, :, :]
+
+        if self.gain_jitter > 0.0:
+            j = float(self.gain_jitter)
+            lo = torch.log(torch.tensor(1.0 / (1.0 + j)))
+            hi = torch.log(torch.tensor(1.0 + j))
+            g = torch.exp(torch.empty(x.shape[0], 1, 1, 1, device=x.device)
+                          .uniform_(float(lo), float(hi)))
+            x = torch.clamp(x * g, 0.0, 1.0)
+
+        return x
+
     def build_input_features(self, x):
         """
         Build model input by appending derived channels.
@@ -624,6 +669,7 @@ class Classifier(pl.LightningModule):
         """
         x, y = batch
 
+        x = self.augment_train_batch(x)
         x = self.add_input_noise(x)
         x = self.build_input_features(x)
 
@@ -1376,6 +1422,10 @@ if __name__ == "__main__":
           noise_clip = config_json['hparams']['noise_clip']
     print("Simulated Noise STD ",noise_std,"/ CLIP ",noise_clip)
     #-----------------------------------------------------------------
+    gain_jitter = float(config_json['hparams'].get('gain_jitter', 0.0))
+    polar_flip  = bool(config_json['hparams'].get('polar_flip', False))
+    print("Augmentation: gain_jitter ", gain_jitter, "/ polar_flip ", polar_flip)
+    #-----------------------------------------------------------------
 
 
 
@@ -1612,7 +1662,9 @@ if __name__ == "__main__":
                             final_dense_layer=final_dense_layer,
                             clean_class=cleanClassID,
                             noise_std=noise_std,
-                            noise_clip=noise_clip)
+                            noise_clip=noise_clip,
+                            gain_jitter=gain_jitter,
+                            polar_flip=polar_flip)
     print(f"Learning rate: {lr}")
     
     model_type = classifier.type
@@ -1626,19 +1678,32 @@ if __name__ == "__main__":
             shutil.rmtree("tensorboard/", ignore_errors=True)
         loggers = [TensorBoardLogger("tensorboard", name=model_name)]
 
+    # Keep the epoch with the best validation loss; cross-site val metrics drift
+    # non-monotonically, so last-epoch weights are often not the best weights.
+    from pytorch_lightning.callbacks import ModelCheckpoint
+    best_ckpt = ModelCheckpoint(monitor='val_loss', mode='min', save_top_k=1)
+
     trainer = pl.Trainer(
                          max_epochs=epochs,
                          logger=loggers,
+                         callbacks=[best_ckpt],
                          #callbacks=[EarlyStopping(monitor='val_loss')],
                          accelerator=config_json['accelerator'],
                          devices=config_json['devices'],
                          gradient_clip_val=gradient_clip_val,
-                         deterministic= (noise_std==0.0), #<- When there is noise switch to non deterministic to speed up training 
+                         deterministic= (noise_std==0.0), #<- When there is noise switch to non deterministic to speed up training
                        )
 
     #Train and log to console
     #------------------------------------------------------------------
     trainer.fit(classifier, train_loader, val_loader)
+
+    # Restore the best-val_loss epoch before saving/validating/confusion matrix
+    if best_ckpt.best_model_path:
+        print("Restoring best checkpoint:", best_ckpt.best_model_path,
+              "(val_loss %s)" % str(best_ckpt.best_model_score))
+        best_state = torch.load(best_ckpt.best_model_path, weights_only=False)
+        classifier.load_state_dict(best_state['state_dict'])
 
 
     #Save the model
@@ -1674,13 +1739,17 @@ if __name__ == "__main__":
         print("Generating new confusion matrix data..")
         y_true = []
         y_pred = []
+        y_maxp = []   # max softmax probability, for the confidence-threshold sweep
 
         # torch.no_grad() prevents graph construction for every batch (saves memory).
         with torch.no_grad():
             for x, y in val_loader:
                 x = x.to(classifier.device)
+                probs = torch.softmax(classifier(x), dim=1)
+                mp, pr = probs.max(dim=1)
                 y_true.extend(y.cpu().numpy())
-                y_pred.extend(classifier(x).argmax(dim=1).cpu().numpy())
+                y_pred.extend(pr.cpu().numpy())
+                y_maxp.extend(mp.cpu().numpy())
 
         num_classes = len(dataset.classes)
         confusion_matrix = np.zeros((num_classes, num_classes), dtype=int)
@@ -1703,7 +1772,53 @@ if __name__ == "__main__":
         with open(f"{model_name}_confusion.json", "w") as f:
             json.dump(confusion_json, f, indent=2)
         subprocess.run(
-            ["python3", "plotTool.py", f"{model_name}_confusion.json"], check=False
+            [sys.executable, "plotTool.py", f"{model_name}_confusion.json"], check=False
+        )
+
+        # Confidence-threshold sweep: live inference forces predictions with
+        # max-prob < threshold to clean, so sweep that gate over the validation
+        # set to produce the operating curve and the model's best configuration.
+        print("Generating threshold sweep / operating curve")
+        yt = np.array(y_true); yp = np.array(y_pred); mp = np.array(y_maxp)
+        isdef = yt != cleanClassID
+        n_def = max(1, int(isdef.sum())); n_cln = max(1, int((~isdef).sum()))
+        sweep = []
+        for t in np.arange(0.0, 0.996, 0.005):
+            pr = np.where(mp < t, cleanClassID, yp)
+            flagged = pr != cleanClassID
+            sweep.append({
+                "threshold":   round(float(t), 3),
+                "detected":    float((flagged &  isdef).sum() / n_def),
+                "false_alarm": float((flagged & ~isdef).sum() / n_cln),
+            })
+        balance  = [s["detected"] - s["false_alarm"] for s in sweep]          # Youden J
+        kpi_cost = [2*(1-s["detected"]) + s["false_alarm"] for s in sweep]    # misses weigh 2x
+        best_bal = sweep[int(np.argmax(balance))]
+        best_kpi = sweep[int(np.argmin(kpi_cost))]
+        # Deployment pick: tile rates ignore prevalence (a frame is ~99% clean,
+        # so 1% FA = dozens of false crosses). Highest detection subject to a
+        # false-alarm budget of 0.5% of clean tiles (~30 crosses/frame @ step 14).
+        in_budget = [s for s in sweep if s["false_alarm"] <= 0.005]
+        best_dep  = max(in_budget, key=lambda s: s["detected"]) if in_budget else sweep[-1]
+        print(f"Best balanced threshold: {best_bal['threshold']:.3f} "
+              f"(detected {best_bal['detected']:.1%}, false-alarm {best_bal['false_alarm']:.1%})")
+        print(f"Best KPI (2xmiss+FA) threshold: {best_kpi['threshold']:.3f} "
+              f"(detected {best_kpi['detected']:.1%}, false-alarm {best_kpi['false_alarm']:.1%})")
+        print(f"Best deployment threshold (FA<=0.5% of clean tiles): {best_dep['threshold']:.3f} "
+              f"(detected {best_dep['detected']:.1%}, false-alarm {best_dep['false_alarm']:.2%})")
+        config_json["best_threshold_balanced"]   = best_bal
+        config_json["best_threshold_kpi"]        = best_kpi
+        config_json["best_threshold_deployment"] = best_dep
+        curve_json = {
+            "title": f"{model_name} / Tile Size = {tile_size} / Epochs = {epochs}",
+            "sweep": sweep,
+            "best_balanced": best_bal,
+            "best_kpi": best_kpi,
+        }
+        with open(f"{model_name}_threshold_curve.json", "w") as f:
+            json.dump(curve_json, f, indent=2)
+        subprocess.run(
+            [sys.executable, "plotTool.py", f"{model_name}_threshold_curve.json"], check=False
         )
     except Exception as e:
         print("Failed generating a confusion matrix:", e)
