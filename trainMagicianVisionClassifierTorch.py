@@ -1399,6 +1399,7 @@ if __name__ == "__main__":
           from DatasetConverter import HDF5Dataset
           print("Using H5 dataset loader ",H5PYFilename)
           dataset = HDF5Dataset(H5PYFilename)
+          dataset.metadata = None  # training/validation steps unpack (x, y) batches only
     else:
           #Normal .PNG decoding and loading
           print("Using Normal PNG dataset loader ",directory)
@@ -1492,6 +1493,7 @@ if __name__ == "__main__":
         if checkIfFileExists(H5PYValFilename):
             from DatasetConverter import HDF5Dataset
             val_dataset = HDF5Dataset(H5PYValFilename)
+            val_dataset.metadata = None  # training/validation steps unpack (x, y) batches only
         else:
             val_dataset = RGBAImageFolder(root=val_directory, transform=transform)
 

@@ -45,6 +45,7 @@ class HDF5Dataset(Dataset):
 
         # Keep targets compatible with ImageFolder-like code
         self.targets = [int(x) for x in self.labels[:]]
+        self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
 
     def __len__(self):
         """Return the total number of samples in the HDF5 dataset."""
