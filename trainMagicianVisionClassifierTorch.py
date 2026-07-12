@@ -383,7 +383,9 @@ class Classifier(pl.LightningModule):
                       noise_std=0.0,
                       noise_clip=None,
                       gain_jitter=0.0,
-                      polar_flip=False
+                      polar_flip=False,
+                      channel_jitter=0.0,
+                      monochrome=False
                  ):
         super(Classifier, self).__init__()
         #-----------------------------------------
@@ -409,6 +411,11 @@ class Classifier(pl.LightningModule):
         self.noise_clip = noise_clip
         self.gain_jitter = gain_jitter   # exposure-emulating multiplicative jitter
         self.polar_flip  = polar_flip    # physics-consistent mirror augmentation
+        self.channel_jitter = channel_jitter  # strobe-light-emulating per-channel jitter
+        # Polarization ablation: replace the 4 channels with their mean (what a
+        # regular monochrome camera would record), replicated x4 so the
+        # architecture/capacity stay byte-identical. Train AND val see it.
+        self.monochrome = monochrome
 
         # Dynamic input channels (base 4 polarization channels + optional derived channels)
         extra_channels = 0
@@ -555,7 +562,8 @@ class Classifier(pl.LightningModule):
         Returns float32 in [0,1] (dequantizes uint8 first so downstream
         build_input_features skips its own dequantization consistently).
         """
-        if not self.training or (self.gain_jitter <= 0.0 and not self.polar_flip):
+        if not self.training or (self.gain_jitter <= 0.0 and not self.polar_flip
+                                 and self.channel_jitter <= 0.0):
             return x
         if x.dtype == torch.uint8:
             x = x.float() * (1.0 / 255.0)
@@ -572,6 +580,21 @@ class Classifier(pl.LightningModule):
             lo = torch.log(torch.tensor(1.0 / (1.0 + j)))
             hi = torch.log(torch.tensor(1.0 + j))
             g = torch.exp(torch.empty(x.shape[0], 1, 1, 1, device=x.device)
+                          .uniform_(float(lo), float(hi)))
+            x = torch.clamp(x * g, 0.0, 1.0)
+
+        if self.channel_jitter > 0.0:
+            # INDEPENDENT per-channel gains: emulates the 6 strobed scene lights,
+            # whose changes shift the polarization channel proportions (measured
+            # signature swing between lights: L1 up to ~0.30 on the normalized
+            # 4-vector, i.e. per-channel relative changes up to ~+/-40%). This is
+            # the augmentation counterpart of the annotator's canonical-light
+            # remap: instead of normalizing lights away at inference, train the
+            # model to be invariant to them.
+            j = float(self.channel_jitter)
+            lo = torch.log(torch.tensor(1.0 / (1.0 + j)))
+            hi = torch.log(torch.tensor(1.0 + j))
+            g = torch.exp(torch.empty(x.shape[0], x.shape[1], 1, 1, device=x.device)
                           .uniform_(float(lo), float(hi)))
             x = torch.clamp(x * g, 0.0, 1.0)
 
@@ -595,6 +618,10 @@ class Classifier(pl.LightningModule):
 
         if x.shape[1] < 4:
             raise ValueError(f"Expected at least 4 channels for polarization input, got {x.shape[1]}")
+
+        if self.monochrome:
+            # simulate a regular monochrome camera: intensity only, no polarization
+            x = x[:, 0:4, :, :].mean(dim=1, keepdim=True).expand(-1, 4, -1, -1).contiguous()
 
         pol = x[:, 0:4, :, :]  # original polarization channels only
 
@@ -1424,7 +1451,10 @@ if __name__ == "__main__":
     #-----------------------------------------------------------------
     gain_jitter = float(config_json['hparams'].get('gain_jitter', 0.0))
     polar_flip  = bool(config_json['hparams'].get('polar_flip', False))
-    print("Augmentation: gain_jitter ", gain_jitter, "/ polar_flip ", polar_flip)
+    channel_jitter = float(config_json['hparams'].get('channel_jitter', 0.0))
+    monochrome = bool(config_json['hparams'].get('monochrome', False))
+    print("Augmentation: gain_jitter ", gain_jitter, "/ polar_flip ", polar_flip,
+          "/ channel_jitter ", channel_jitter, "/ monochrome ", monochrome)
     #-----------------------------------------------------------------
     # Derived polarization input channels (computed on-GPU from the 4 raw ones)
     use_AoLP  = bool(config_json['hparams'].get('AoLP', False))
@@ -1676,6 +1706,8 @@ if __name__ == "__main__":
                             noise_clip=noise_clip,
                             gain_jitter=gain_jitter,
                             polar_flip=polar_flip,
+                            channel_jitter=channel_jitter,
+                            monochrome=monochrome,
                             AoLP=use_AoLP,
                             DoLP=use_DoLP,
                             Unpolarized=use_unpol,

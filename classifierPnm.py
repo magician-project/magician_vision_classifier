@@ -1168,6 +1168,7 @@ class ClassifierPnm:
                        MaxPolarization=bool(hp.get('MaxPolarization', False)),
                        MinPolarization=bool(hp.get('MinPolarization', False)),
                        RangePolarization=bool(hp.get('RangePolarization', False)),
+                       monochrome=bool(hp.get('monochrome', False)),
                       )
         model = Classifier(
                            model=self.cfg['model'],

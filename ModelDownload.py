@@ -35,12 +35,22 @@ BASE_URL = "http://ammar.gr/magician/models/CameraV2Models/"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def list_remote_models(base_url=BASE_URL):
+def list_remote_models(base_url=BASE_URL, timeout=30):
     """Return the .zip filenames listed in the server's directory index."""
-    with urllib.request.urlopen(base_url, timeout=30) as r:
+    with urllib.request.urlopen(base_url, timeout=timeout) as r:
         html = r.read().decode("utf-8", errors="replace")
     zips = sorted(set(re.findall(r'href="([^"]+\.zip)"', html)))
     return [os.path.basename(z) for z in zips]
+
+
+def remote_model_names(base_url=BASE_URL, timeout=30):
+    """Base model names available remotely ({name}_{timestamp}.zip -> name)."""
+    names = set()
+    for z in list_remote_models(base_url, timeout):
+        m = re.match(r"(.+)_\d{8}_\d{6}\.zip$", z)
+        if m:
+            names.add(m.group(1))
+    return sorted(names)
 
 
 def newest_zip_for(model_name, remote_zips):
