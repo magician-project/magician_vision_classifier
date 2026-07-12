@@ -1426,6 +1426,17 @@ if __name__ == "__main__":
     polar_flip  = bool(config_json['hparams'].get('polar_flip', False))
     print("Augmentation: gain_jitter ", gain_jitter, "/ polar_flip ", polar_flip)
     #-----------------------------------------------------------------
+    # Derived polarization input channels (computed on-GPU from the 4 raw ones)
+    use_AoLP  = bool(config_json['hparams'].get('AoLP', False))
+    use_DoLP  = bool(config_json['hparams'].get('DoLP', False))
+    use_unpol = bool(config_json['hparams'].get('Unpolarized',
+                     config_json['hparams'].get('unpolarized', False)))
+    use_maxp  = bool(config_json['hparams'].get('MaxPolarization', False))
+    use_minp  = bool(config_json['hparams'].get('MinPolarization', False))
+    use_rngp  = bool(config_json['hparams'].get('RangePolarization', False))
+    print("Derived channels: AoLP", use_AoLP, "/ DoLP", use_DoLP, "/ Unpolarized", use_unpol,
+          "/ Max", use_maxp, "/ Min", use_minp, "/ Range", use_rngp)
+    #-----------------------------------------------------------------
 
 
 
@@ -1664,7 +1675,13 @@ if __name__ == "__main__":
                             noise_std=noise_std,
                             noise_clip=noise_clip,
                             gain_jitter=gain_jitter,
-                            polar_flip=polar_flip)
+                            polar_flip=polar_flip,
+                            AoLP=use_AoLP,
+                            DoLP=use_DoLP,
+                            Unpolarized=use_unpol,
+                            MaxPolarization=use_maxp,
+                            MinPolarization=use_minp,
+                            RangePolarization=use_rngp)
     print(f"Learning rate: {lr}")
     
     model_type = classifier.type
