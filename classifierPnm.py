@@ -836,8 +836,10 @@ def draw_heatmap(rgba_image, responses, class_id_to_color, size=10):
 
         color = class_id_to_color[class_id]
 
-        # IMPORTANT: your original signature requires (Y, X)
-        draw_cross(heatmap, (y//2, x//2), size, color)
+        # points are already in the demosaiced (half-res) space this heatmap
+        # lives in — draw_cross takes (Y, X); halving them again squeezed every
+        # cross toward the top-left (bug visible once erosion voting was enabled)
+        draw_cross(heatmap, (y, x), size, color)
 
     return heatmap
 #----------------------------------------------------------

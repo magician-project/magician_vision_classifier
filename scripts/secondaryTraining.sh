@@ -1,57 +1,21 @@
 #!/bin/bash
-
+# Backbone sweep on the WINNING cross-site recipe (2026-07-13):
+#   v2 dataset + pfc0.5 + gain_jitter 1.0 + polar_flip + channel_jitter 0.4 + polar_rot
+# Backbone is a CLI arg to one config; outputs are crossvalv2rot_<backbone>_*.
+# Ordered cheapest-first so early results land before the heavy models finish.
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$DIR"
-cd ..
-
+cd "$DIR"; cd ..
 source venv/bin/activate
 
-# ---------------------------------------------------------------
-# bigmodel.json  — heavy pretrained backbones
-#   resnext50      ~25M params
-#   convnext_tiny  ~28M params
-#   efficientnet_v2_s ~21M params
-#   swin_v2_t      ~28M params
-#   densenet121    ~8M params (memory-heavy due to dense connections)
-# ---------------------------------------------------------------
-python3 trainClassifierTorch.py configs/bigmodel.json resnext50
-python3 trainClassifierTorch.py configs/bigmodel.json convnext_tiny
-python3 trainClassifierTorch.py configs/bigmodel.json efficientnet_v2_s
-python3 trainClassifierTorch.py configs/bigmodel.json swin_v2_t
-python3 trainClassifierTorch.py configs/bigmodel.json densenet121
-
-# ---------------------------------------------------------------
-# smallmodel.json — medium pretrained backbones + medium custom CNN
-#   resnet18           ~11M params
-#   regnet_y_800mf     ~6M params
-#   regnet_y_400mf     ~4M params
-#   mobilenet_v3_large ~5M params
-#   efficientnet_b0    ~5M params
-#   mnasnet1_0         ~4M params
-#   shufflenet_v2_x1_0 ~2.3M params
-#   custom             medium custom CNN (base_channels=48, final_dense_layer=512)
-# ---------------------------------------------------------------
-python3 trainClassifierTorch.py configs/smallmodel.json resnet18
-python3 trainClassifierTorch.py configs/smallmodel.json regnet_y_800mf
-python3 trainClassifierTorch.py configs/smallmodel.json regnet_y_400mf
-python3 trainClassifierTorch.py configs/smallmodel.json mobilenet_v3_large
-python3 trainClassifierTorch.py configs/smallmodel.json efficientnet_b0
-python3 trainClassifierTorch.py configs/smallmodel.json mnasnet1_0
-python3 trainClassifierTorch.py configs/smallmodel.json shufflenet_v2_x1_0
-python3 trainClassifierTorch.py configs/smallmodel.json custom
-
-# ---------------------------------------------------------------
-# verysmallmodel.json — lightweight backbones + tiny custom CNN
-#   mobilenet_v3_small  ~2.5M params
-#   shufflenet_v2_x0_5  ~1.4M params
-#   squeezenet1_1       ~1.2M params  (fire modules, highest throughput)
-#   mnasnet0_5          ~2.2M params
-#   verysmall_cnn       tiny custom CNN (base_channels=30, final_dense_layer=256)
-# ---------------------------------------------------------------
-python3 trainClassifierTorch.py configs/verysmallmodel.json mobilenet_v3_small
-python3 trainClassifierTorch.py configs/verysmallmodel.json shufflenet_v2_x0_5
-python3 trainClassifierTorch.py configs/verysmallmodel.json squeezenet1_1
-python3 trainClassifierTorch.py configs/verysmallmodel.json mnasnet0_5
-python3 trainClassifierTorch.py configs/verysmallmodel.json verysmall_cnn
-
-
+CFG=configs/crossval_v2_rot.json
+for MODEL in resnet18_fullres resnet18_hires resnet18_stem resnet18_fine mobilenet_v3_large regnet_y_800mf convnext_tiny efficientnet_v2_s densenet121 swin_v2_t; do
+    # skip if already trained (resumable)
+    if [ -f "crossvalv2rot_${MODEL}_confusion.json" ]; then
+        echo "=== SKIP ${MODEL} (already done) ==="
+        continue
+    fi
+    echo "=== ${MODEL} start $(date) ==="
+    python3 trainMagicianVisionClassifierTorch.py "$CFG" "$MODEL" || echo "${MODEL} FAILED exit $?"
+    echo "=== ${MODEL} done $(date) ==="
+done
+echo "=== BACKBONE SWEEP COMPLETE $(date) ==="

@@ -385,7 +385,10 @@ class Classifier(pl.LightningModule):
                       gain_jitter=0.0,
                       polar_flip=False,
                       channel_jitter=0.0,
-                      monochrome=False
+                      monochrome=False,
+                      polar_rot=False,
+                      frozen_body_start_epochs=0,
+                      frozen_body_end_epochs=0
                  ):
         super(Classifier, self).__init__()
         #-----------------------------------------
@@ -412,6 +415,13 @@ class Classifier(pl.LightningModule):
         self.gain_jitter = gain_jitter   # exposure-emulating multiplicative jitter
         self.polar_flip  = polar_flip    # physics-consistent mirror augmentation
         self.channel_jitter = channel_jitter  # strobe-light-emulating per-channel jitter
+        self.polar_rot = polar_rot       # physics-consistent +/-90deg rotations (0<->90, 45<->135 swap)
+        # Freeze the pretrained backbone body for the first / last N epochs so a
+        # freshly-initialized stem or head can align before the body co-adapts
+        # (and for a clean head-only fine-tune at the end). 0 = never freeze.
+        self.frozen_body_start_epochs = int(frozen_body_start_epochs)
+        self.frozen_body_end_epochs   = int(frozen_body_end_epochs)
+        self._body_frozen_state = None   # cache to avoid redundant requires_grad churn
         # Polarization ablation: replace the 4 channels with their mean (what a
         # regular monochrome camera would record), replicated x4 so the
         # architecture/capacity stay byte-identical. Train AND val see it.
@@ -437,6 +447,67 @@ class Classifier(pl.LightningModule):
         elif self.type == 'resnet18':
             self.model = resnet18(weights=ResNet18_Weights.DEFAULT)
             self.model.conv1 = nn.Conv2d(self.in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+            self.model.fc = nn.Linear(512, num_classes)
+        elif self.type == 'resnet18_stem':
+            # Deeper stem, same downsampling: more early capacity for the small
+            # (~3x3) polarization micro-features the stock 7x7/2 conv blurs away.
+            self.model = resnet18(weights=ResNet18_Weights.DEFAULT)
+            self.model.conv1 = nn.Sequential(
+                nn.Conv2d(self.in_channels, 32, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            )
+            self.model.fc = nn.Linear(512, num_classes)
+        elif self.type == 'resnet18_fullres':
+            # Maximum feature preservation for ~3px (300um) defects: the stem does
+            # ZERO spatial downsampling. Three 3x3 stride-1 convs (RF 7, ch
+            # 4->32->48->64) extract the feature at full 48x48 resolution and the
+            # resnet body's own maxpool is removed, so layer1 runs at 48x48 and the
+            # first downsample is layer2 (stride 2). Final map 6x6 (vs 1.5x1.5 stock).
+            # ~16x the layer1 FLOPs of stock resnet18 — acceptable: inference cost is
+            # traded back at deploy time via a larger tile step. Best fidelity for recall.
+            self.model = resnet18(weights=ResNet18_Weights.DEFAULT)
+            self.model.conv1 = nn.Sequential(
+                nn.Conv2d(self.in_channels, 32, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+                nn.Conv2d(32, 48, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(48), nn.ReLU(inplace=True),
+                nn.Conv2d(48, 64, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            )
+            self.model.maxpool = nn.Identity()  # NO downsampling before the residual body
+            self.model.fc = nn.Linear(512, num_classes)
+        elif self.type == 'resnet18_hires':
+            # Feature-preserving stem for ~3px (300um) defects. Nyquist: a 3px
+            # feature tolerates <1.5x downsampling BEFORE it is extracted, so the
+            # stem runs THREE 3x3 stride-1 convs at full tile resolution
+            # (receptive field 7, channels 4->32->48->64) to encode the feature
+            # into the channel dimension, THEN a single maxpool downsamples the
+            # now-redundant spatial grid. Contrast: stock/stem strides 2 on the
+            # first conv (3px -> 0.75px at layer1, unrecoverable).
+            self.model = resnet18(weights=ResNet18_Weights.DEFAULT)
+            self.model.conv1 = nn.Sequential(
+                nn.Conv2d(self.in_channels, 32, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+                nn.Conv2d(32, 48, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(48), nn.ReLU(inplace=True),
+                nn.Conv2d(48, 64, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+                nn.MaxPool2d(kernel_size=2, stride=2),   # only downsample: 48->24
+            )
+            self.model.maxpool = nn.Identity()  # resnet's own maxpool folded into the stem above
+            self.model.fc = nn.Linear(512, num_classes)
+        elif self.type == 'resnet18_fine':
+            # Deeper stem AND stride 1: layer1 runs at 24x24 instead of 12x12 for
+            # 48px tiles (only the maxpool downsamples). ~4x compute of resnet18.
+            self.model = resnet18(weights=ResNet18_Weights.DEFAULT)
+            self.model.conv1 = nn.Sequential(
+                nn.Conv2d(self.in_channels, 32, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            )
             self.model.fc = nn.Linear(512, num_classes)
         elif self.type == 'convnext_tiny':
             self.model = convnext_tiny(weights=ConvNeXt_Tiny_Weights.DEFAULT)
@@ -563,7 +634,7 @@ class Classifier(pl.LightningModule):
         build_input_features skips its own dequantization consistently).
         """
         if not self.training or (self.gain_jitter <= 0.0 and not self.polar_flip
-                                 and self.channel_jitter <= 0.0):
+                                 and self.channel_jitter <= 0.0 and not self.polar_rot):
             return x
         if x.dtype == torch.uint8:
             x = x.float() * (1.0 / 255.0)
@@ -574,6 +645,17 @@ class Classifier(pl.LightningModule):
                 sel = torch.rand(x.shape[0], device=x.device) < 0.5
                 if sel.any():
                     x[sel] = x[sel].flip(dim)[:, swap, :, :]
+
+        if self.polar_rot:
+            # +/-90deg rotations complete the dihedral group the mirrors start
+            # (180deg = H+V mirror is already covered). Stokes rotation by 90deg
+            # negates S1 and S2 -> swap I0<->I90 AND I45<->I135. In the H5/model
+            # channel order [p90, p45, p0, p135] that is the permutation [2,3,0,1].
+            rot_swap = [2, 3, 0, 1]
+            for k in (1, 3):  # 90 and 270 degrees, each on a random 1/4 of the batch
+                sel = torch.rand(x.shape[0], device=x.device) < 0.25
+                if sel.any():
+                    x[sel] = torch.rot90(x[sel], k, dims=(-2, -1))[:, rot_swap, :, :]
 
         if self.gain_jitter > 0.0:
             j = float(self.gain_jitter)
@@ -825,6 +907,38 @@ class Classifier(pl.LightningModule):
         self.recall.reset()
         self.precision.reset()
         self.auroc.reset()
+
+    # Parameter-name fragments identifying the NON-body (input adapter / stem /
+    # classifier head) parameters — the ones we replaced and that should keep
+    # training while the pretrained body is frozen. Everything else is "body".
+    _NONBODY_KEYS = ('conv1', 'bn1', 'stem', 'fc', 'classifier', 'head', 'features.0')
+
+    def _is_body_param(self, name):
+        return not any(k in name for k in self._NONBODY_KEYS)
+
+    def _set_body_frozen(self, frozen):
+        if self._body_frozen_state is frozen:
+            return
+        n = 0
+        for name, p in self.model.named_parameters():
+            if self._is_body_param(name):
+                p.requires_grad = not frozen
+                n += 1
+        # also stop BN running-stat drift in the frozen body
+        for name, m in self.model.named_modules():
+            if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)) and self._is_body_param(name + '.weight'):
+                m.eval() if frozen else m.train()
+        self._body_frozen_state = frozen
+        print(f"[FreezeBody] body {'FROZEN' if frozen else 'UNFROZEN'} ({n} body param tensors)")
+
+    def on_train_epoch_start(self):
+        s, e = self.frozen_body_start_epochs, self.frozen_body_end_epochs
+        if s == 0 and e == 0:
+            return
+        ep = self.current_epoch
+        total = getattr(self.trainer, 'max_epochs', None) or (ep + 1)
+        freeze = (ep < s) or (ep >= total - e)
+        self._set_body_frozen(freeze)
 
     def configure_optimizers(self):
         """
@@ -1453,8 +1567,13 @@ if __name__ == "__main__":
     polar_flip  = bool(config_json['hparams'].get('polar_flip', False))
     channel_jitter = float(config_json['hparams'].get('channel_jitter', 0.0))
     monochrome = bool(config_json['hparams'].get('monochrome', False))
+    polar_rot = bool(config_json['hparams'].get('polar_rot', False))
+    frozen_body_start_epochs = int(config_json['hparams'].get('frozen_body_start_epochs', 0))
+    frozen_body_end_epochs   = int(config_json['hparams'].get('frozen_body_end_epochs', 0))
     print("Augmentation: gain_jitter ", gain_jitter, "/ polar_flip ", polar_flip,
-          "/ channel_jitter ", channel_jitter, "/ monochrome ", monochrome)
+          "/ channel_jitter ", channel_jitter, "/ monochrome ", monochrome,
+          "/ polar_rot ", polar_rot)
+    print("Frozen body epochs: start ", frozen_body_start_epochs, "/ end ", frozen_body_end_epochs)
     #-----------------------------------------------------------------
     # Derived polarization input channels (computed on-GPU from the 4 raw ones)
     use_AoLP  = bool(config_json['hparams'].get('AoLP', False))
@@ -1708,6 +1827,9 @@ if __name__ == "__main__":
                             polar_flip=polar_flip,
                             channel_jitter=channel_jitter,
                             monochrome=monochrome,
+                            polar_rot=polar_rot,
+                            frozen_body_start_epochs=frozen_body_start_epochs,
+                            frozen_body_end_epochs=frozen_body_end_epochs,
                             AoLP=use_AoLP,
                             DoLP=use_DoLP,
                             Unpolarized=use_unpol,

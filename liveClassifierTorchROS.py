@@ -300,7 +300,9 @@ class DefectPublisher(Node):
         # Runtime tunables (dynamic via services)
         self._target_fps = 23.0
         self._step_size = 18
-        self._threshold = 0.6  # min softmax confidence for a tile prediction to be kept; tiles below this are reassigned to the low-confidence class
+        self._threshold = 0.90  # min softmax confidence for a tile prediction to be kept; tiles below this are reassigned to the low-confidence class (0.90: FP-reduction bias)
+        self._erosion_kernel = 1   # neighborhood radius for tile voting: (2k+1)^2 tiles
+        self._min_votes = 2        # activated tiles (incl. itself) required in the neighborhood to accept a tile; 0/1 = voting off
         self._majority_voting = True
 
         self._lock = threading.Lock()
@@ -345,6 +347,8 @@ class DefectPublisher(Node):
         self.create_service(SetFloat64, "magician_vision_classifier/set_fps", self._set_fps_cb)
         self.create_service(SetInt64,   "magician_vision_classifier/set_step", self._set_step_cb)
         self.create_service(SetFloat64, "magician_vision_classifier/set_threshold", self._set_threshold_cb)
+        self.create_service(SetFloat64, "magician_vision_classifier/set_erosion_kernel", self._set_erosion_kernel_cb)
+        self.create_service(SetFloat64, "magician_vision_classifier/set_min_votes", self._set_min_votes_cb)
         self.create_service(Trigger,    "magician_vision_classifier/remember_defect", self._remember_defect_cb)
         self.create_service(Trigger,    "magician_vision_classifier/remember_clean", self._remember_clean_cb)
         self.create_service(Trigger,    "magician_vision_classifier/scan_markers", self._scan_markers_cb)
@@ -364,6 +368,8 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/set_fps (SetFloat64)")
         self.get_logger().info("  magician_vision_classifier/set_step (SetInt64)")
         self.get_logger().info("  magician_vision_classifier/set_threshold (SetFloat64)")
+        self.get_logger().info("  magician_vision_classifier/set_erosion_kernel (SetFloat64, int 0..5)")
+        self.get_logger().info("  magician_vision_classifier/set_min_votes (SetFloat64, int; accept tile if >=N activated tiles incl. itself in the (2k+1)^2 neighborhood; 0/1 disables voting)")
         self.get_logger().info("  magician_vision_classifier/remember_defect (Trigger)")
         self.get_logger().info("  magician_vision_classifier/remember_clean (Trigger)")
         self.get_logger().info("  magician_vision_classifier/set_autosave_defect_snapshots (SetBool)")
@@ -450,6 +456,26 @@ class DefectPublisher(Node):
             self._threshold = thr
         response.success = True
         response.message = f"Max probability threshold set to {self._threshold}"
+        self.get_logger().info(response.message)
+        return response
+
+    def _set_erosion_kernel_cb(self, request, response):
+        """Set the voting neighborhood radius k; votes are counted over the (2k+1)^2 tiles around each activation."""
+        k = max(0, min(5, int(request.data)))
+        with self._lock:
+            self._erosion_kernel = k
+        response.success = True
+        response.message = f"Erosion kernel set to {self._erosion_kernel} (neighborhood {(2*self._erosion_kernel+1)**2} tiles)"
+        self.get_logger().info(response.message)
+        return response
+
+    def _set_min_votes_cb(self, request, response):
+        """Require N activated tiles (including the tile itself) in the voting neighborhood for an activation to be accepted. 0/1 disables voting."""
+        v = max(0, int(request.data))
+        with self._lock:
+            self._min_votes = v
+        response.success = True
+        response.message = f"Minimum votes set to {self._min_votes}"
         self.get_logger().info(response.message)
         return response
 
@@ -663,6 +689,16 @@ class DefectPublisher(Node):
         """Thread-safe getter for the max probability threshold."""
         with self._lock:
             return self._threshold
+
+    def get_erosion_kernel(self):
+        """Thread-safe getter for the voting neighborhood radius."""
+        with self._lock:
+            return self._erosion_kernel
+
+    def get_min_votes(self):
+        """Thread-safe getter for the votes required to accept a tile."""
+        with self._lock:
+            return self._min_votes
 
     def get_target_fps(self):
         """Thread-safe getter for the target FPS limit."""
@@ -977,8 +1013,8 @@ def main():
                         heatmap, occupancy, responses = single_classifier.forward(
                             frame,
                             majorityVote=majority_voting,
-                            erosion_kernel=0,
-                            erosion_threshold=0,
+                            erosion_kernel=ros_node.get_erosion_kernel(),
+                            erosion_threshold=ros_node.get_min_votes(),
                         )
 
             # Snapshot responses for _save_current_frame sidecar JSON
