@@ -43,6 +43,10 @@ class HDF5Dataset(Dataset):
         else:
             self.classes = []
 
+        # Optional runtime label remap (old_idx -> new_idx), e.g. class merges.
+        # None = identity. Set via apply_class_merges() so both __getitem__ and
+        # targets stay consistent without rewriting the H5 file.
+        self.label_map = None
         # Keep targets compatible with ImageFolder-like code
         self.targets = [int(x) for x in self.labels[:]]
         self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
@@ -96,7 +100,10 @@ class HDF5Dataset(Dataset):
             x = torch.from_numpy((raw * 255.0).clip(0, 255).astype(np.uint8))
         else:
             x = torch.from_numpy(raw.astype(np.uint8))
-        y = torch.tensor(self.labels[idx], dtype=torch.long)
+        lbl = int(self.labels[idx])
+        if self.label_map is not None:
+            lbl = int(self.label_map[lbl])
+        y = torch.tensor(lbl, dtype=torch.long)
 
         if self.metadata is not None:
             meta = self._decode_metadata(idx)

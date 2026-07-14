@@ -1,0 +1,51 @@
+{
+    "hparams":{
+      "tile_size": 48,
+      "batch_size": 256,
+      "training_epochs": 12,
+      "dropout_rate": 0.25,
+      "seed": 42,
+      "gradient_clip_value": 1.0,
+      "base_channels": 48,
+      "final_dense_layer": 512,
+      "AoLP": false,
+      "DoLP": false,
+      "unpolarized": false
+    },
+    "early_stopping": {
+        "monitor":"loss",
+        "mode": "min",
+        "patience": 16,
+        "min_delta": 0.0005,
+        "verbose": 1,
+        "restore_best_weights": true
+    },
+    "optimizer": {
+        "type": "AdamW",
+        "learning_rate": 5e-4
+    },
+    "dataloader": {
+        "seed": 42,
+        "validation_split": 0.05,
+        "shuffle": false,
+        "label_mode": "categorical",
+        "cacheAllDataToRAM": false,
+        "num_workers": 12,
+        "balanced_sampling": true
+    },
+    "wandb": {
+        "project": "Classifier",
+        "name": "CrossValAltinay",
+        "use_wandb": false
+    },
+    "training_dataset": "/home/ammar/Documents/Programming/magician_datasets/train_nonaltinay/",
+    "validation_dataset": "/home/ammar/Documents/Programming/magician_datasets/val_altinay/",
+    "class_weight": false,
+    "loss": "focal",
+    "penalize_false_clean": 0.25,
+    "accelerator": "auto",
+    "name": "crossvalpfc025",
+    "model": "resnet18",
+    "devices": 1,
+    "selected_classes": [ ]
+  }

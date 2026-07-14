@@ -78,6 +78,38 @@ def filter_dataset_classes(dataset, keep_classes):
     print(f"Filtered dataset to {len(dataset.samples)} samples across {len(keep_classes)} classes.")
 
 
+def merge_dataset_classes(dataset, merges):
+    """Merge classes at runtime WITHOUT rewriting the H5 file. `merges`: dict of
+    {source_class: destination_class}, e.g. {"class_Seal":"class_Welding"}. Source
+    samples are relabeled to the destination; source class dropped, rest renumbered.
+    Apply identically to train + val so their label spaces match. Honored by
+    HDF5Dataset.__getitem__ via label_map, and by sample/target-list datasets."""
+    import numpy as _np
+    if not merges:
+        return dataset
+    old_classes = list(dataset.classes)
+    old_cti = {c: i for i, c in enumerate(old_classes)}
+    merges = {s: d for s, d in merges.items() if s in old_cti and d in old_cti and s != d}
+    if not merges:
+        print("[merge_classes] nothing to merge"); return dataset
+    dropped = set(merges.keys())
+    new_classes = [c for c in old_classes if c not in dropped]
+    new_cti = {c: i for i, c in enumerate(new_classes)}
+    remap = _np.empty(len(old_classes), dtype=_np.int64)
+    for c, oi in old_cti.items():
+        remap[oi] = new_cti[merges.get(c, c)]
+    if hasattr(dataset, "label_map"):
+        dataset.label_map = remap
+    if getattr(dataset, "targets", None) is not None:
+        dataset.targets = [int(remap[int(t)]) for t in dataset.targets]
+    if getattr(dataset, "samples", None) is not None:
+        dataset.samples = [(s, int(remap[int(t)])) for (s, t) in dataset.samples]
+    dataset.classes = new_classes
+    dataset.class_to_idx = new_cti
+    print(f"[merge_classes] {merges} -> {len(new_classes)} classes: {new_classes}")
+    return dataset
+
+
 
 def evaluate_dumped_tiles(model, tiles_dir, classes, device='cuda', batch_size=16):
     """
@@ -206,6 +238,20 @@ def load_hyperparameters(config_file):
         sys.exit(1)
     with open(config_file) as json_file:
         data = json.load(json_file)
+    # Inherit shared defaults from common.json in the same directory, so
+    # cross-cutting settings (e.g. class_merges) live in ONE place instead of
+    # every config file. The specific config deep-overrides the common one.
+    common_path = os.path.join(os.path.dirname(config_file), "common.json")
+    if checkIfFileExists(common_path):
+        with open(common_path) as cf:
+            common = json.load(cf)
+        def _deep_merge(base, override):
+            out = dict(base)
+            for k, v in override.items():
+                out[k] = _deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+            return out
+        data = _deep_merge(common, data)
+        print("Merged shared defaults from", common_path)
     return data
 
 
@@ -266,6 +312,20 @@ class CategoricalFocalLoss(nn.Module):
 
 
 
+class BasicResBlock(nn.Module):
+    """Stride-1 residual block (conv-bn-relu-conv-bn + identity skip, then relu).
+    Same channel count in/out so it can be stacked at a fixed stage width;
+    lets a deeper FROM-SCRATCH net train inside a short epoch budget."""
+    def __init__(self, ch):
+        super().__init__()
+        self.c1 = nn.Conv2d(ch, ch, 3, padding=1, bias=False); self.b1 = nn.BatchNorm2d(ch)
+        self.c2 = nn.Conv2d(ch, ch, 3, padding=1, bias=False); self.b2 = nn.BatchNorm2d(ch)
+    def forward(self, x):
+        y = F.relu(self.b1(self.c1(x)))
+        y = self.b2(self.c2(y))
+        return F.relu(x + y)
+
+
 class CustomCNN(nn.Module):
     """
     A lightweight 4-layer convolutional network with adaptive global pooling
@@ -278,37 +338,63 @@ class CustomCNN(nn.Module):
         → Linear → InstanceNorm1d → ReLU → Dropout
         → Linear → num_classes logits
     """
-    def __init__(self, in_channels=4, intended_tile_size=64, num_classes=4, dropout_rate=0.5, base_channels=32, final_dense_layer=512):
+    def __init__(self, in_channels=4, intended_tile_size=64, num_classes=4, dropout_rate=0.5, base_channels=32, final_dense_layer=512, early_convs=0, channels=None, res_blocks=None):
         super(CustomCNN, self).__init__()
+        if res_blocks is None:
+            res_blocks = [0, 0, 0, 0]
+        res_blocks = [int(x) for x in res_blocks]
 
-        print("Custom CNN (",base_channels,",",final_dense_layer,") constructor")
+        # channels: explicit per-stage width [c1,c2,c3,c4]. Default is the
+        # narrow-early/wide-late convention [base, 2base, 4base, 4base]. A
+        # wide-early/taper-late schedule (e.g. [128,96,64,64]) puts capacity
+        # where pooling has not yet destroyed information (see 3px-feature note).
+        if channels is None:
+            channels = [base_channels, base_channels*2, base_channels*4, base_channels*4]
+        c1, c2, c3, c4 = [int(x) for x in channels]
+        print("Custom CNN (",base_channels,",",final_dense_layer,") constructor / early_convs",
+              early_convs, "/ channels", [c1,c2,c3,c4])
         self.channels  = in_channels
         self.tile_size = intended_tile_size
+        self.early_convs = int(early_convs)
 
-        c1 = base_channels
         self.conv1 = nn.Conv2d(in_channels, c1, kernel_size=3, padding=1)
         self.bn1   = nn.BatchNorm2d(c1)
+        # 3px-feature preservation: extra stride-1 3x3 convs at FULL tile
+        # resolution before the first pool, so a ~3px (300um) defect is encoded
+        # into channels (RF grows 3->5->7...) before any downsampling. From-scratch
+        # net -> no pretrained-body confound, unlike the resnet18 stems.
+        self.early = nn.ModuleList()
+        for _ in range(self.early_convs):
+            self.early.append(nn.Sequential(
+                nn.Conv2d(c1, c1, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(c1), nn.ReLU(inplace=True)))
         self.pool1 = nn.MaxPool2d(2)
 
-        c2 = base_channels * 2
         self.conv2 = nn.Conv2d(c1, c2, kernel_size=3, padding=1)
         self.bn2   = nn.BatchNorm2d(c2)
         self.pool2 = nn.MaxPool2d(2)
 
-        c3 = base_channels * 4
         self.conv3 = nn.Conv2d(c2, c3, kernel_size=3, padding=1)
         self.bn3   = nn.BatchNorm2d(c3)
         self.pool3 = nn.MaxPool2d(2)
 
-        self.conv4 = nn.Conv2d(c3, c3, kernel_size=3, padding=1)
-        self.bn4   = nn.BatchNorm2d(c3)
+        self.conv4 = nn.Conv2d(c3, c4, kernel_size=3, padding=1)
+        self.bn4   = nn.BatchNorm2d(c4)
         self.pool4 = nn.MaxPool2d(2)
+
+        # extra representational depth per stage (residual, at stage width),
+        # inserted after the stage conv and BEFORE its pool
+        stage_ch = [c1, c2, c3, c4]
+        self.res = nn.ModuleList([
+            nn.Sequential(*[BasicResBlock(stage_ch[i]) for _ in range(res_blocks[i])])
+            for i in range(4)])
+        print("Custom CNN res_blocks per stage:", res_blocks)
 
         prefinalLayerChannels     = int(final_dense_layer * 4.5)
         intermediateLayerChannels = int(final_dense_layer * 1.5)   # new FC layer
 
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc1 = nn.Linear(c3, prefinalLayerChannels)
+        self.fc1 = nn.Linear(c4, prefinalLayerChannels)
         self.fc2 = nn.Linear(prefinalLayerChannels, intermediateLayerChannels)  # new layer
         self.bn_dense1 = nn.InstanceNorm1d(prefinalLayerChannels)
         self.bn_dense2 = nn.InstanceNorm1d(intermediateLayerChannels)
@@ -332,10 +418,13 @@ class CustomCNN(nn.Module):
         """
         if x.shape[1:] != (self.channels, self.tile_size, self.tile_size):  # Sanity check on desired input size
           raise ValueError(f"Input size must be {self.channels}x{self.tile_size}x{self.tile_size}, got {x.shape[1:]}")
-        x = self.pool1(F.relu(self.bn1(self.conv1(x))))
-        x = self.pool2(F.relu(self.bn2(self.conv2(x))))
-        x = self.pool3(F.relu(self.bn3(self.conv3(x))))
-        x = self.pool4(F.relu(self.bn4(self.conv4(x))))
+        x = F.relu(self.bn1(self.conv1(x)))
+        for blk in self.early:
+            x = blk(x)                     # extract 3px feature at full res
+        x = self.pool1(self.res[0](x))
+        x = self.pool2(self.res[1](F.relu(self.bn2(self.conv2(x)))))
+        x = self.pool3(self.res[2](F.relu(self.bn3(self.conv3(x)))))
+        x = self.pool4(self.res[3](F.relu(self.bn4(self.conv4(x)))))
         x = self.global_pool(x)
         x = torch.flatten(x, 1)
 
@@ -388,7 +477,10 @@ class Classifier(pl.LightningModule):
                       monochrome=False,
                       polar_rot=False,
                       frozen_body_start_epochs=0,
-                      frozen_body_end_epochs=0
+                      frozen_body_end_epochs=0,
+                      custom_early_convs=0,
+                      custom_channels=None,
+                      custom_res_blocks=None
                  ):
         super(Classifier, self).__init__()
         #-----------------------------------------
@@ -419,6 +511,9 @@ class Classifier(pl.LightningModule):
         # Freeze the pretrained backbone body for the first / last N epochs so a
         # freshly-initialized stem or head can align before the body co-adapts
         # (and for a clean head-only fine-tune at the end). 0 = never freeze.
+        self.custom_early_convs = int(custom_early_convs)
+        self.custom_channels = custom_channels
+        self.custom_res_blocks = custom_res_blocks
         self.frozen_body_start_epochs = int(frozen_body_start_epochs)
         self.frozen_body_end_epochs   = int(frozen_body_end_epochs)
         self._body_frozen_state = None   # cache to avoid redundant requires_grad churn
@@ -573,7 +668,10 @@ class Classifier(pl.LightningModule):
                                    num_classes=num_classes,
                                    dropout_rate=dropout_rate,
                                    base_channels=self.base_channels,
-                                   final_dense_layer=self.final_dense_layer
+                                   final_dense_layer=self.final_dense_layer,
+                                   early_convs=getattr(self, 'custom_early_convs', 0),
+                                   channels=getattr(self, 'custom_channels', None),
+                                   res_blocks=getattr(self, 'custom_res_blocks', None)
                                   )
         else:
             raise ValueError(f"Unsupported model type: {model}. Supported types are 'resnext50', 'resnet18', 'convnext_tiny', 'efficientnet_v2_s', 'swin_v2_t', 'regnet_y_800mf'.")
@@ -1570,6 +1668,9 @@ if __name__ == "__main__":
     polar_rot = bool(config_json['hparams'].get('polar_rot', False))
     frozen_body_start_epochs = int(config_json['hparams'].get('frozen_body_start_epochs', 0))
     frozen_body_end_epochs   = int(config_json['hparams'].get('frozen_body_end_epochs', 0))
+    custom_early_convs       = int(config_json['hparams'].get('custom_early_convs', 0))
+    custom_channels          = config_json['hparams'].get('custom_channels', None)
+    custom_res_blocks        = config_json['hparams'].get('custom_res_blocks', None)
     print("Augmentation: gain_jitter ", gain_jitter, "/ polar_flip ", polar_flip,
           "/ channel_jitter ", channel_jitter, "/ monochrome ", monochrome,
           "/ polar_rot ", polar_rot)
@@ -1620,6 +1721,10 @@ if __name__ == "__main__":
     if ('selected_classes' in  config_json) and (config_json['selected_classes'] is not None) and (len(config_json['selected_classes'])>1) :
        print("Only selecting the classes ",config_json['selected_classes'], "for training")
        filter_dataset_classes(dataset, config_json['selected_classes'])
+
+    # Merge classes (e.g. Seal->Welding) from config; runtime, no H5 rewrite
+    if config_json.get('class_merges'):
+       merge_dataset_classes(dataset, config_json['class_merges'])
 
     # Optionally preload all samples to RAM (slow startup, fast epoch iteration)
     if ('cacheAllDataToRAM' in config_json['dataloader']) and (config_json['dataloader']['cacheAllDataToRAM']):
@@ -1709,6 +1814,9 @@ if __name__ == "__main__":
 
         if ('selected_classes' in config_json) and config_json['selected_classes']:
             filter_dataset_classes(val_dataset, config_json['selected_classes'])
+
+        if config_json.get('class_merges'):
+            merge_dataset_classes(val_dataset, config_json['class_merges'])
 
         if dataset.classes != val_dataset.classes:
             raise ValueError(f"Training/validation class mismatch: {dataset.classes} vs {val_dataset.classes}")
@@ -1830,6 +1938,9 @@ if __name__ == "__main__":
                             polar_rot=polar_rot,
                             frozen_body_start_epochs=frozen_body_start_epochs,
                             frozen_body_end_epochs=frozen_body_end_epochs,
+                            custom_early_convs=custom_early_convs,
+                            custom_channels=custom_channels,
+                            custom_res_blocks=custom_res_blocks,
                             AoLP=use_AoLP,
                             DoLP=use_DoLP,
                             Unpolarized=use_unpol,
