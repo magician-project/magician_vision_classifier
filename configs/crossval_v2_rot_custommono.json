@@ -50,7 +50,7 @@
     "penalize_false_clean": 0.5,
     "accelerator": "auto",
     "name": "crossvalv2rotcustommono",
-    "model": "resnet18",
+    "model": "custom",
     "devices": 1,
     "selected_classes": []
 }

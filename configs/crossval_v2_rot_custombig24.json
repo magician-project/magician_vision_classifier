@@ -2,11 +2,11 @@
     "hparams": {
         "tile_size": 48,
         "batch_size": 504,
-        "training_epochs": 8,
+        "training_epochs": 24,
         "dropout_rate": 0.25,
         "seed": 42,
         "gradient_clip_value": 1.0,
-        "base_channels": 48,
+        "base_channels": 96,
         "final_dense_layer": 512,
         "AoLP": false,
         "DoLP": false,
@@ -14,13 +14,7 @@
         "gain_jitter": 1.0,
         "polar_flip": true,
         "channel_jitter": 0.4,
-        "polar_rot": true,
-        "custom_res_blocks": [
-            0,
-            0,
-            2,
-            2
-        ]
+        "polar_rot": true
     },
     "early_stopping": {
         "monitor": "loss",
@@ -54,7 +48,7 @@
     "loss": "focal",
     "penalize_false_clean": 0.5,
     "accelerator": "auto",
-    "name": "crossvalv2rotcustomdeep",
+    "name": "crossvalv2rotcustombig24",
     "model": "custom",
     "devices": 1,
     "selected_classes": [],

@@ -326,6 +326,42 @@ class BasicResBlock(nn.Module):
         return F.relu(x + y)
 
 
+class WaveletPool(nn.Module):
+    """Lossless 2x downsample: one level of Haar DWT, subbands stacked on channels.
+
+    Drop-in for MaxPool2d(2), except C -> 4C: returns [LL,LH,HL,HH] per input
+    channel. The transform is orthonormal and critically sampled, so it is
+    invertible -- nothing is discarded, whereas MaxPool2d(2) throws away 3 of
+    every 4 samples. The following stage conv then *learns* what to keep instead
+    of the pool deciding blindly.
+
+    Scale budget for the 300um (~3px at demosaic) defect on a 48x48 tile:
+      stage 1 pool 48->24, level-1 detail resolves ~2px structure  <- the defect
+      stage 2 pool 24->12, level-2 detail resolves ~4px            <- borderline
+      stage 3 pool 12->6 (~8px) and stage 4 6->3 (~16px)           <- past it
+    So this only earns its 4x channel cost at the first pool (and marginally the
+    second); leave the later stages on MaxPool. See custom_wavelet_pools.
+
+    Filters are fixed -> zero parameters. Note the decimated DWT is not
+    shift-invariant, but it runs on conv1/early_convs feature maps (RF 7), not
+    raw pixels, so the 3px response is already spatially smeared before decimation.
+    """
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = int(channels)
+        # 2D Haar basis from l=[1,1]/sqrt(2), h=[1,-1]/sqrt(2); each has unit norm.
+        ll = torch.tensor([[ 1.,  1.], [ 1.,  1.]]) * 0.5
+        lh = torch.tensor([[ 1.,  1.], [-1., -1.]]) * 0.5   # horizontal edges
+        hl = torch.tensor([[ 1., -1.], [ 1., -1.]]) * 0.5   # vertical edges
+        hh = torch.tensor([[ 1., -1.], [-1.,  1.]]) * 0.5   # diagonal
+        w = torch.stack([ll, lh, hl, hh]).unsqueeze(1)      # (4,1,2,2)
+        self.register_buffer('filters', w.repeat(self.channels, 1, 1, 1))
+
+    def forward(self, x):
+        # groups=C: input channel g -> output channels 4g..4g+3 = its LL,LH,HL,HH
+        return F.conv2d(x, self.filters, stride=2, groups=self.channels)
+
+
 class CustomCNN(nn.Module):
     """
     A lightweight 4-layer convolutional network with adaptive global pooling
@@ -338,11 +374,14 @@ class CustomCNN(nn.Module):
         → Linear → InstanceNorm1d → ReLU → Dropout
         → Linear → num_classes logits
     """
-    def __init__(self, in_channels=4, intended_tile_size=64, num_classes=4, dropout_rate=0.5, base_channels=32, final_dense_layer=512, early_convs=0, channels=None, res_blocks=None):
+    def __init__(self, in_channels=4, intended_tile_size=64, num_classes=4, dropout_rate=0.5, base_channels=32, final_dense_layer=512, early_convs=0, channels=None, res_blocks=None, wavelet_pools=None):
         super(CustomCNN, self).__init__()
         if res_blocks is None:
             res_blocks = [0, 0, 0, 0]
         res_blocks = [int(x) for x in res_blocks]
+        # 1-based stage indices whose MaxPool2d(2) is replaced by a lossless Haar
+        # WaveletPool (which also widens that stage's output 4x, for free).
+        wavelet_pools = set(int(s) for s in (wavelet_pools or []))
 
         # channels: explicit per-stage width [c1,c2,c3,c4]. Default is the
         # narrow-early/wide-late convention [base, 2base, 4base, 4base]. A
@@ -352,10 +391,16 @@ class CustomCNN(nn.Module):
             channels = [base_channels, base_channels*2, base_channels*4, base_channels*4]
         c1, c2, c3, c4 = [int(x) for x in channels]
         print("Custom CNN (",base_channels,",",final_dense_layer,") constructor / early_convs",
-              early_convs, "/ channels", [c1,c2,c3,c4])
+              early_convs, "/ channels", [c1,c2,c3,c4], "/ wavelet_pools", sorted(wavelet_pools))
         self.channels  = in_channels
         self.tile_size = intended_tile_size
         self.early_convs = int(early_convs)
+
+        def make_pool(stage, ch):
+            """1-based stage -> (pool module, channels it emits)."""
+            if stage in wavelet_pools:
+                return WaveletPool(ch), ch * 4
+            return nn.MaxPool2d(2), ch
 
         self.conv1 = nn.Conv2d(in_channels, c1, kernel_size=3, padding=1)
         self.bn1   = nn.BatchNorm2d(c1)
@@ -368,19 +413,19 @@ class CustomCNN(nn.Module):
             self.early.append(nn.Sequential(
                 nn.Conv2d(c1, c1, kernel_size=3, padding=1, bias=False),
                 nn.BatchNorm2d(c1), nn.ReLU(inplace=True)))
-        self.pool1 = nn.MaxPool2d(2)
+        self.pool1, p1 = make_pool(1, c1)
 
-        self.conv2 = nn.Conv2d(c1, c2, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(p1, c2, kernel_size=3, padding=1)
         self.bn2   = nn.BatchNorm2d(c2)
-        self.pool2 = nn.MaxPool2d(2)
+        self.pool2, p2 = make_pool(2, c2)
 
-        self.conv3 = nn.Conv2d(c2, c3, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(p2, c3, kernel_size=3, padding=1)
         self.bn3   = nn.BatchNorm2d(c3)
-        self.pool3 = nn.MaxPool2d(2)
+        self.pool3, p3 = make_pool(3, c3)
 
-        self.conv4 = nn.Conv2d(c3, c4, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv2d(p3, c4, kernel_size=3, padding=1)
         self.bn4   = nn.BatchNorm2d(c4)
-        self.pool4 = nn.MaxPool2d(2)
+        self.pool4, p4 = make_pool(4, c4)
 
         # extra representational depth per stage (residual, at stage width),
         # inserted after the stage conv and BEFORE its pool
@@ -394,7 +439,7 @@ class CustomCNN(nn.Module):
         intermediateLayerChannels = int(final_dense_layer * 1.5)   # new FC layer
 
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc1 = nn.Linear(c4, prefinalLayerChannels)
+        self.fc1 = nn.Linear(p4, prefinalLayerChannels)
         self.fc2 = nn.Linear(prefinalLayerChannels, intermediateLayerChannels)  # new layer
         self.bn_dense1 = nn.InstanceNorm1d(prefinalLayerChannels)
         self.bn_dense2 = nn.InstanceNorm1d(intermediateLayerChannels)
@@ -480,7 +525,9 @@ class Classifier(pl.LightningModule):
                       frozen_body_end_epochs=0,
                       custom_early_convs=0,
                       custom_channels=None,
-                      custom_res_blocks=None
+                      custom_res_blocks=None,
+                      custom_wavelet_pools=None,
+                      pretrained=True
                  ):
         super(Classifier, self).__init__()
         #-----------------------------------------
@@ -514,6 +561,8 @@ class Classifier(pl.LightningModule):
         self.custom_early_convs = int(custom_early_convs)
         self.custom_channels = custom_channels
         self.custom_res_blocks = custom_res_blocks
+        self.custom_wavelet_pools = custom_wavelet_pools
+        self.pretrained = bool(pretrained)
         self.frozen_body_start_epochs = int(frozen_body_start_epochs)
         self.frozen_body_end_epochs   = int(frozen_body_end_epochs)
         self._body_frozen_state = None   # cache to avoid redundant requires_grad churn
@@ -540,7 +589,7 @@ class Classifier(pl.LightningModule):
             self.model.conv1 = nn.Conv2d(self.in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
             self.model.fc = nn.Linear(2048, num_classes)
         elif self.type == 'resnet18':
-            self.model = resnet18(weights=ResNet18_Weights.DEFAULT)
+            self.model = resnet18(weights=ResNet18_Weights.DEFAULT if getattr(self, 'pretrained', True) else None)
             self.model.conv1 = nn.Conv2d(self.in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
             self.model.fc = nn.Linear(512, num_classes)
         elif self.type == 'resnet18_stem':
@@ -671,7 +720,8 @@ class Classifier(pl.LightningModule):
                                    final_dense_layer=self.final_dense_layer,
                                    early_convs=getattr(self, 'custom_early_convs', 0),
                                    channels=getattr(self, 'custom_channels', None),
-                                   res_blocks=getattr(self, 'custom_res_blocks', None)
+                                   res_blocks=getattr(self, 'custom_res_blocks', None),
+                                   wavelet_pools=getattr(self, 'custom_wavelet_pools', None)
                                   )
         else:
             raise ValueError(f"Unsupported model type: {model}. Supported types are 'resnext50', 'resnet18', 'convnext_tiny', 'efficientnet_v2_s', 'swin_v2_t', 'regnet_y_800mf'.")
@@ -1671,6 +1721,8 @@ if __name__ == "__main__":
     custom_early_convs       = int(config_json['hparams'].get('custom_early_convs', 0))
     custom_channels          = config_json['hparams'].get('custom_channels', None)
     custom_res_blocks        = config_json['hparams'].get('custom_res_blocks', None)
+    custom_wavelet_pools     = config_json['hparams'].get('custom_wavelet_pools', None)
+    pretrained_backbone      = bool(config_json['hparams'].get('pretrained', True))
     print("Augmentation: gain_jitter ", gain_jitter, "/ polar_flip ", polar_flip,
           "/ channel_jitter ", channel_jitter, "/ monochrome ", monochrome,
           "/ polar_rot ", polar_rot)
@@ -1941,6 +1993,8 @@ if __name__ == "__main__":
                             custom_early_convs=custom_early_convs,
                             custom_channels=custom_channels,
                             custom_res_blocks=custom_res_blocks,
+                            custom_wavelet_pools=custom_wavelet_pools,
+                            pretrained=pretrained_backbone,
                             AoLP=use_AoLP,
                             DoLP=use_DoLP,
                             Unpolarized=use_unpol,
