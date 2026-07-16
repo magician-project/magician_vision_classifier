@@ -133,6 +133,10 @@ def _instantiate_classifier(config_json: dict, class_names: list[str]) -> Classi
         clean_class         = get_clean_class_id(class_names),
         noise_std           = config_json["hparams"].get("noise_std", 0.0),
         noise_clip          = config_json["hparams"].get("noise_clip", None),
+        custom_early_convs  = int(config_json["hparams"].get("custom_early_convs", 0)),
+        custom_channels     = config_json["hparams"].get("custom_channels", None),
+        custom_res_blocks   = config_json["hparams"].get("custom_res_blocks", None),
+        custom_wavelet_pools= config_json["hparams"].get("custom_wavelet_pools", None),
     )
 
 
