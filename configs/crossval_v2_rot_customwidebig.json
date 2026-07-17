@@ -2,7 +2,7 @@
     "hparams": {
         "tile_size": 48,
         "batch_size": 504,
-        "training_epochs": 24,
+        "training_epochs": 8,
         "dropout_rate": 0.25,
         "seed": 42,
         "gradient_clip_value": 1.0,

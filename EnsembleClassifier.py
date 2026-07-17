@@ -11,7 +11,11 @@ from liveClassifierTorch import (
     classify_tiles,
     generate_heatmap,
     runSingle,
-    log_performance
+    log_performance,
+    gate_tiles,
+    GATE_DEFECT_MASS,
+    GATE_MAX_PROB,
+    GATE_OFF
 )
 # -------------------------------------------------------------------------------------
 def dump_predictions_to_file(preds, filename, header=None):
@@ -91,12 +95,18 @@ def classify_selected_tiles(name,
                             tile_size=64,
                             step=0,
                             chunks=0,
-                            thresholdMaxProbability=0.50,
+                            thresholdMaxProbability=0.655,
                             forceLowMaxProbToThisClass=None,
+                            gateMode=GATE_DEFECT_MASS,
+                            assignBestDefectClass=True,
                             return_torch=False):
     """
     Classify only the tiles in npTiles (already selected subset).
 
+    thresholdMaxProbability : cut on the gate's score — see gate_tiles(). Under
+                  the default gateMode this thresholds 1 - P(clean), NOT the max
+                  probability, so it is not interchangeable with the old 0.50.
+    gateMode, assignBestDefectClass : see gate_tiles().
     return_torch : if True, return GPU tensors directly (avoids GPU→CPU copy
                   when the caller will immediately wrap back to tensor).
     """
@@ -114,11 +124,14 @@ def classify_selected_tiles(name,
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             preds = model(npTiles)
         probs = torch.nn.functional.softmax(preds.float(), dim=1)
+        # max_probs stays the reported per-tile confidence; the gate decides the class.
         max_probs, predictions = torch.max(probs, dim=1)
         if forceLowMaxProbToThisClass is not None and thresholdMaxProbability > 0.0:
-            mask = max_probs < thresholdMaxProbability
-            low_activations += mask.sum().item()
-            predictions[mask] = forceLowMaxProbToThisClass
+            predictions, forced = gate_tiles(probs, forceLowMaxProbToThisClass,
+                                             thresholdMaxProbability,
+                                             gateMode=gateMode,
+                                             assignBestDefectClass=assignBestDefectClass)
+            low_activations += forced
     else:
         preds_list = []
         for chunk in npTiles.chunk(chunks):
@@ -128,9 +141,11 @@ def classify_selected_tiles(name,
         probs = torch.nn.functional.softmax(preds.float(), dim=1)
         max_probs, predictions = torch.max(probs, dim=1)
         if forceLowMaxProbToThisClass is not None and thresholdMaxProbability > 0.0:
-            mask = max_probs < thresholdMaxProbability
-            low_activations += mask.sum().item()
-            predictions[mask] = forceLowMaxProbToThisClass
+            predictions, forced = gate_tiles(probs, forceLowMaxProbToThisClass,
+                                             thresholdMaxProbability,
+                                             gateMode=gateMode,
+                                             assignBestDefectClass=assignBestDefectClass)
+            low_activations += forced
 
     print(f"Low-confidence tiles reassigned: {low_activations}")
     print(f"classify_selected_tiles ({name}) done in {time.time() - start:.2f}s, on {len(predictions)} selected tiles")
@@ -261,7 +276,16 @@ class EnsembleClassifierPnm:
         """
         assert len(model_cfg_list) > 0, "You must provide at least one ensemble model."
 
+        # Tile decision gate -- see gate_tiles(). Threshold 0.0 leaves the gate
+        # OFF (plain argmax), the historical behaviour here. Plain attributes so
+        # a caller can set them after construction -- wxAnnotator drives them
+        # from its Classifier tab via _applyGateSettings():
+        #     ens.gateMode = GATE_DEFECT_MASS; ens.maxProbabilityThreshold = 0.57
+        # Thresholds are per-model and per-mode -- take them from the trainer's
+        # sweep, never reuse a max_prob threshold under defect_mass.
         self.maxProbabilityThreshold = 0.0
+        self.gateMode                = GATE_DEFECT_MASS
+        self.assignBestDefectClass   = True
         self.tile_size = tile_size
         self.step = step
         self.hz = 0.0
@@ -470,6 +494,8 @@ class EnsembleClassifierPnm:
                                                           majorityVote=True,
                                                           thresholdMaxProbability=self.maxProbabilityThreshold,
                                                           forceLowMaxProbToThisClass=self.firstCleanClassID,
+                                                          gateMode=self.gateMode,
+                                                          assignBestDefectClass=self.assignBestDefectClass,
                                                           return_tiles=True,
                                                          )
             base_preds       = torch.tensor(base_preds_np, device=self.device, dtype=torch.int32)
@@ -483,6 +509,8 @@ class EnsembleClassifierPnm:
                                                           majorityVote=False,
                                                           thresholdMaxProbability=self.maxProbabilityThreshold,
                                                           forceLowMaxProbToThisClass=self.firstCleanClassID,
+                                                          gateMode=self.gateMode,
+                                                          assignBestDefectClass=self.assignBestDefectClass,
                                                           return_torch=True,
                                                           return_tiles=True,
                                                          )
@@ -546,6 +574,8 @@ class EnsembleClassifierPnm:
                                                      majorityVote=majorityVote,
                                                      thresholdMaxProbability=self.maxProbabilityThreshold,
                                                      forceLowMaxProbToThisClass=self.cleanClassID,
+                                                     gateMode=self.gateMode,
+                                                     assignBestDefectClass=self.assignBestDefectClass,
                                                      return_torch=not majorityVote,
                                                     )
                        if majorityVote:  # numpy path — wrap back
@@ -561,6 +591,8 @@ class EnsembleClassifierPnm:
                                                               step=self.step,
                                                               thresholdMaxProbability=self.maxProbabilityThreshold,
                                                               forceLowMaxProbToThisClass=self.cleanClassID,
+                                                              gateMode=self.gateMode,
+                                                              assignBestDefectClass=self.assignBestDefectClass,
                                                               return_torch=True,
                                                              )
                     self.model_perf[clf.name] = 1.0 / (time.time() - _t0 + 1e-9)

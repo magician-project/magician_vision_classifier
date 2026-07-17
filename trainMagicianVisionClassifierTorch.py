@@ -2075,7 +2075,8 @@ if __name__ == "__main__":
         print("Generating new confusion matrix data..")
         y_true = []
         y_pred = []
-        y_maxp = []   # max softmax probability, for the confidence-threshold sweep
+        y_maxp = []   # max softmax probability      -> legacy max_prob gate sweep
+        y_pcln = []   # P(clean) per tile            -> defect_mass gate sweep
 
         # torch.no_grad() prevents graph construction for every batch (saves memory).
         with torch.no_grad():
@@ -2086,6 +2087,7 @@ if __name__ == "__main__":
                 y_true.extend(y.cpu().numpy())
                 y_pred.extend(pr.cpu().numpy())
                 y_maxp.extend(mp.cpu().numpy())
+                y_pcln.extend(probs[:, cleanClassID].cpu().numpy())
 
         num_classes = len(dataset.classes)
         confusion_matrix = np.zeros((num_classes, num_classes), dtype=int)
@@ -2111,43 +2113,83 @@ if __name__ == "__main__":
             [sys.executable, "plotTool.py", f"{model_name}_confusion.json"], check=False
         )
 
-        # Confidence-threshold sweep: live inference forces predictions with
-        # max-prob < threshold to clean, so sweep that gate over the validation
-        # set to produce the operating curve and the model's best configuration.
+        # Threshold sweep -> operating curve + the gate the live path will use.
+        # Swept for BOTH gates (liveClassifierTorch.gate_tiles implements them):
+        #   "defect_mass" : score = 1 - P(clean), the total mass on ANY defect
+        #                   class. Recommended. Flags a tile the model is sure is
+        #                   a defect even when it cannot say which one.
+        #   "max_prob"    : score = max_c P(c), and the tile must not argmax to
+        #                   clean. Legacy, kept so older runs stay comparable. It
+        #                   discards a 0.40 Welding / 0.40 Seal / 0.20 clean tile
+        #                   as clean despite it being 80% likely a defect.
+        # Thresholds are NOT comparable between the two modes or across models,
+        # so we write the chosen one into config_json["gate"] and the live path
+        # reads it from there instead of hardcoding a number.
         print("Generating threshold sweep / operating curve")
-        yt = np.array(y_true); yp = np.array(y_pred); mp = np.array(y_maxp)
+        yt = np.array(y_true); yp = np.array(y_pred)
+        mp = np.array(y_maxp); pcl = np.array(y_pcln)
         isdef = yt != cleanClassID
         n_def = max(1, int(isdef.sum())); n_cln = max(1, int((~isdef).sum()))
-        sweep = []
-        for t in np.arange(0.0, 0.996, 0.005):
-            pr = np.where(mp < t, cleanClassID, yp)
-            flagged = pr != cleanClassID
-            sweep.append({
-                "threshold":   round(float(t), 3),
-                "detected":    float((flagged &  isdef).sum() / n_def),
-                "false_alarm": float((flagged & ~isdef).sum() / n_cln),
-            })
-        balance  = [s["detected"] - s["false_alarm"] for s in sweep]          # Youden J
-        kpi_cost = [2*(1-s["detected"]) + s["false_alarm"] for s in sweep]    # misses weigh 2x
-        best_bal = sweep[int(np.argmax(balance))]
-        best_kpi = sweep[int(np.argmin(kpi_cost))]
-        # Deployment pick: tile rates ignore prevalence (a frame is ~99% clean,
-        # so 1% FA = dozens of false crosses). Highest detection subject to a
-        # false-alarm budget of 0.5% of clean tiles (~30 crosses/frame @ step 14).
-        in_budget = [s for s in sweep if s["false_alarm"] <= 0.005]
-        best_dep  = max(in_budget, key=lambda s: s["detected"]) if in_budget else sweep[-1]
-        print(f"Best balanced threshold: {best_bal['threshold']:.3f} "
-              f"(detected {best_bal['detected']:.1%}, false-alarm {best_bal['false_alarm']:.1%})")
-        print(f"Best KPI (2xmiss+FA) threshold: {best_kpi['threshold']:.3f} "
-              f"(detected {best_kpi['detected']:.1%}, false-alarm {best_kpi['false_alarm']:.1%})")
-        print(f"Best deployment threshold (FA<=0.5% of clean tiles): {best_dep['threshold']:.3f} "
-              f"(detected {best_dep['detected']:.1%}, false-alarm {best_dep['false_alarm']:.2%})")
-        config_json["best_threshold_balanced"]   = best_bal
-        config_json["best_threshold_kpi"]        = best_kpi
-        config_json["best_threshold_deployment"] = best_dep
+
+        def run_sweep(score, also_require=None):
+            out = []
+            for t in np.arange(0.0, 0.996, 0.005):
+                flagged = score >= t
+                if also_require is not None:
+                    flagged = flagged & also_require
+                out.append({
+                    "threshold":   round(float(t), 3),
+                    "detected":    float((flagged &  isdef).sum() / n_def),
+                    "false_alarm": float((flagged & ~isdef).sum() / n_cln),
+                })
+            return out
+
+        def pick(sweep):
+            balance  = [s["detected"] - s["false_alarm"] for s in sweep]        # Youden J
+            kpi_cost = [2*(1-s["detected"]) + s["false_alarm"] for s in sweep]  # misses weigh 2x
+            # Deployment pick: tile rates ignore prevalence (a frame is ~99% clean,
+            # so 1% FA = dozens of false crosses). Highest detection subject to a
+            # false-alarm budget of 0.5% of clean tiles (~30 crosses/frame @ step 14).
+            in_budget = [s for s in sweep if s["false_alarm"] <= 0.005]
+            return (sweep[int(np.argmax(balance))],
+                    sweep[int(np.argmin(kpi_cost))],
+                    max(in_budget, key=lambda s: s["detected"]) if in_budget else sweep[-1])
+
+        sweeps = {
+            "max_prob":    run_sweep(mp, also_require=(yp != cleanClassID)),
+            "defect_mass": run_sweep(1.0 - pcl),
+        }
+        picks = {k: pick(v) for k, v in sweeps.items()}
+        for mode, (b, k, d) in picks.items():
+            print(f"[{mode}] balanced t={b['threshold']:.3f} "
+                  f"(detected {b['detected']:.1%}, FA {b['false_alarm']:.1%}) | "
+                  f"KPI t={k['threshold']:.3f} (detected {k['detected']:.1%}, FA {k['false_alarm']:.1%}) | "
+                  f"deploy t={d['threshold']:.3f} (detected {d['detected']:.1%}, FA {d['false_alarm']:.2%})")
+
+        # Which gate ships. Override per run with "gate_mode" in the config.
+        gate_mode = config_json.get("gate_mode", "defect_mass")
+        best_bal, best_kpi, best_dep = picks[gate_mode]
+        # Legacy keys keep their original max_prob meaning so old configs/readers
+        # do not silently change semantics.
+        lb, lk, ld = picks["max_prob"]
+        config_json["best_threshold_balanced"]   = lb
+        config_json["best_threshold_kpi"]        = lk
+        config_json["best_threshold_deployment"] = ld
+        config_json["gate"] = {
+            "mode": gate_mode,
+            "threshold": best_kpi["threshold"],      # KPI-optimal: misses weigh 2x
+            "assign_best_defect_class": True,
+            "calibrated_on": config_json.get("validation_dataset", ""),
+            "detected": best_kpi["detected"],
+            "false_alarm": best_kpi["false_alarm"],
+            "alternatives": {"balanced": best_bal, "deployment": best_dep},
+        }
+        print(f"config['gate'] -> mode={gate_mode} threshold={best_kpi['threshold']:.3f} "
+              f"(detected {best_kpi['detected']:.1%}, FA {best_kpi['false_alarm']:.1%})")
         curve_json = {
             "title": f"{model_name} / Tile Size = {tile_size} / Epochs = {epochs}",
-            "sweep": sweep,
+            "sweep": sweeps[gate_mode],
+            "sweeps": sweeps,
             "best_balanced": best_bal,
             "best_kpi": best_kpi,
         }

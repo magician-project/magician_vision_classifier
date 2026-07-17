@@ -845,16 +845,103 @@ def draw_heatmap(rgba_image, responses, class_id_to_color, size=10):
 #----------------------------------------------------------
 #----------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tile decision gate: how a tile becomes "clean" vs "some defect".
+#
+# GATE_DEFECT_MASS ("defect_mass") -- default, recommended.
+#     score = 1 - P(clean): the total probability mass on *any* defect class.
+#     Flags a tile when the model is collectively sure it is a defect, even when
+#     it cannot decide *which* defect. This is the detector our binding KPI
+#     (skipped defects) actually asks for.
+#
+# GATE_MAX_PROB ("max_prob") -- legacy, reproduces pre-2026-07-17 behaviour.
+#     score = max_c P(c), and the tile must also not argmax to clean.
+#     Known bug: a tile at 0.40 Welding / 0.40 Seal / 0.20 clean scores 0.40 and
+#     is discarded as clean though it is 80% likely a defect. Welding/Seal
+#     confusion is common enough that this drops real defects in bulk. Measured
+#     on val_altinay/customwide at a MATCHED 27.0% false-alarm rate:
+#     miss 27.1% (max_prob) vs 18.9% (defect_mass), every class better.
+#
+# GATE_OFF ("off") -- no gate; plain argmax over all classes (clean wins only if
+#     it is the argmax). Same as the old threshold<=0 path. FA 37.7 / miss 13.1
+#     on val_altinay/customwide, so the gate is not automatically an improvement:
+#     max_prob@0.50 is *worse* than no gate at all.
+# ---------------------------------------------------------------------------
+GATE_DEFECT_MASS = "defect_mass"
+GATE_MAX_PROB    = "max_prob"
+GATE_OFF         = "off"
+
+
+def gate_tiles(probs, cleanClassID, threshold,
+               gateMode=GATE_DEFECT_MASS,
+               assignBestDefectClass=True):
+    """Turn per-class probabilities into class IDs, forcing weak tiles to clean.
+
+    probs                 : (N, K) softmax probabilities.
+    cleanClassID          : index of the clean class. Must genuinely be clean --
+                            every mode below reasons about "defect vs clean".
+    threshold             : cut on the mode's score. NOT portable across modes or
+                            models: defect_mass needs ~0.655 to reproduce the
+                            false-alarm rate max_prob gave at 0.50 (customwide);
+                            the same FA needs 0.544 for mobilenet_pfc05. Always
+                            re-derive per model from the trainer's threshold
+                            sweep. threshold <= 0 disables the gate.
+    gateMode              : GATE_DEFECT_MASS / GATE_MAX_PROB / GATE_OFF, above.
+    assignBestDefectClass : above the gate, label the tile with its best *defect*
+                            class instead of the global argmax. Matters because
+                            the argmax can still be clean when mass is spread
+                            thinly across defects (0.8% of gate-passing tiles);
+                            without this those tiles pass the gate and then get
+                            labelled clean anyway, which is incoherent. Ignored
+                            by GATE_MAX_PROB (which is defined on the argmax).
+
+    Returns (predictions, number_of_tiles_forced_to_clean).
+    """
+    if gateMode == GATE_OFF or threshold <= 0.0 or cleanClassID is None:
+        return probs.argmax(dim=1), 0
+
+    if gateMode == GATE_MAX_PROB:
+        max_probs, predictions = torch.max(probs, dim=1)
+        mask = max_probs < threshold
+        predictions = predictions.clone()
+        predictions[mask] = cleanClassID
+        return predictions, int(mask.sum().item())
+
+    if gateMode != GATE_DEFECT_MASS:
+        raise ValueError(f"unknown gateMode {gateMode!r}; expected one of "
+                         f"{GATE_DEFECT_MASS!r}, {GATE_MAX_PROB!r}, {GATE_OFF!r}")
+
+    if assignBestDefectClass:
+        defect_probs = probs.clone()
+        defect_probs[:, cleanClassID] = -1.0
+        predictions = defect_probs.argmax(dim=1)
+    else:
+        predictions = probs.argmax(dim=1).clone()
+    mask = (1.0 - probs[:, cleanClassID]) < threshold
+    predictions[mask] = cleanClassID
+    return predictions, int(mask.sum().item())
+
+
 @torch.no_grad()
 def classify_tiles(model, rgba_image, tile_size=64, step=0,
                    chunks=0, majorityVote=True,
-                   thresholdMaxProbability=0.50,
+                   thresholdMaxProbability=0.655,
                    forceLowMaxProbToThisClass=None,
+                   gateMode=GATE_DEFECT_MASS,
+                   assignBestDefectClass=True,
                    return_torch=False,
                    return_tiles=False):
     """
     Classify tiles efficiently, returning integer class IDs.
 
+    thresholdMaxProbability : cut on the gate's score — see gate_tiles(). The name
+                  is historical; under the default gateMode it thresholds
+                  1 - P(clean), NOT the max probability, so 0.50 here is not the
+                  0.50 of the old gate (it would raise false alarms 27% -> 50%).
+                  Default 0.655 reproduces the old 27.0% false-alarm rate on
+                  customwide while cutting miss 27.1% -> 18.9%.
+    forceLowMaxProbToThisClass : the clean class ID; None disables the gate.
+    gateMode, assignBestDefectClass : see gate_tiles().
     return_torch : if True, return GPU tensors instead of numpy arrays (avoids
                   GPU→CPU copy when the caller immediately wraps back to tensor).
     return_tiles : if True, return the tile tensor (N, C, tile_size, tile_size) as
@@ -878,11 +965,14 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             preds = model(npTiles)
         probs = torch.nn.functional.softmax(preds.float(), dim=1)
+        # max_probs stays the reported per-tile confidence; the gate decides the class.
         max_probs, predictions = torch.max(probs, dim=1)
         if forceLowMaxProbToThisClass is not None and thresholdMaxProbability > 0.0:
-            mask = max_probs < thresholdMaxProbability
-            low_activations += mask.sum().item()
-            predictions[mask] = forceLowMaxProbToThisClass
+            predictions, forced = gate_tiles(probs, forceLowMaxProbToThisClass,
+                                             thresholdMaxProbability,
+                                             gateMode=gateMode,
+                                             assignBestDefectClass=assignBestDefectClass)
+            low_activations += forced
     else:
         preds_list = []
         for chunk in npTiles.chunk(chunks):
@@ -892,9 +982,11 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
         probs = torch.nn.functional.softmax(preds.float(), dim=1)
         max_probs, predictions = torch.max(probs, dim=1)
         if forceLowMaxProbToThisClass is not None and thresholdMaxProbability > 0.0:
-            mask = max_probs < thresholdMaxProbability
-            low_activations += mask.sum().item()
-            predictions[mask] = forceLowMaxProbToThisClass
+            predictions, forced = gate_tiles(probs, forceLowMaxProbToThisClass,
+                                             thresholdMaxProbability,
+                                             gateMode=gateMode,
+                                             assignBestDefectClass=assignBestDefectClass)
+            low_activations += forced
 
     print(f"Low-confidence tiles reassigned: {low_activations}")
 
@@ -936,8 +1028,10 @@ def runSingle(image,
               step,
               dumpTiles=False,
               majorityVote=True,
-              maxProbabilityThreshold=0.50,
-              erosion_kernel=0, 
+              maxProbabilityThreshold=0.655,
+              gateMode=GATE_DEFECT_MASS,
+              assignBestDefectClass=True,
+              erosion_kernel=0,
               erosion_threshold=0,
               name="Model",
               log=True,
@@ -968,6 +1062,8 @@ def runSingle(image,
                                               majorityVote=majorityVote,
                                               thresholdMaxProbability=maxProbabilityThreshold,
                                               forceLowMaxProbToThisClass=cleanClassID,
+                                              gateMode=gateMode,
+                                              assignBestDefectClass=assignBestDefectClass,
                                              )
     print(bcolors.OKGREEN)
     elapsed = time.time() - start + 1e-4
@@ -1093,7 +1189,23 @@ class ClassifierPnm:
         self.step = step
         self.name = os.path.basename(model_path)
         self.model_path = model_path
-        self.maxProbabilityThreshold = 0.0
+        # Tile decision gate -- see gate_tiles(). Driven by an optional "gate"
+        # block in the model's own .json so each model ships the operating point
+        # it was calibrated at (thresholds are NOT portable between models):
+        #     "gate": {"mode": "defect_mass", "threshold": 0.57,
+        #              "assign_best_defect_class": true}
+        # wxAnnotator overrides these per-forward from its Classifier tab.
+        # Default threshold 0.0 leaves the gate OFF, which is this path's
+        # historical behaviour (plain argmax). Do not "enable" it blindly: on
+        # val_altinay/customwide, argmax gives FA 37.7 / miss 13.1, and turning
+        # a gate on at 0.655 trades that to FA 27.0 / miss 18.9 -- lower false
+        # alarms but MORE skipped defects, which is the wrong way on our KPI.
+        # The win here is mode, not gating: defect_mass at 0.570 holds FA at
+        # 37.7 and cuts miss to 11.9. Re-derive per model from the sweep.
+        gate_cfg = self.cfg.get("gate", {}) if isinstance(getattr(self, "cfg", None), dict) else {}
+        self.gateMode                = gate_cfg.get("mode", GATE_DEFECT_MASS)
+        self.maxProbabilityThreshold = float(gate_cfg.get("threshold", 0.0))
+        self.assignBestDefectClass   = bool(gate_cfg.get("assign_best_defect_class", True))
         self.hz = 0.0
         #--------------------------------------------------------------
         print("Classes : ",self.tile_classes)
@@ -1172,6 +1284,10 @@ class ClassifierPnm:
                        RangePolarization=bool(hp.get('RangePolarization', False)),
                        monochrome=bool(hp.get('monochrome', False)),
                       )
+        # CustomCNN architecture knobs must match training too, for the same reason
+        # as the derived channels above: without them a wide-early model like
+        # allclass_customwide ([128,96,64,64]) is rebuilt with the default channel
+        # ladder and load_state_dict dies on conv1 (128 vs 48).
         model = Classifier(
                            model=self.cfg['model'],
                            lr=0.1,
@@ -1179,6 +1295,10 @@ class ClassifierPnm:
                            tile_size=self.cfg['hparams']['tile_size'],
                            base_channels = self.base_channels,
                            final_dense_layer = self.final_dense_layer,
+                           custom_early_convs   = int(hp.get('custom_early_convs', 0)),
+                           custom_channels      = hp.get('custom_channels', None),
+                           custom_res_blocks    = hp.get('custom_res_blocks', None),
+                           custom_wavelet_pools = hp.get('custom_wavelet_pools', None),
                            **derived
                           )
 
@@ -1285,7 +1405,9 @@ class ClassifierPnm:
                                                   self.step,
                                                   majorityVote=majorityVote,
                                                   maxProbabilityThreshold=self.maxProbabilityThreshold,
-                                                  erosion_kernel=erosion_kernel, 
+                                                  gateMode=self.gateMode,
+                                                  assignBestDefectClass=self.assignBestDefectClass,
+                                                  erosion_kernel=erosion_kernel,
                                                   erosion_threshold=erosion_threshold,
                                                   name=self.name)
 
