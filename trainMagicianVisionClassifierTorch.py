@@ -743,6 +743,9 @@ class Classifier(pl.LightningModule):
         self.recall    = Recall(task='MULTICLASS',    num_classes=num_classes)
         self.precision = Precision(task='MULTICLASS', num_classes=num_classes)
         self.auroc     = AUROC(task='MULTICLASS',     num_classes=num_classes)
+        # Binary defect-vs-clean detector AUROC — the metric the KPI cares about,
+        # and the one ModelCheckpoint should select on (see validation_step).
+        self.detect_auroc = AUROC(task='BINARY')
 
     def add_input_noise(self, x):
         """
@@ -980,6 +983,20 @@ class Classifier(pl.LightningModule):
         self.precision.update(y_hat, y)
         self.auroc.update(y_hat, y)
 
+        # Detection AUROC: is this tile ANY defect, vs clean -- the question the
+        # KPI (skipped defects) actually asks. val_loss does NOT answer it:
+        # focal+penalize_false_clean scores 6-way class identity and calibration,
+        # and measured over epochs it is UNCORRELATED with detection
+        # (pearson(val_loss, detect AUROC) = -0.09 over the 24-epoch customwide
+        # run), so monitoring val_loss selects a checkpoint at random w.r.t. what
+        # we care about. Same for val_auroc above: that is macro one-vs-rest over
+        # all classes, not defect-vs-clean. Score by 1 - P(clean), matching
+        # liveClassifierTorch.gate_tiles' defect_mass gate.
+        if self.clean_class is not None:
+            probs = F.softmax(y_hat, dim=1)
+            self.detect_auroc.update(1.0 - probs[:, self.clean_class],
+                                     (y != self.clean_class).long())
+
         return loss
 
     def calculate_stokes(self, x):
@@ -1051,6 +1068,10 @@ class Classifier(pl.LightningModule):
         self.log('val_recall',    self.recall.compute(),    prog_bar=True, sync_dist=True)
         self.log('val_precision', self.precision.compute(), prog_bar=True, sync_dist=True)
         self.log('val_auroc',     self.auroc.compute(),     prog_bar=True, sync_dist=True)
+        if self.clean_class is not None:
+            # The checkpoint selector should monitor THIS (mode='max'), not val_loss.
+            self.log('val_detect_auroc', self.detect_auroc.compute(), prog_bar=True, sync_dist=True)
+            self.detect_auroc.reset()
         self.accuracy.reset()
         self.recall.reset()
         self.precision.reset()
@@ -2016,8 +2037,34 @@ if __name__ == "__main__":
 
     # Keep the epoch with the best validation loss; cross-site val metrics drift
     # non-monotonically, so last-epoch weights are often not the best weights.
+    #
+    # save_top_k=1 (the default) DELETES every other epoch, which makes the
+    # "do more epochs help?" question unanswerable: val_loss is a SOURCE-domain
+    # quantity and bottoms out around epoch 0-1, so it selects an early epoch and
+    # discards the later ones -- even if cross-site detection (our actual KPI)
+    # keeps improving after val_loss stops. Set "checkpoint_save_top_k": -1 in the
+    # config to keep every epoch, then rank them by AUROC of 1-P(clean) on the
+    # held-out site instead of by val_loss. "checkpoint_dir" redirects the files
+    # (they are ~30MB each and /home is nearly full).
     from pytorch_lightning.callbacks import ModelCheckpoint
-    best_ckpt = ModelCheckpoint(monitor='val_loss', mode='min', save_top_k=1)
+    ckpt_top_k  = int(config_json.get("checkpoint_save_top_k", 1))
+    ckpt_dir    = config_json.get("checkpoint_dir", None)
+    # Default to selecting on DETECTION AUROC, not val_loss. Measured over the
+    # 24-epoch customwide run, pearson(val_loss, detect AUROC) = -0.09 and
+    # pearson(val_loss, macro) = -0.00 => val_loss ranks epochs at random w.r.t.
+    # the KPI, because focal+pfc scores 6-way class identity while the KPI asks
+    # "defect or clean". Set "checkpoint_monitor": "val_loss" to get the old
+    # behaviour back.
+    ckpt_monitor = config_json.get("checkpoint_monitor", "val_detect_auroc")
+    ckpt_mode    = config_json.get("checkpoint_mode",
+                                   "min" if ckpt_monitor.endswith("loss") else "max")
+    best_ckpt = ModelCheckpoint(monitor=ckpt_monitor, mode=ckpt_mode,
+                                save_top_k=ckpt_top_k,
+                                dirpath=ckpt_dir,
+                                filename='{epoch}-{step}-{val_loss:.4f}-{val_detect_auroc:.4f}')
+    print(f"Checkpoints: monitor={ckpt_monitor} mode={ckpt_mode} save_top_k={ckpt_top_k} "
+          f"({'ALL epochs kept' if ckpt_top_k == -1 else 'best epoch(s) only'}) "
+          f"dir={ckpt_dir or '<logger default>'}")
 
     trainer = pl.Trainer(
                          max_epochs=epochs,
@@ -2037,7 +2084,7 @@ if __name__ == "__main__":
     # Restore the best-val_loss epoch before saving/validating/confusion matrix
     if best_ckpt.best_model_path:
         print("Restoring best checkpoint:", best_ckpt.best_model_path,
-              "(val_loss %s)" % str(best_ckpt.best_model_score))
+              "(%s = %s)" % (ckpt_monitor, str(best_ckpt.best_model_score)))
         best_state = torch.load(best_ckpt.best_model_path, weights_only=False)
         classifier.load_state_dict(best_state['state_dict'])
 

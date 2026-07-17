@@ -114,6 +114,17 @@ def _count_parameters(model: torch.nn.Module) -> int:
 
 def _instantiate_classifier(config_json: dict, class_names: list[str]) -> Classifier:
     """Build a Classifier from a JSON config dict, ready for inference."""
+    # The derived-channel flags live in hparams, NOT at the top level -- reading
+    # them from the top level silently yields False and builds the wrong conv1,
+    # so every DoLP/mono/unpolarized model dies on a size mismatch (or worse,
+    # loads a subtly wrong stem). Mirror classifierPnm.load_model(), which also
+    # accepts the lowercase "unpolarized" spelling the configs actually use.
+    hp = config_json.get("hparams", {})
+    def _flag(name, *aliases):
+        for k in (name, *aliases):
+            if k in hp:            return bool(hp[k])
+            if k in config_json:   return bool(config_json[k])
+        return False
     return Classifier(
         model               = config_json["model"],
         loss                = config_json.get("loss", "focal"),
@@ -121,12 +132,13 @@ def _instantiate_classifier(config_json: dict, class_names: list[str]) -> Classi
         num_classes         = len(class_names),
         dropout_rate        = config_json["hparams"]["dropout_rate"],
         lr                  = config_json["optimizer"]["learning_rate"],
-        AoLP                = config_json.get("AoLP", False),
-        DoLP                = config_json.get("DoLP", False),
-        Unpolarized         = config_json.get("Unpolarized", False),
-        MaxPolarization     = config_json.get("MaxPolarization", False),
-        MinPolarization     = config_json.get("MinPolarization", False),
-        RangePolarization   = config_json.get("RangePolarization", False),
+        AoLP                = _flag("AoLP"),
+        DoLP                = _flag("DoLP"),
+        Unpolarized         = _flag("Unpolarized", "unpolarized"),
+        MaxPolarization     = _flag("MaxPolarization"),
+        MinPolarization     = _flag("MinPolarization"),
+        RangePolarization   = _flag("RangePolarization"),
+        monochrome          = _flag("monochrome"),
         penalize_false_clean= float(config_json.get("penalize_false_clean", 0.0)),
         base_channels       = config_json["hparams"].get("base_channels", 32),
         final_dense_layer   = config_json["hparams"].get("final_dense_layer", 512),
