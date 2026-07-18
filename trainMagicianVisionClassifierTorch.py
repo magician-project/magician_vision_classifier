@@ -79,25 +79,42 @@ def filter_dataset_classes(dataset, keep_classes):
 
 
 def merge_dataset_classes(dataset, merges):
-    """Merge classes at runtime WITHOUT rewriting the H5 file. `merges`: dict of
-    {source_class: destination_class}, e.g. {"class_Seal":"class_Welding"}. Source
-    samples are relabeled to the destination; source class dropped, rest renumbered.
-    Apply identically to train + val so their label spaces match. Honored by
+    """Merge/rename classes at runtime WITHOUT rewriting the H5 file. `merges`: dict
+    of {source_class: destination_class}. Source samples are relabeled to the
+    destination; source class dropped, rest renumbered. The destination MAY be a
+    brand-new name that is not an existing class -- that is how you rename or bucket,
+    e.g. collapse every defect into one class for a binary detector:
+        {"class_Deformation":"class_defect", ..., "class_Welding":"class_defect"}
+        -> classes become [class_clean, class_defect].
+    Chains (A->B, B->C) resolve transitively to the terminal destination. Apply
+    identically to train + val so their label spaces match. Honored by
     HDF5Dataset.__getitem__ via label_map, and by sample/target-list datasets."""
     import numpy as _np
     if not merges:
         return dataset
     old_classes = list(dataset.classes)
     old_cti = {c: i for i, c in enumerate(old_classes)}
-    merges = {s: d for s, d in merges.items() if s in old_cti and d in old_cti and s != d}
+    # source must exist and differ from its destination; destination may be new.
+    merges = {s: d for s, d in merges.items() if s in old_cti and s != d}
     if not merges:
         print("[merge_classes] nothing to merge"); return dataset
-    dropped = set(merges.keys())
+    def _terminal(c):
+        seen = set()
+        while c in merges and c not in seen:
+            seen.add(c); c = merges[c]
+        return c
+    final = {c: _terminal(c) for c in old_classes}   # final label for every old class
+    dropped = set(merges.keys())                     # every source disappears
+    # survivors keep their order; then append any brand-new destination names.
     new_classes = [c for c in old_classes if c not in dropped]
+    for c in old_classes:
+        d = final[c]
+        if d not in new_classes:
+            new_classes.append(d)
     new_cti = {c: i for i, c in enumerate(new_classes)}
     remap = _np.empty(len(old_classes), dtype=_np.int64)
     for c, oi in old_cti.items():
-        remap[oi] = new_cti[merges.get(c, c)]
+        remap[oi] = new_cti[final[c]]
     if hasattr(dataset, "label_map"):
         dataset.label_map = remap
     if getattr(dataset, "targets", None) is not None:
