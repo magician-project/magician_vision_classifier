@@ -128,6 +128,73 @@ def merge_dataset_classes(dataset, merges):
 
 
 
+class _SkipSweep(Exception):
+    """Raised to skip the defect-vs-clean threshold sweep for runs with no clean
+    class (alldefect). Caught right after the sweep; the confusion matrix, which
+    runs earlier in the same block, is unaffected."""
+    pass
+
+
+def drop_dataset_classes(dataset, drop):
+    """Remove all samples of the named classes from `dataset`, renumbering the
+    survivors to a contiguous 0..k-1 label space. `drop`: list of class names,
+    e.g. ["class_clean"] to build an 'alldefect' typer that never sees clean.
+
+    Operates in the CURRENT label space, so run it AFTER merge_dataset_classes.
+    Works on HDF5Dataset (row subset via .indices, no H5 rewrite) and on
+    ImageFolder-style datasets (.samples/.targets). Apply identically to train +
+    val so their label spaces match. NOTE: dropping class_clean removes the
+    clean class entirely -- val_detect_auroc / penalize_false_clean are undefined
+    then; select on val_auroc and set penalize_false_clean=0 for such runs."""
+    import numpy as _np
+    if not drop:
+        return dataset
+    old_cti = getattr(dataset, "class_to_idx", None) or {c: i for i, c in enumerate(dataset.classes)}
+    drop = [c for c in drop if c in old_cti]
+    if not drop:
+        print("[drop_classes] nothing to drop (names not present)"); return dataset
+    old_classes = list(dataset.classes)
+    drop_set = set(drop)
+    new_classes = [c for c in old_classes if c not in drop_set]
+    new_cti = {c: i for i, c in enumerate(new_classes)}
+    drop_idx = {old_cti[c] for c in drop}
+    # current-label-index -> new-index (or -1 if dropped)
+    remap = _np.full(len(old_classes), -1, dtype=_np.int64)
+    for c, oi in old_cti.items():
+        if c in new_cti:
+            remap[oi] = new_cti[c]
+
+    if hasattr(dataset, "labels") and hasattr(dataset, "images"):
+        # HDF5Dataset: rows carry RAW labels; label_map (if any) maps raw->current.
+        raw = _np.asarray(dataset.labels[:], dtype=_np.int64)
+        raw2cur = (_np.asarray(dataset.label_map, dtype=_np.int64)
+                   if dataset.label_map is not None
+                   else _np.arange(max(int(raw.max()) + 1 if len(raw) else 0,
+                                       len(old_classes)), dtype=_np.int64))
+        cur = raw2cur[raw]
+        keep = _np.where(~_np.isin(cur, list(drop_idx)))[0]
+        if dataset.indices is not None:                    # compose with any prior subset
+            keep = _np.intersect1d(_np.asarray(dataset.indices), keep)
+        # new raw->new-index map (dropped raws map to -1 but their rows are excluded)
+        dataset.label_map = _np.array([remap[c] if 0 <= c < len(remap) else -1
+                                       for c in raw2cur], dtype=_np.int64)
+        dataset.indices = keep
+        dataset.targets = [int(dataset.label_map[int(r)]) for r in raw[keep]]
+    else:
+        samples = getattr(dataset, "samples", None)
+        if samples is not None:
+            samples = [(s, int(remap[t])) for (s, t) in samples if t not in drop_idx]
+            dataset.samples = samples
+            dataset.targets = [t for (_, t) in samples]
+        elif getattr(dataset, "targets", None) is not None:
+            dataset.targets = [int(remap[t]) for t in dataset.targets if t not in drop_idx]
+
+    dataset.classes = new_classes
+    dataset.class_to_idx = new_cti
+    print(f"[drop_classes] dropped {sorted(drop_set)} -> {len(new_classes)} classes: {new_classes}")
+    return dataset
+
+
 def evaluate_dumped_tiles(model, tiles_dir, classes, device='cuda', batch_size=16):
     """
     Evaluates dumped PNG tiles against the current model.
@@ -1675,15 +1742,22 @@ def print_class_distribution(dataset, title="Dataset"):
         targets = dataset.targets
         classes = dataset.classes
 
-    counter = Counter(targets)
+    counter = Counter(int(t) for t in targets)
 
-    total = 0
-    for class_idx in sorted(counter.keys()):
-        class_name = classes[class_idx]
-        count = counter[class_idx]
-        total += count
-        print(f"Class {class_idx} ({class_name}): {count} samples")
+    # Iterate ALL classes (not just present ones) so zero-sample classes are
+    # visible -- they crash BalancedBatchSampler and make a class unlearnable.
+    total = sum(counter.values()) or 1
+    for class_idx in range(len(classes)):
+        count = counter.get(class_idx, 0)
+        flag = "   <-- ZERO SAMPLES" if count == 0 else ""
+        print(f"Class {class_idx} ({classes[class_idx]}): {count} samples "
+              f"({100.0*count/total:5.1f}%){flag}")
 
+    present = [c for c in counter.values() if c > 0]
+    if present and max(present) / max(1, min(present)) > 50:
+        print(f"WARNING: class imbalance {max(present)}:{min(present)} = "
+              f"{max(present)/min(present):.0f}x (BalancedBatchSampler mitigates, "
+              f"but rare classes stay hard cross-site)")
     print(f"Total samples: {total}")
     print("----------------------------------\n")
 
@@ -1816,6 +1890,14 @@ if __name__ == "__main__":
     if config_json.get('class_merges'):
        merge_dataset_classes(dataset, config_json['class_merges'])
 
+    # Drop classes entirely from training (e.g. class_clean for an 'alldefect'
+    # typer). Runs AFTER merges, in the post-merge label space.
+    if config_json.get('drop_classes'):
+       drop_dataset_classes(dataset, config_json['drop_classes'])
+
+    # Sanity-check the final training label space before we train on it.
+    print_class_distribution(dataset, title="TRAIN (final label space, pre-training)")
+
     # Optionally preload all samples to RAM (slow startup, fast epoch iteration)
     if ('cacheAllDataToRAM' in config_json['dataloader']) and (config_json['dataloader']['cacheAllDataToRAM']):
       # --- Sanity check: ensure there is enough available RAM ---
@@ -1908,6 +1990,11 @@ if __name__ == "__main__":
         if config_json.get('class_merges'):
             merge_dataset_classes(val_dataset, config_json['class_merges'])
 
+        if config_json.get('drop_classes'):
+            drop_dataset_classes(val_dataset, config_json['drop_classes'])
+
+        print_class_distribution(val_dataset, title="VAL (final label space)")
+
         if dataset.classes != val_dataset.classes:
             raise ValueError(f"Training/validation class mismatch: {dataset.classes} vs {val_dataset.classes}")
 
@@ -1975,8 +2062,10 @@ if __name__ == "__main__":
     class_names = dataset.classes
     print(f"Classes: {class_names}")
 
-    #Get clean class which could be needed for extra penalization
-    cleanClassID = 0
+    #Get clean class which could be needed for extra penalization. None when the
+    #dataset has no clean class (e.g. an 'alldefect' run that dropped class_clean)
+    #-- val_detect_auroc / penalize_false_clean / the threshold sweep all skip.
+    cleanClassID = None
     for i in range(len(dataset.classes)):
            if (dataset.classes[i] == "class_clean") or (dataset.classes[i] == "Clean"):
               cleanClassID = i
@@ -2075,10 +2164,15 @@ if __name__ == "__main__":
     ckpt_monitor = config_json.get("checkpoint_monitor", "val_detect_auroc")
     ckpt_mode    = config_json.get("checkpoint_mode",
                                    "min" if ckpt_monitor.endswith("loss") else "max")
+    # Filename references only metrics that are actually logged: val_loss always,
+    # plus the monitored metric (val_detect_auroc is absent on alldefect runs).
+    ckpt_fname = '{epoch}-{step}-{val_loss:.4f}'
+    if ckpt_monitor != 'val_loss':
+        ckpt_fname += '-{' + ckpt_monitor + ':.4f}'
     best_ckpt = ModelCheckpoint(monitor=ckpt_monitor, mode=ckpt_mode,
                                 save_top_k=ckpt_top_k,
                                 dirpath=ckpt_dir,
-                                filename='{epoch}-{step}-{val_loss:.4f}-{val_detect_auroc:.4f}')
+                                filename=ckpt_fname)
     print(f"Checkpoints: monitor={ckpt_monitor} mode={ckpt_mode} save_top_k={ckpt_top_k} "
           f"({'ALL epochs kept' if ckpt_top_k == -1 else 'best epoch(s) only'}) "
           f"dir={ckpt_dir or '<logger default>'}")
@@ -2151,7 +2245,8 @@ if __name__ == "__main__":
                 y_true.extend(y.cpu().numpy())
                 y_pred.extend(pr.cpu().numpy())
                 y_maxp.extend(mp.cpu().numpy())
-                y_pcln.extend(probs[:, cleanClassID].cpu().numpy())
+                if cleanClassID is not None:
+                    y_pcln.extend(probs[:, cleanClassID].cpu().numpy())
 
         num_classes = len(dataset.classes)
         confusion_matrix = np.zeros((num_classes, num_classes), dtype=int)
@@ -2189,6 +2284,11 @@ if __name__ == "__main__":
         # Thresholds are NOT comparable between the two modes or across models,
         # so we write the chosen one into config_json["gate"] and the live path
         # reads it from there instead of hardcoding a number.
+        # The sweep is a defect-vs-clean operating curve -- meaningless without a
+        # clean class (e.g. an 'alldefect' typer), so skip it there.
+        if cleanClassID is None:
+            print("No clean class -> skipping threshold sweep / gate calibration")
+            raise _SkipSweep()
         print("Generating threshold sweep / operating curve")
         yt = np.array(y_true); yp = np.array(y_pred)
         mp = np.array(y_maxp); pcl = np.array(y_pcln)
@@ -2262,6 +2362,8 @@ if __name__ == "__main__":
         subprocess.run(
             [sys.executable, "plotTool.py", f"{model_name}_threshold_curve.json"], check=False
         )
+    except _SkipSweep:
+        pass   # no clean class; confusion matrix already written above
     except Exception as e:
         print("Failed generating a confusion matrix:", e)
         with open(f"{model_name}_confusion.json", "w") as f:

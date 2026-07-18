@@ -47,12 +47,19 @@ class HDF5Dataset(Dataset):
         # None = identity. Set via apply_class_merges() so both __getitem__ and
         # targets stay consistent without rewriting the H5 file.
         self.label_map = None
+        # Optional row subset (list/array of kept H5 row positions), e.g. after
+        # dropping a class from training. None = use every row. When set,
+        # __len__/__getitem__ address rows through it so the H5 file is never
+        # rewritten. Set via drop_dataset_classes().
+        self.indices = None
         # Keep targets compatible with ImageFolder-like code
         self.targets = [int(x) for x in self.labels[:]]
         self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
 
     def __len__(self):
-        """Return the total number of samples in the HDF5 dataset."""
+        """Return the number of samples (respecting an optional row subset)."""
+        if self.indices is not None:
+            return len(self.indices)
         return len(self.labels)
 
     def _decode_metadata(self, idx):
@@ -94,19 +101,21 @@ class HDF5Dataset(Dataset):
         # the GPU, keeping CPU→GPU transfer bandwidth 4× lower than float32.
         # HDF5 files written before this change stored float32; detect that case
         # and convert back to uint8 so downstream code stays consistent.
-        raw = self.images[idx]
+        # Map the caller's index through the optional row subset first.
+        row = int(self.indices[idx]) if self.indices is not None else idx
+        raw = self.images[row]
         if raw.dtype == np.float32:
             # Legacy float32 HDF5 (values already in [0,1]) — re-quantise to uint8.
             x = torch.from_numpy((raw * 255.0).clip(0, 255).astype(np.uint8))
         else:
             x = torch.from_numpy(raw.astype(np.uint8))
-        lbl = int(self.labels[idx])
+        lbl = int(self.labels[row])
         if self.label_map is not None:
             lbl = int(self.label_map[lbl])
         y = torch.tensor(lbl, dtype=torch.long)
 
         if self.metadata is not None:
-            meta = self._decode_metadata(idx)
+            meta = self._decode_metadata(row)
             return x, y, meta
 
         return x, y
