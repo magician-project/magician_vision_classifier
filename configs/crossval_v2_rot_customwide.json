@@ -49,7 +49,10 @@
         "name": "CrossValAltinay",
         "use_wandb": false
     },
-    "training_dataset": "/home/ammar/Documents/Programming/magician_datasets/train_nonaltinay_v2/",
+    "training_dataset": [
+        "/home/ammar/Documents/Programming/magician_datasets/train_nonaltinay_v2/",
+        "/media/ammar/games2/Datasets/MagicianH5/forth_new_certified/"
+    ],
     "validation_dataset": "/home/ammar/Documents/Programming/magician_datasets/val_altinay/",
     "class_weight": false,
     "loss": "focal",

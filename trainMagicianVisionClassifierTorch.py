@@ -195,6 +195,57 @@ def drop_dataset_classes(dataset, drop):
     return dataset
 
 
+def _dataset_source_frames(dataset):
+    """Per-sample source-FRAME string for every sample (aligned with dataset[i],
+    0..len-1). Frame = metadata 'source' path minus the tile (x,y) offset. Works
+    on HDF5Dataset (reads its open .file, respects a prior .indices row subset)
+    and CombinedDataset (concatenates constituents in the same order it indexes).
+    'source' paths are globally unique across dumps, so combined frame ids stay
+    distinct across FORTH / Altinay / etc. without extra offsetting."""
+    import json as _json
+    def _h5_frames(ds):
+        raw = ds.file["metadata"][:]
+        rows = ds.indices if getattr(ds, "indices", None) is not None else range(len(ds))
+        out = []
+        for r in rows:
+            m = raw[int(r)]
+            m = m.decode() if isinstance(m, bytes) else m
+            out.append(_json.loads(m)["source"].rsplit("(", 1)[0])
+        return out
+    if hasattr(dataset, "datasets"):          # CombinedDataset
+        out = []
+        for ds in dataset.datasets:
+            out.extend(_h5_frames(ds))
+        return out
+    if hasattr(dataset, "file"):              # HDF5Dataset
+        return _h5_frames(dataset)
+    raise ValueError("frame_disjoint_split requires H5 'source' metadata; this "
+                     "dataset exposes none (PNG ImageFolder is not frame-aware).")
+
+
+def frame_disjoint_split(dataset, val_split, seed):
+    """Split a dataset into (train_idx, val_idx) SAMPLE-index lists by FRAME, not
+    by tile — whole source frames go entirely to train or entirely to val, so
+    tiles of the same frame/point never straddle the split. Essential when there
+    are many tiles per point (v2 has ~16), where a tile-level random_split leaks
+    near-duplicate siblings across train/val and inflates the val metric. Works
+    across combined datasets (mixed domains) since frame ids are global. Returns
+    indices INTO `dataset` (0..len(dataset)-1)."""
+    import numpy as _np
+    srcs = _np.array(_dataset_source_frames(dataset))
+    _, frame_id = _np.unique(srcs, return_inverse=True)            # per SAMPLE
+    uf = _np.unique(frame_id)
+    rng = _np.random.default_rng(seed)
+    n_val = max(1, int(round(len(uf) * val_split)))
+    val_frames = set(rng.choice(uf, n_val, replace=False).tolist())
+    is_val = _np.array([fr in val_frames for fr in frame_id])
+    train_idx = _np.where(~is_val)[0].tolist()
+    val_idx = _np.where(is_val)[0].tolist()
+    print(f"[frame_disjoint_split] {len(uf)} frames -> {len(uf)-n_val} train / {n_val} val "
+          f"({len(train_idx)} / {len(val_idx)} tiles); frames do not straddle the split")
+    return train_idx, val_idx
+
+
 def evaluate_dumped_tiles(model, tiles_dir, classes, device='cuda', batch_size=16):
     """
     Evaluates dumped PNG tiles against the current model.
@@ -1868,32 +1919,40 @@ if __name__ == "__main__":
         lambda img: torch.from_numpy(img).permute(2, 0, 1).contiguous()
     )
 
-    H5PYFilename = '%s/dataset.h5' % directory 
-    if (checkIfFileExists(H5PYFilename)):
-          #If there is a .h5 file read directly from it to not spam I/O (Use DatasetConverter.py)
-          from DatasetConverter import HDF5Dataset
-          print("Using H5 dataset loader ",H5PYFilename)
-          dataset = HDF5Dataset(H5PYFilename)
-          dataset.metadata = None  # training/validation steps unpack (x, y) batches only
+    # training_dataset may be a single dir OR a LIST of dirs to combine (e.g.
+    # FORTH + Altinay for a mixed-domain train, then frame_disjoint_split). Each
+    # is loaded and gets the SAME class scheme (filter/merge/drop) BEFORE combining
+    # so class spaces stay consistent.
+    directories = directory if isinstance(directory, list) else [directory]
+
+    def _load_one(d):
+        h5 = '%s/dataset.h5' % d
+        if checkIfFileExists(h5):
+            from DatasetConverter import HDF5Dataset
+            print("Using H5 dataset loader ", h5)
+            ds = HDF5Dataset(h5)
+            ds.metadata = None  # training/validation steps unpack (x, y) batches only
+        else:
+            print("Using Normal PNG dataset loader ", d)
+            ds = RGBAImageFolder(root=d, transform=transform)
+        # Keep some classes / merge / drop -- applied per dataset so the combined
+        # label space is consistent across all constituents.
+        if config_json.get('selected_classes') and len(config_json['selected_classes']) > 1:
+            print("Only selecting the classes ", config_json['selected_classes'])
+            filter_dataset_classes(ds, config_json['selected_classes'])
+        if config_json.get('class_merges'):
+            merge_dataset_classes(ds, config_json['class_merges'])
+        if config_json.get('drop_classes'):
+            drop_dataset_classes(ds, config_json['drop_classes'])
+        return ds
+
+    subs = [_load_one(d) for d in directories]
+    if len(subs) == 1:
+        dataset = subs[0]
     else:
-          #Normal .PNG decoding and loading
-          print("Using Normal PNG dataset loader ",directory)
-          dataset = RGBAImageFolder(root=directory,transform=transform,)
-
-
-    #Just keep some of the classes     
-    if ('selected_classes' in  config_json) and (config_json['selected_classes'] is not None) and (len(config_json['selected_classes'])>1) :
-       print("Only selecting the classes ",config_json['selected_classes'], "for training")
-       filter_dataset_classes(dataset, config_json['selected_classes'])
-
-    # Merge classes (e.g. Seal->Welding) from config; runtime, no H5 rewrite
-    if config_json.get('class_merges'):
-       merge_dataset_classes(dataset, config_json['class_merges'])
-
-    # Drop classes entirely from training (e.g. class_clean for an 'alldefect'
-    # typer). Runs AFTER merges, in the post-merge label space.
-    if config_json.get('drop_classes'):
-       drop_dataset_classes(dataset, config_json['drop_classes'])
+        dataset = CombinedDataset(subs)   # validates identical class spaces
+        print(f"Combined {len(subs)} datasets -> {len(dataset)} tiles, classes {dataset.classes}")
+    H5PYFilename = '%s/dataset.h5' % directories[0]   # legacy single-file references
 
     # Sanity-check the final training label space before we train on it.
     print_class_distribution(dataset, title="TRAIN (final label space, pre-training)")
@@ -2002,8 +2061,18 @@ if __name__ == "__main__":
             raise ValueError("Training/validation class_to_idx mismatch")
 
         train_dataset = dataset
+    elif config_json['dataloader'].get('frame_disjoint_split'):
+        # Train/test split of the (possibly combined) training set BY FRAME (no
+        # tile leakage). Used for the within-domain ceiling (FORTH->FORTH) and for
+        # mixed-domain runs (FORTH+Altinay -> held-out frames from both).
+        print("No validation_dataset → FRAME-DISJOINT split of the training set")
+        from torch.utils.data import Subset
+        tr_idx, va_idx = frame_disjoint_split(dataset, val_split, seed)
+        train_dataset = Subset(dataset, tr_idx)
+        val_dataset   = Subset(dataset, va_idx)
     else:
-        print("No validation_dataset provided → using validation_split")
+        print("No validation_dataset provided → using validation_split (TILE-level; "
+              "may leak sibling tiles — set dataloader.frame_disjoint_split for a clean split)")
 
         dataset_size    = len(dataset)
         validation_size = int(val_split * dataset_size)
