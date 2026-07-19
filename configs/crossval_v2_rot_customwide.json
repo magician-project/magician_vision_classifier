@@ -61,5 +61,6 @@
     "name": "crossvalv2rotcustomwide",
     "model": "custom",
     "devices": 1,
-    "selected_classes": []
+    "selected_classes": [],
+    "strip_severity": true
 }

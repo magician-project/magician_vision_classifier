@@ -67,5 +67,6 @@
     ],
     "checkpoint_monitor": "val_auroc",
     "checkpoint_save_top_k": -1,
-    "checkpoint_dir": "/media/ammar/games2/Datasets/Models/alldefect_ckpts"
+    "checkpoint_dir": "/media/ammar/games2/Datasets/Models/alldefect_ckpts",
+    "strip_severity": true
 }

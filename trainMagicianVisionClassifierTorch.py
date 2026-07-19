@@ -78,6 +78,71 @@ def filter_dataset_classes(dataset, keep_classes):
     print(f"Filtered dataset to {len(dataset.samples)} samples across {len(keep_classes)} classes.")
 
 
+def align_dataset_to_classes(dataset, target_classes):
+    """Force a dataset onto a canonical class list `target_classes` (exact order).
+    Samples whose class is not in target are DROPPED; target classes absent from
+    the dataset stay at zero count. Lets heterogeneous H5s (different class
+    subsets/orders, e.g. base train + a granular dump collapsed to base) share one
+    label space so CombinedDataset accepts them. Uses the same H5 label_map+indices
+    / ImageFolder mechanism as drop_dataset_classes."""
+    import numpy as _np
+    old_classes = list(dataset.classes)
+    if old_classes == list(target_classes):
+        return dataset
+    tgt_idx = {c: i for i, c in enumerate(target_classes)}
+    # current class index -> target index (or -1 if the class is not in target)
+    cur2tgt = _np.array([tgt_idx.get(c, -1) for c in old_classes], dtype=_np.int64)
+
+    if hasattr(dataset, "labels") and hasattr(dataset, "images"):   # HDF5Dataset
+        raw = _np.asarray(dataset.labels[:], dtype=_np.int64)
+        raw2cur = (_np.asarray(dataset.label_map, dtype=_np.int64)
+                   if dataset.label_map is not None
+                   else _np.arange(max(int(raw.max()) + 1 if len(raw) else 0,
+                                       len(old_classes)), dtype=_np.int64))
+        cur = raw2cur[raw]
+        keep = _np.where(cur2tgt[cur] >= 0)[0]
+        if dataset.indices is not None:
+            keep = _np.intersect1d(_np.asarray(dataset.indices), keep)
+        dataset.label_map = _np.array([cur2tgt[c] if 0 <= c < len(cur2tgt) else -1
+                                       for c in raw2cur], dtype=_np.int64)
+        dataset.indices = keep
+        dataset.targets = [int(dataset.label_map[int(r)]) for r in raw[keep]]
+    else:
+        samples = getattr(dataset, "samples", None)
+        if samples is not None:
+            samples = [(s, int(cur2tgt[t])) for (s, t) in samples if cur2tgt[t] >= 0]
+            dataset.samples = samples
+            dataset.targets = [t for (_, t) in samples]
+        elif getattr(dataset, "targets", None) is not None:
+            dataset.targets = [int(cur2tgt[t]) for t in dataset.targets if cur2tgt[t] >= 0]
+
+    dataset.classes = list(target_classes)
+    dataset.class_to_idx = dict(tgt_idx)
+    print(f"[align_classes] -> {len(target_classes)} canonical classes: {list(target_classes)}")
+    return dataset
+
+
+def strip_severity_classes(dataset):
+    """Collapse severity-tagged class names to their base at runtime, e.g.
+    class_WeldingClassA / class_WeldingClassB -> class_Welding. This is the
+    "non-severity" view of a granular H5: dumps store the full severity/class
+    truth, and the config decides at load time whether to keep or drop severity.
+    A no-op on H5s that were dumped without severity (base names already).
+    Implemented via merge_dataset_classes so labels/targets/label_map stay
+    consistent. The suffix is 'Class<LETTER>' at the end of the class name."""
+    import re as _re
+    merges = {}
+    for c in list(dataset.classes):
+        base = _re.sub(r'Class[A-Z]$', '', c)
+        if base != c:
+            merges[c] = base
+    if merges:
+        merge_dataset_classes(dataset, merges)
+    else:
+        print("[strip_severity] no severity-tagged classes to collapse")
+    return dataset
+
+
 def merge_dataset_classes(dataset, merges):
     """Merge/rename classes at runtime WITHOUT rewriting the H5 file. `merges`: dict
     of {source_class: destination_class}. Source samples are relabeled to the
@@ -1940,6 +2005,12 @@ if __name__ == "__main__":
         if config_json.get('selected_classes') and len(config_json['selected_classes']) > 1:
             print("Only selecting the classes ", config_json['selected_classes'])
             filter_dataset_classes(ds, config_json['selected_classes'])
+        # Non-severity view first (collapse class_XClassY -> class_X), so the
+        # merge/drop below operate on base names. Set "severity": false (or
+        # "strip_severity": true) in the config. Granular H5 + this flag = the
+        # runtime "non-severity" mode; omit it to train on the full severity truth.
+        if config_json.get('strip_severity') or config_json.get('severity') is False:
+            strip_severity_classes(ds)
         if config_json.get('class_merges'):
             merge_dataset_classes(ds, config_json['class_merges'])
         if config_json.get('drop_classes'):
@@ -1950,7 +2021,14 @@ if __name__ == "__main__":
     if len(subs) == 1:
         dataset = subs[0]
     else:
-        dataset = CombinedDataset(subs)   # validates identical class spaces
+        # Combining multiple H5s that may have different class SUBSETS/orders
+        # (e.g. base train + a granular dump collapsed to base): force all onto
+        # one canonical list so CombinedDataset accepts them. canonical_classes
+        # in the config, else the primary (first) dataset's post-transform list.
+        canon = config_json.get('canonical_classes') or list(subs[0].classes)
+        for ds in subs:
+            align_dataset_to_classes(ds, canon)
+        dataset = CombinedDataset(subs)   # now identical class spaces
         print(f"Combined {len(subs)} datasets -> {len(dataset)} tiles, classes {dataset.classes}")
     H5PYFilename = '%s/dataset.h5' % directories[0]   # legacy single-file references
 
