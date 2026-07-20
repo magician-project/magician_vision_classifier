@@ -181,7 +181,16 @@ def merge_dataset_classes(dataset, merges):
     for c, oi in old_cti.items():
         remap[oi] = new_cti[final[c]]
     if hasattr(dataset, "label_map"):
-        dataset.label_map = remap
+        # `remap` is CURRENT-index -> new-index. H5 rows always carry RAW labels,
+        # so label_map must stay raw->current. When a prior merge (e.g.
+        # strip_severity) already set label_map (raw->current), COMPOSE with it
+        # instead of overwriting -- otherwise a second merge stores a current->new
+        # map that is wrong-domain for the raw rows (IndexError on drop).
+        if dataset.label_map is not None:
+            prev = _np.asarray(dataset.label_map, dtype=_np.int64)  # raw -> current
+            dataset.label_map = remap[prev]                          # raw -> new
+        else:
+            dataset.label_map = remap
     if getattr(dataset, "targets", None) is not None:
         dataset.targets = [int(remap[int(t)]) for t in dataset.targets]
     if getattr(dataset, "samples", None) is not None:
