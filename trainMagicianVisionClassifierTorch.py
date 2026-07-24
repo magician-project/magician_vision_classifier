@@ -269,6 +269,36 @@ def drop_dataset_classes(dataset, drop):
     return dataset
 
 
+def resolve_auto_drops(classes, config_json, clean_name='class_clean'):
+    """Extra class NAMES to drop, computed from two convention toggles so callers
+    don't have to enumerate exact granular names in drop_classes. Operates in the
+    CURRENT label space (run alongside/after strip_severity + merge):
+
+      drop_severityless_defects (bool): drop every non-clean class that lacks a
+          severity suffix (Class A/B/C) -- e.g. the bare 'class_PositiveDent'
+          bucket and stray 'class_Suspicious'/'class_Unknown'. 'class_clean' (the
+          only legitimately severity-less class) is always kept.
+      drop_class_families (list): drop every class whose base name (severity
+          stripped) matches an entry, regardless of severity -- e.g.
+          'class_Dust' drops class_Dust, class_DustClassA, class_DustClassB, ...
+
+    Returns a sorted list; names not present are ignored by drop_dataset_classes.
+    """
+    import re as _re
+    suffix = _re.compile(r'Class[ABC]$')
+    drop = set()
+    if config_json.get('drop_severityless_defects'):
+        for c in classes:
+            if c != clean_name and not suffix.search(c):
+                drop.add(c)
+    families = set(config_json.get('drop_class_families') or [])
+    if families:
+        for c in classes:
+            if c in families or suffix.sub('', c) in families:
+                drop.add(c)
+    return sorted(drop)
+
+
 def _dataset_source_frames(dataset):
     """Per-sample source-FRAME string for every sample (aligned with dataset[i],
     0..len-1). Frame = metadata 'source' path minus the tile (x,y) offset. Works
@@ -447,10 +477,11 @@ def load_hyperparameters(config_file):
         sys.exit(1)
     with open(config_file) as json_file:
         data = json.load(json_file)
-    # Inherit shared defaults from common.json in the same directory, so
-    # cross-cutting settings (e.g. class_merges) live in ONE place instead of
-    # every config file. The specific config deep-overrides the common one.
-    common_path = os.path.join(os.path.dirname(config_file), "common.json")
+    # Inherit shared defaults from configs/common.json (next to the trainer), so
+    # cross-cutting settings (e.g. class_merges, the discard toggles) live in ONE
+    # place for every config regardless of where the config file itself sits. The
+    # specific config deep-overrides the common one.
+    common_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "common.json")
     if checkIfFileExists(common_path):
         with open(common_path) as cf:
             common = json.load(cf)
@@ -2022,8 +2053,10 @@ if __name__ == "__main__":
             strip_severity_classes(ds)
         if config_json.get('class_merges'):
             merge_dataset_classes(ds, config_json['class_merges'])
-        if config_json.get('drop_classes'):
-            drop_dataset_classes(ds, config_json['drop_classes'])
+        drops = list(config_json.get('drop_classes') or [])
+        drops += resolve_auto_drops(ds.classes, config_json)
+        if drops:
+            drop_dataset_classes(ds, drops)
         return ds
 
     subs = [_load_one(d) for d in directories]
@@ -2136,8 +2169,10 @@ if __name__ == "__main__":
         if config_json.get('class_merges'):
             merge_dataset_classes(val_dataset, config_json['class_merges'])
 
-        if config_json.get('drop_classes'):
-            drop_dataset_classes(val_dataset, config_json['drop_classes'])
+        val_drops = list(config_json.get('drop_classes') or [])
+        val_drops += resolve_auto_drops(val_dataset.classes, config_json)
+        if val_drops:
+            drop_dataset_classes(val_dataset, val_drops)
 
         print_class_distribution(val_dataset, title="VAL (final label space)")
 
