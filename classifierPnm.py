@@ -522,9 +522,12 @@ def dump_tiles_as_png(rgba_image, predictions, classes, tile_size, step, output_
 
 @torch.no_grad()
 def tile_and_cast_data_torch(image, tile_size=24, step=2):
-    # Convert image to tensor (if it's a NumPy array)
+    # Convert image to tensor (if it's a NumPy array).
+    # Preserve the incoming dtype: uint8 frames must stay uint8 all the way to
+    # Classifier.build_input_features(), which is what applies the /255. Casting
+    # to float here would skip that and feed the model 0-255 values.
     if isinstance(image, np.ndarray):
-        image = torch.from_numpy(image).float()
+        image = torch.from_numpy(image)
 
     #print("tile_and_cast_data_torch input image:",image.shape)
     #image H , W , C | torch.Size([1024, 1224, 4])
@@ -952,7 +955,11 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
 
     # Extract tiles and prepare tensor (N, C, H, W)
     npTiles = tile_and_cast_data_torch(rgba_image, tile_size=tile_size, step=step)
-    npTiles = npTiles.to(dtype=torch.float32).permute(0, 3, 1, 2).contiguous().to('cuda')
+    # Keep the tile dtype as-is (uint8 for the live/ensemble paths). Classifier
+    # .build_input_features() dequantises uint8 to [0,1] on the GPU; casting to
+    # float32 here would bypass that and feed the model 0-255, which collapses
+    # predictions towards class_clean.
+    npTiles = npTiles.permute(0, 3, 1, 2).contiguous().to('cuda')
 
     channels = 4
     if npTiles.shape[1:] != (channels, tile_size, tile_size):
@@ -1042,11 +1049,12 @@ def runSingle(image,
     """
     print(f"runSingle: image {image.shape}, tile={tile_size}, step={step}, classes={len(classes)} erosion_kernel={erosion_kernel} erosion_threshold={erosion_threshold}")
 
-    # 1. Read & normalize image
+    # 1. Read image. Upload as uint8 and let Classifier.build_input_features()
+    #    do the /255 on the GPU — same numbers as normalising here, but 4x less
+    #    data over PCIe. Matches the EnsembleClassifier path.
     rgba_image = readPolarPNMToRGBALive(image)
     rgba_image = cv2.cvtColor(rgba_image, cv2.COLOR_RGBA2BGRA)
-    rgba_image = (rgba_image.astype('float32') / 255.0)
-    rgba_image = torch.as_tensor(rgba_image, device=device, dtype=torch.float32)
+    rgba_image = torch.as_tensor(rgba_image, device=device, dtype=torch.uint8)
 
     # 2. Identify "clean" class once
     cleanClassID = next((i for i, c in enumerate(classes) if c.lower() in ("class_clean", "clean")), None)
@@ -1075,8 +1083,8 @@ def runSingle(image,
     if (log):
       log_performance("perf.csv", name, step, tile_size, majorityVote, maxProbabilityThreshold, len(predictions), hz)
     
-    # 4. Restore image intensity for heatmap overlay
-    rgba_image *= 255.0
+    # 4. rgba_image is already uint8 0-255 (normalisation happens inside the
+    #    model), so no intensity restore is needed before the heatmap overlay.
 
     if dumpTiles:
         dump_tiles_as_png(rgba_image, predictions, classes, tile_size, step)

@@ -58,9 +58,11 @@ def tile_and_cast_selected_tiles_torch(image, selected_indices, tile_size=24, st
     selected_indices : 1D tensor or list of indices into the flattened tile list.
     """
 
-    # Convert to tensor if needed
+    # Convert to tensor if needed. Preserve dtype for the same reason as
+    # tile_and_cast_data_torch(): uint8 must reach the model so that
+    # Classifier.build_input_features() can apply the /255 on the GPU.
     if isinstance(image, np.ndarray):
-        image = torch.from_numpy(image).float()
+        image = torch.from_numpy(image)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     image = image.to(device)

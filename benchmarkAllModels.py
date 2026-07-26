@@ -180,9 +180,13 @@ def find_max_batch_size(clf, sample_nchw: torch.Tensor, device: str) -> int:
 # ---------------------------------------------------------------------------
 
 def _tiles_nchw(rgba: np.ndarray, tile_size: int, step: int, device: str) -> torch.Tensor:
-    """Tile one RGBA frame → (N, C, tile_size, tile_size) float32 on device."""
+    """Tile one RGBA frame → (N, C, tile_size, tile_size) uint8 on device.
+
+    Kept uint8 to match the live pipeline: the model dequantises internally, so
+    benchmarking float32 tiles would measure a transfer size inference never uses.
+    """
     tiles = tile_and_cast_data_torch(rgba, tile_size=tile_size, step=step)
-    return tiles.to(dtype=torch.float32).permute(0, 3, 1, 2).contiguous().to(device)
+    return tiles.permute(0, 3, 1, 2).contiguous().to(device)
 
 
 @torch.no_grad()

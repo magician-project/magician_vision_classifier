@@ -342,9 +342,10 @@ def _infer_frame(
 
     def _flush():
         arr = np.stack(buf_tiles, axis=0)          # (B, H, W, C) uint8
+        # Keep uint8: Classifier.build_input_features() applies the /255 on the
+        # GPU. Casting to float32 here skips it and feeds the model 0-255.
         t   = (torch.from_numpy(arr)
                     .permute(0, 3, 1, 2)
-                    .to(dtype=torch.float32)
                     .to(device)
                     .contiguous())
         with autocast_ctx:
@@ -490,8 +491,7 @@ def _eval_step(
             if len(buf) == batch_size:
                 arr = np.stack(buf, axis=0)
                 timing_batches.append(
-                    torch.from_numpy(arr).permute(0, 3, 1, 2)
-                         .to(dtype=torch.float32).contiguous()
+                    torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
                 )
                 buf = []
                 if len(timing_batches) >= n_timing_frames * 4:
@@ -501,8 +501,7 @@ def _eval_step(
         if buf:
             arr = np.stack(buf, axis=0)
             timing_batches.append(
-                torch.from_numpy(arr).permute(0, 3, 1, 2)
-                     .to(dtype=torch.float32).contiguous()
+                torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
             )
 
     fps = 0.0
