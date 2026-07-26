@@ -117,7 +117,9 @@ pip install -r requirements.txt
 pip install empy lark
 ```
 
-The main dependencies are: `torch`, `torchvision`, `pytorch-lightning`, `torchmetrics`, `opencv-python`, `numpy`, `h5py`, `wandb`, `matplotlib`, `seaborn`, `numba`.
+The main dependencies are `torch`, `torchvision`, `torchmetrics`, `pytorch-lightning`, `opencv-python`, `numpy`, `pillow`, `h5py`, `tqdm` and `psutil`, plus `scikit-learn`, `matplotlib` and `seaborn` for the analysis tools and `tensorboard` / `wandb` for logging.
+
+`PyOpenGL` is listed last in `requirements.txt` and is only needed by the `integrator3D.py` 3D viewer; it additionally requires system freeglut (`sudo apt install freeglut3-dev`). Everything else in the pipeline runs without it.
 
 ### ROS2 Workspace
 
@@ -311,6 +313,27 @@ The training module logs the following validation metrics:
 
 ## Inference
 
+### Obtaining Pretrained Models
+
+Inference needs a `.pth` checkpoint and its matching `.json` config. If you have not trained your own, fetch them from the model server with `ModelDownload.py`, which drops them where `ClassifierPnm.model_scan()` will find them:
+
+```bash
+python3 ModelDownload.py --list                       # show available remote models
+python3 ModelDownload.py allclass_forthalt_custom     # newest archive of one model
+python3 ModelDownload.py --all                        # every remote archive
+```
+
+Options: `--dest DIR` (default: the script's directory), `--plots` (also extract confusion/threshold PNGs).
+
+It can also be used as a library, which is a no-op if the model is already present locally:
+
+```python
+from ModelDownload import ensure_model
+ensure_model("allclass_forthalt_custom")
+```
+
+Archives are flat zips named `{model_name}_{timestamp}.zip` containing the `.pth` + `.json`, uploaded by `scripts/uploadToAmmarServer.sh`.
+
 ### Standalone Mode
 
 Run the classifier outside of ROS2, reading frames from shared memory and displaying a live heatmap:
@@ -318,6 +341,8 @@ Run the classifier outside of ROS2, reading frames from shared memory and displa
 ```bash
 python3 liveClassifierTorch.py
 ```
+
+The inference core itself — tiling, heatmaps, majority voting, erosion, gating and model scanning — lives in `classifierPnm.py`. `liveClassifierTorch.py` re-exports it, so existing `from liveClassifierTorch import ...` imports keep working, and the ROS node, the annotator and `ModelDownload.py` all share one implementation.
 
 ### ROS2 Mode
 
@@ -489,6 +514,32 @@ ArUco marker detection uses the `DICT_6X6_250` dictionary. Detected markers are 
 
 ## Model Analysis and Evaluation
 
+### Quick Start — Full Report in One Command
+
+`ModelAnalysis.py` is the recommended entry point. It discovers every `(.pth, .json)` model pair in a directory, evaluates them all, benchmarks throughput, runs ensemble optimisation, and writes a self-contained HTML report:
+
+```bash
+python3 ModelAnalysis.py <dataset_dir> [models_dir]
+```
+
+```bash
+# raw frame directory, FP16, custom output location
+python3 ModelAnalysis.py /path/to/frames . --fp16 --out report_2026_07
+```
+
+| Option | Description |
+|--------|-------------|
+| `dataset_dir` | ImageFolder-style dir, a `dataset.h5`, or a raw frame dir (`colorFrame_*.png/pnm` + matching `.json` annotations) |
+| `models_dir` | directory containing `*.pth` + matching `*.json` (default: `.`) |
+| `--batch N` | inference batch size (default: 64 tiled, 256 raw) |
+| `--fp16` | run inference under autocast FP16 |
+| `--out DIR` | output directory (default: `model_analysis_<timestamp>`) |
+| `--metric M` | ensemble optimisation target (`balanced_accuracy` \| `accuracy`) |
+| `--no-bench` | skip the batch×step throughput benchmark |
+| `--bench-batches`, `--bench-steps` | comma-separated sweep values |
+
+Internally this orchestrates `ModelAnalysisEvaluate.py` (or `ModelAnalysisEvaluateRawDataset.py`) and `ModelAnalysisReport.py`. Run those individually only if you need a single stage.
+
 ### Single-Model Evaluation
 
 Evaluate a single trained checkpoint on one or more dataset directories:
@@ -497,12 +548,6 @@ Evaluate a single trained checkpoint on one or more dataset directories:
 python3 evaluateClassifierNew.py model.pth config.json /path/to/eval_dir
 python3 evaluateClassifierNew.py model.pth config.json /path/to/eval_dir <batch_size>
 python3 evaluateClassifierNew.py model.pth config.json /path/to/eval_dir 16 Class1,Class2
-```
-
-For a quick single-model pass without a config file:
-
-```bash
-python3 evaluateTorch.py
 ```
 
 ### Batch Evaluation
@@ -568,11 +613,64 @@ Identify defect samples that the classifier is misclassifying as clean — usefu
 python3 identifyDefectsConfusedWithClean.py
 ```
 
+### Detection-Oriented Evaluation
+
+The tools above score a model as a *k-way classifier*. The MAGICIAN KPI is *skipped defects*, which is a detection problem — the scripts in this section measure that instead. Three findings from the July 2026 cross-site campaign drive their design:
+
+- **Detector score is `1 - P(clean)`, not max-prob.** A tile at 0.40 Welding / 0.40 Seal / 0.20 clean scores 0.40 under max-prob and is called clean, though it is 80% likely a defect. Summing the defect mass lowers miss at every false-alarm rate.
+- **Rank models by defect-vs-clean AUROC, never by `val_loss`.** The two are uncorrelated (Pearson ≈ −0.09), so `save_top_k=1` on `val_loss` selects an essentially random epoch with respect to the KPI.
+- **Any single checkpoint is a lottery.** The cross-site metric oscillates ±0.02–0.04 AUROC epoch to epoch — the same size as the gaps *between* models.
+
+```bash
+# Evaluate a checkpoint as a defect detector: AUROC + miss at a false-positive budget,
+# reported at both tile and frame level, with per-class breakdown.
+python3 evaluateDetection.py model.pth config.json [dataset_dir] [--split-frames] [--fp N]
+
+# Per-TYPE recall split by domain (Altinay vs FORTH), on the trainer's exact held-out split.
+python3 evalTyping.py model.pth <name>_custom.json
+
+# Does the winner win on the target site, or only on the FORTH-heavy aggregate?
+python3 eval_domain_split.py
+
+# Ensemble search on the detection metric rather than balanced accuracy.
+python3 detection_ensemble.py <probs.npz>
+```
+
+**Stochastic Weight Averaging.** Averaging the weights of every epoch checkpoint into one model removes the single-checkpoint lottery at 1× inference cost. On the cross-site `customwide` run this lifted held-out AUROC from 0.79 to 0.83:
+
+```bash
+python3 swaCheckpoints.py <ckpt_dir> <config.json> <out.pth> [--last N]
+```
+
+Two rules from the measurements: average **all** epochs (the weak early ones contribute weight-space diversity — all-18 scored 0.829 vs 0.782 for last-8), and only do this **without an LR scheduler**, so the checkpoints share one loss basin.
+
+**Reproducing the held-out split.** `materialize_heldout.py` writes the exact seed-42 frame-disjoint validation set to a standalone H5 so `calculateOptimalEnsemble.py` can score models leakage-free.
+
+> **Note:** `materialize_heldout.py`, `eval_domain_split.py` and `detection_ensemble.py` currently hardcode dataset paths under `/home/ammar/Documents/Programming/magician_datasets/`. Edit the `DIRS` constant at the top of each before running them elsewhere.
+
 ### Benchmarking
+
+Benchmark inference throughput for every `allclass_*.pth` model on raw PNM frames:
+
+```bash
+python3 benchmarkAllModels.py --from /path/to/frames --frames 100 --step 15 20
+python3 benchmarkAllModels.py --from /path/to/frames --models . --out benchmark_results
+```
+
+Writes `benchmark_results.csv` (per-model, per-step FPS) and `benchmark_results.png` (grouped bar chart).
 
 - `scripts/bench_to_csv.sh` — convert benchmark output to CSV
 - `scripts/run_benchmark_plotting.sh` — run benchmarks and generate Gnuplot comparisons
 - Benchmark result files for each architecture are in `scripts/benchmark_allclass_*.txt`
+
+### Plotting Utilities
+
+```bash
+python3 plot_param_count.py [--classifier-dir DIR] [--exclude MODEL ...]
+python3 plot_tensorboard_comparison.py [--ckpts-dir DIR] [--out-dir DIR]
+```
+
+`plot_param_count.py` plots parameter counts from the saved JSON configs. `plot_tensorboard_comparison.py` extracts TensorBoard scalars from checkpoint zips and plots per-model validation curves. Both write into `tb_plots/` by default.
 
 ---
 
@@ -605,28 +703,46 @@ The `SharedMemoryManager.py` module provides Python bindings for:
 
 ```
 magician_vision_classifier/
+  │
+  │   Training
   ├── trainMagicianVisionClassifierTorch.py   Main training script
-  ├── liveClassifierTorch.py                  Standalone inference engine
-  ├── liveClassifierTorchROS.py               ROS2 inference node
-  ├── EnsembleClassifier.py                   Two-stage ensemble classifier
-  ├── EnsembleClassifierOG.py                 Legacy ensemble variant
   ├── DatasetConverter.py                     PNG to HDF5 dataset converter
   ├── DataLoader.py                           Dataset utilities
   ├── readData.py                             Polarization image loading and debayering
-  ├── evaluateClassifierNew.py                Evaluate a checkpoint on one or more dataset dirs
-  ├── evaluateTorch.py                        Quick single-model evaluation
-  ├── evaluateOptimalEnsemble.py              Evaluate ensemble voting strategies
-  ├── identifyDefectsConfusedWithClean.py     Find defects misclassified as clean
+  ├── splitChannels.py                        Polarization channel splitter
+  ├── swaCheckpoints.py                       Stochastic Weight Averaging over epoch checkpoints
+  │
+  │   Inference
+  ├── classifierPnm.py                        Inference core: tiling, heatmaps, voting, erosion, model scan
+  ├── liveClassifierTorch.py                  Standalone live runner (re-exports classifierPnm)
+  ├── liveClassifierTorchROS.py               ROS2 inference node
+  ├── EnsembleClassifier.py                   Two-stage ensemble classifier
+  ├── ModelDownload.py                        Fetch trained models from the model server
+  ├── integrator3D.py                         OpenGL 3D visualization of detections
+  ├── viewer.py                               Live polarization image viewer
+  │
+  │   Analysis and evaluation
+  ├── ModelAnalysis.py                        All-in-one analysis driver (start here)
   ├── ModelAnalysisEvaluate.py                Batch model evaluation
   ├── ModelAnalysisEvaluateRawDataset.py      Batch evaluation on raw PNG datasets
   ├── ModelAnalysisReport.py                  HTML report generator
-  ├── plotTool.py                             Confusion matrix plotting
+  ├── evaluateClassifierNew.py                Evaluate a checkpoint on one or more dataset dirs
+  ├── evaluateDetection.py                    Evaluate a model as a defect DETECTOR (AUROC, miss@FP)
+  ├── evalTyping.py                           Per-type recall split by domain
+  ├── eval_domain_split.py                    Per-domain (FORTH vs Altinay) backbone comparison
+  ├── materialize_heldout.py                  Write the exact seed-42 held-out split to a standalone H5
   ├── calculateOptimalEnsemble.py             Ensemble weight optimization
-  ├── integrator3D.py                         OpenGL 3D visualization of detections
+  ├── evaluateOptimalEnsemble.py              Evaluate ensemble voting strategies
+  ├── detection_ensemble.py                   Ensemble search on the detection metric
+  ├── identifyDefectsConfusedWithClean.py     Find defects misclassified as clean
+  ├── benchmarkAllModels.py                   Throughput benchmark across all allclass_* models
+  ├── plotTool.py                             Confusion matrix plotting
+  ├── plot_param_count.py                     Parameter-count bar chart
+  ├── plot_tensorboard_comparison.py          TensorBoard validation-curve comparison
+  │
+  │   Infrastructure
   ├── SharedMemoryManager.py                  Shared memory Python bindings
   ├── SharedMemoryServer.py                   Standalone shared memory server
-  ├── viewer.py                               Live polarization image viewer
-  ├── splitChannels.py                        Polarization channel splitter
   ├── CMakeLists.txt                          ROS2 package build configuration
   ├── requirements.txt                        Python dependencies
   ├── last.pth                                Latest model checkpoint (symlink, updated after training)
@@ -642,7 +758,12 @@ magician_vision_classifier/
   ├── SharedMemoryVideoBuffers/               Shared memory C library source
   ├── models/                                 Trained model archives
   ├── sounds/                                 Audio feedback files
+  ├── legacy/                                 Retired code, kept for reference only (see legacy/README.md)
 ```
+
+### Legacy
+
+`legacy/` holds retired code that is no longer on a supported path — the Keras-era tooling (`client.py`, `dumpKerasDataset.py`, `evaluateTorch.py`), superseded implementations (`ModelAnalysisOld.py`, `EnsembleClassifierOG.py`), and unrelated or scratch scripts (`principleComponentAnalysis.py`, `randomCameraPoses.py`, `randomHeatmap.py`). Nothing there is imported by the training, inference or analysis pipelines, and most of it will not run as-is. See `legacy/README.md` for what replaced each file.
 
 ---
 

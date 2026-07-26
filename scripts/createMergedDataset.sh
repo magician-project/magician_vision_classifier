@@ -6,11 +6,11 @@ cd ..
 rm -rf keras_dataset/
 
 rm -rf keras_dataset_negative/
-python3 dumpKerasDataset.py magician/20-0.02-lights-negativedents/*.pnm
+python3 legacy/dumpKerasDataset.py magician/20-0.02-lights-negativedents/*.pnm
 mv keras_dataset/ keras_dataset_negative/
 
 rm -rf keras_dataset_positive/
-python3 dumpKerasDataset.py magician/21-0.02-lights-positivedents/*.pnm
+python3 legacy/dumpKerasDataset.py magician/21-0.02-lights-positivedents/*.pnm
 mv keras_dataset/ keras_dataset_positive/
 
 

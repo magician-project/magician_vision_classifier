@@ -1,14 +1,24 @@
-opencv-python
+# Core: training, inference and analysis
 numpy
+opencv-python
+pillow
 torch
 torchvision
 torchmetrics
 pytorch-lightning
-pillow
-wandb
-numpy
-tensorflow
+h5py
+tqdm
+psutil
+
+# Metrics and plotting
+scikit-learn
 matplotlib
 seaborn
-h5py
-numba
+
+# Experiment logging (TensorBoard is the default; wandb is opt-in via config)
+tensorboard
+wandb
+
+# Optional: 3D detection viewer (integrator3D.py). Also needs system freeglut,
+# e.g. sudo apt install freeglut3-dev
+PyOpenGL
