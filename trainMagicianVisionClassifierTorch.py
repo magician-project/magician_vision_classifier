@@ -1288,17 +1288,38 @@ class Classifier(pl.LightningModule):
 
         return loss
 
+    # Channel order of the 4 polarization planes as they reach the model. Traced
+    # end to end and identical on every path that feeds the network:
+    #   readData.readPolarPNMToRGBALive emits [I0, I45, I90, I135], then a
+    #   0<->2 swap is applied exactly once --
+    #     training H5 : annotator datasetCreator.py `tile[:, :, [2, 1, 0, 3]]`
+    #     training PNG: load_rgba_image's cv2.COLOR_RGBA2BGRA
+    #     live/ROS    : classifierPnm.runSingle's cv2.COLOR_RGBA2BGRA
+    #     ensemble    : EnsembleClassifier.py cv2.COLOR_RGBA2BGRA
+    #   -> [I90, I45, I0, I135].
+    # Only the Stokes maths below depends on this ordering; the other derived
+    # channels (Unpolarized / Max / Min / Range / monochrome) are symmetric over
+    # the 4 planes. The polar_flip / polar_rot permutations in
+    # augment_train_batch also assume this order.
+    CH_I90, CH_I45, CH_I0, CH_I135 = 0, 1, 2, 3
+
     def calculate_stokes(self, x):
         """
-        Compute the 4 Stokes parameters (S0, S1, S2, S3) from the 4-channel
-        polarization input. The input channels are assumed to be:
-          [I_total, 0°_linear, 45°_linear, Right_circular]
+        Compute the Stokes parameters from the 4 linear polarization channels.
 
-        Stokes formulas:
-          S0 = I_total
-          S1 = I(0°) - I(90°)   → x[:,1] - x[:,2]
-          S2 = I(45°) - I(135°) → x[:,1] + x[:,2]
-          S3 = 2*I(right_circ) - I_total
+        Input channel order is [I90, I45, I0, I135] -- see CH_* above.
+
+        Stokes formulas (linear only; a DoFP sensor measures 0/45/90/135, so the
+        circular component S3 is not observable and is returned as zero rather
+        than being faked from one of the linear channels):
+          S0 = I(0°) + I(90°)     total intensity
+          S1 = I(0°) - I(90°)
+          S2 = I(45°) - I(135°)
+          S3 = 0
+
+        Matches the annotator's reference implementation in
+        magician_grabber_annotator/visualizeData.py:convertPolarCVMATToRGB
+        (ways 9/10), which is what the operator sees when labelling.
 
         Args:
             x: Tensor of shape (batch_size, 4, height, width).
@@ -1306,10 +1327,14 @@ class Classifier(pl.LightningModule):
         Returns:
             Stokes tensor of shape (batch_size, 4, height, width).
         """
-        S0 = x[:, 0, :, :]
-        S1 = x[:, 1, :, :] - x[:, 2, :, :]
-        S2 = x[:, 1, :, :] + x[:, 2, :, :]
-        S3 = x[:, 3, :, :]
+        I90  = x[:, self.CH_I90,  :, :]
+        I45  = x[:, self.CH_I45,  :, :]
+        I0   = x[:, self.CH_I0,   :, :]
+        I135 = x[:, self.CH_I135, :, :]
+        S0 = I0 + I90
+        S1 = I0 - I90
+        S2 = I45 - I135
+        S3 = torch.zeros_like(S0)
         return torch.stack((S0, S1, S2, S3), dim=1)
 
     def calculate_DoLP(self, x):
@@ -1328,14 +1353,16 @@ class Classifier(pl.LightningModule):
         S1 = x[:, 1, :, :]
         S2 = x[:, 2, :, :]
         #S3 = x[:, 3, :, :]  # Not used in DoLP
-        DoLP = torch.sqrt(S1**2 + S2**2) / (S0 + 1e-8)
-        return DoLP
+        # Clamped like the annotator's reference implementation: S0 -> 0 on a dark
+        # tile would otherwise emit an unbounded value into the network.
+        DoLP = torch.sqrt(S1**2 + S2**2) / (S0 + 1e-6)
+        return torch.clamp(DoLP, 0.0, 1.0)
 
     def calculate_AoLP(self, x):
         """
         Compute the Angle of Linear Polarization from Stokes parameters.
         AoLP = 0.5 * atan2(S2, S1), representing the orientation angle of the
-        electric field oscillation. Value range: [-pi/4, pi/4].
+        electric field oscillation. Value range: [-pi/2, pi/2].
 
         Args:
             x: Stokes tensor of shape (batch_size, 4, height, width).
