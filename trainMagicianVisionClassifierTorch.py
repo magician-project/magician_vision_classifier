@@ -273,6 +273,19 @@ def drop_dataset_classes(dataset, drop):
     old_classes = list(dataset.classes)
     drop_set = set(drop)
     new_classes = [c for c in old_classes if c not in drop_set]
+    # Safety net: a drop rule that eats most of the label space is almost always a
+    # config interaction rather than intent (see resolve_auto_drops' strip_severity
+    # guard). Fail on a degenerate result, warn on a suspicious one, so the next
+    # variant of that mistake cannot pass silently.
+    if len(new_classes) < 2:
+        raise ValueError(
+            f"[drop_classes] dropping {sorted(drop_set)} leaves {new_classes} — "
+            f"a classifier needs at least 2 classes. Check drop_classes / "
+            f"drop_severityless_defects / drop_class_families in the config.")
+    if len(drop_set) > len(new_classes):
+        print(f"[drop_classes] WARNING dropping {len(drop_set)} classes "
+              f"{sorted(drop_set)} leaves only {len(new_classes)} "
+              f"({new_classes}) — verify this is intended")
     new_cti = {c: i for i, c in enumerate(new_classes)}
     drop_idx = {old_cti[c] for c in drop}
     # current-label-index -> new-index (or -1 if dropped)
@@ -331,15 +344,34 @@ def resolve_auto_drops(classes, config_json, clean_name='class_clean'):
     suffix = _re.compile(r'Class[ABC]$')
     drop = set()
     if config_json.get('drop_severityless_defects'):
-        # A merge DESTINATION is created deliberately by the config, so it is not
-        # "a defect whose severity was never labelled". Without this guard a binary
-        # bucket -- {"class_Welding": "class_defect", ...} -- would be built by the
-        # merge and then immediately auto-dropped for lacking a Class[ABC] suffix,
-        # leaving the run with class_clean alone.
-        protected = set((config_json.get('class_merges') or {}).values())
-        for c in classes:
-            if c != clean_name and c not in protected and not suffix.search(c):
-                drop.add(c)
+        # GUARD: strip_severity has already removed every Class[ABC] suffix, so this
+        # rule would match EVERY defect and leave the run with class_clean plus
+        # whatever the merges happen to protect. Measured on train_nonaltinay_v2 with
+        # crossval_v2_rot_customwide.json: 7 classes -> ['class_clean',
+        # 'class_Welding'], discarding 354,480 defect tiles (73% of all defects)
+        # without a word. Warn and skip instead.
+        #
+        # NOTE this keys off the CONFIG FLAG, not off "no class carries a suffix".
+        # Those are different situations with opposite correct answers: a natively
+        # base-named dump (val_altinay, train_nonaltinay, val_canonical) also has no
+        # suffixes, and there dropping IS intended -- admitting a severity-less
+        # class_Welding beside class_WeldingClassA would create a bogus fourth
+        # "no severity" category. Only the strip_severity case is the mistake.
+        if config_json.get('strip_severity') or config_json.get('severity') is False:
+            print("[auto_drops] WARNING drop_severityless_defects IGNORED: "
+                  "strip_severity removed every Class[ABC] suffix, so this rule would "
+                  "match every defect and collapse the label space. Use "
+                  "drop_class_families to drop specific families in a non-severity run.")
+        else:
+            # A merge DESTINATION is created deliberately by the config, so it is not
+            # "a defect whose severity was never labelled". Without this guard a binary
+            # bucket -- {"class_Welding": "class_defect", ...} -- would be built by the
+            # merge and then immediately auto-dropped for lacking a Class[ABC] suffix,
+            # leaving the run with class_clean alone.
+            protected = set((config_json.get('class_merges') or {}).values())
+            for c in classes:
+                if c != clean_name and c not in protected and not suffix.search(c):
+                    drop.add(c)
     families = set(config_json.get('drop_class_families') or [])
     if families:
         for c in classes:
@@ -747,8 +779,19 @@ class CustomCNN(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc1 = nn.Linear(p4, prefinalLayerChannels)
         self.fc2 = nn.Linear(prefinalLayerChannels, intermediateLayerChannels)  # new layer
-        self.bn_dense1 = nn.InstanceNorm1d(prefinalLayerChannels)
-        self.bn_dense2 = nn.InstanceNorm1d(intermediateLayerChannels)
+        # LayerNorm(..., elementwise_affine=False), NOT InstanceNorm1d.
+        # The FC head feeds these a 2-D (B, C) tensor. InstanceNorm1d accepts that
+        # but interprets it as an UNBATCHED (channels=B, length=C) signal, warning
+        # "input's size at dim=0 does not match num_features" on every call, and
+        # normalising each row over the feature dim -- which is LayerNorm, arrived
+        # at by accident. PyTorch has deprecated feeding 2-D input to InstanceNorm,
+        # so this was a future breakage as well as a misleading name.
+        # elementwise_affine=False keeps it parameter-free, so the swap is
+        # numerically identical (max abs diff 4.8e-07, i.e. float32 noise) and the
+        # state_dict is unchanged -- every existing CustomCNN checkpoint still loads.
+        # The bn_dense* attribute names are kept so the diff stays minimal.
+        self.bn_dense1 = nn.LayerNorm(prefinalLayerChannels, elementwise_affine=False)
+        self.bn_dense2 = nn.LayerNorm(intermediateLayerChannels, elementwise_affine=False)
         self.dropout = nn.Dropout(dropout_rate)
         self.out = nn.Linear(intermediateLayerChannels, num_classes)
 
@@ -2342,6 +2385,27 @@ if __name__ == "__main__":
     else:
         train_targets = train_dataset.targets
 
+    # Shared DataLoader throughput settings. The pipeline is input-bound (GPU ~63%
+    # util, gzip HDF5 chunks), so these are close to free wins:
+    #   pin_memory        page-locked staging buffers -> the host->device copy can
+    #                     overlap compute instead of blocking on a pageable copy.
+    #   persistent_workers keep the worker pool alive between epochs. With
+    #                     BalancedBatchSampler an "epoch" is 38k batches so this is
+    #                     minor, but under sampling_temperature (8x shorter epochs)
+    #                     the respawn cost is paid 8x more often.
+    #   prefetch_factor   batches queued per worker; the default is 2, and a little
+    #                     more depth smooths out gzip decompression stalls.
+    # All three REQUIRE num_workers > 0, hence the guard -- note the
+    # cacheAllDataToRAM path forces num_workers to 1, and a plain 0 is legal too.
+    loader_kwargs = {}
+    if num_workers > 0:
+        loader_kwargs = {
+            "pin_memory":         True,
+            "persistent_workers": True,
+            "prefetch_factor":    int(config_json['dataloader'].get('prefetch_factor', 4)),
+        }
+    print(f"DataLoader tuning: num_workers={num_workers} {loader_kwargs or '(single-process: no pinning/prefetch)'}")
+
     # Create DataLoaders
     #
     # `dataloader.sampling_temperature` (tau) is an OPT-IN alternative to
@@ -2393,6 +2457,7 @@ if __name__ == "__main__":
                                   sampler=sampler,
                                   num_workers=num_workers,
                                   drop_last=True,
+                                  **loader_kwargs,
                                  )
     elif balanced_sampling:
         print(f"Using BalancedBatchSampler (batch_size={batch_size}, num_classes={len(dataset.classes)})")
@@ -2405,6 +2470,7 @@ if __name__ == "__main__":
                                   train_dataset,
                                   batch_sampler=balanced_sampler,
                                   num_workers=num_workers,
+                                  **loader_kwargs,
                                  )
     else:
         train_loader = DataLoader(
@@ -2413,6 +2479,7 @@ if __name__ == "__main__":
                                   shuffle=True,
                                   num_workers=num_workers,
                                   drop_last=True,
+                                  **loader_kwargs,
                                  )
 
     val_loader  = DataLoader(
@@ -2421,6 +2488,7 @@ if __name__ == "__main__":
                             shuffle=False,
                             num_workers=num_workers,
                             drop_last=False,  # never discard validation samples
+                            **loader_kwargs,
                            )
 
     #Print class names as a sanity check
@@ -2556,6 +2624,31 @@ if __name__ == "__main__":
           f"({'ALL epochs kept' if ckpt_top_k == -1 else 'best epoch(s) only'}) "
           f"dir={ckpt_dir or '<logger default>'}")
 
+    # Deterministic cuDNN kernels are only worth their speed penalty if the run is
+    # ACTUALLY reproducible. The old test looked at noise_std alone, but every
+    # augmentation below draws from the RNG too -- with gain_jitter/polar_flip/
+    # channel_jitter/polar_rot on (the standard v2rot recipe) the run was never
+    # reproducible, so the deterministic kernels bought nothing and only cost
+    # throughput. Now every stochastic knob is considered, and the config can force
+    # the decision either way with "deterministic": true/false.
+    _stochastic = {
+        'noise_std':      noise_std > 0.0,
+        'gain_jitter':    gain_jitter > 0.0,
+        'channel_jitter': channel_jitter > 0.0,
+        'polar_flip':     bool(polar_flip),
+        'polar_rot':      bool(polar_rot),
+    }
+    _active = [k for k, v in _stochastic.items() if v]
+    if 'deterministic' in config_json:
+        deterministic_mode = bool(config_json['deterministic'])
+        print(f"Deterministic mode forced by config: {deterministic_mode}")
+    else:
+        deterministic_mode = not _active
+        print(f"Deterministic mode: {deterministic_mode}"
+              + (f" (stochastic augmentation active: {', '.join(_active)} -> "
+                 f"the run is not reproducible anyway, so deterministic kernels "
+                 f"would only cost throughput)" if _active else ""))
+
     trainer = pl.Trainer(
                          max_epochs=epochs,
                          logger=loggers,
@@ -2564,7 +2657,7 @@ if __name__ == "__main__":
                          accelerator=config_json['accelerator'],
                          devices=config_json['devices'],
                          gradient_clip_val=gradient_clip_val,
-                         deterministic= (noise_std==0.0), #<- When there is noise switch to non deterministic to speed up training
+                         deterministic= deterministic_mode,
                        )
 
     #Train and log to console
@@ -2635,7 +2728,9 @@ if __name__ == "__main__":
 
         # Embed confusion matrix in the main config JSON
         config_json["confusion_matrix"] = confusion_matrix.tolist()
-        config_json["classes_int"] = [int(c) for c in set(y_true)]
+        # sorted(): a set has no defined iteration order, so this key used to come
+        # out in an arbitrary order and was meaningless to any reader.
+        config_json["classes_int"] = sorted(int(c) for c in set(y_true))
         config_json["classes"] = dataset.classes
 
         # Write a separate confusion JSON and generate the plot image
