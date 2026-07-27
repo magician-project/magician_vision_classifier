@@ -1235,6 +1235,10 @@ class ClassifierPnm:
         print("Final Dense Layer ", self.final_dense_layer)
         #-----------------------------------------------------------------
         self.model = self.load_model()
+        # Operating curve for this model, so the runtime can report what a gate
+        # threshold costs instead of the operator guessing. See _load_threshold_curve.
+        self.threshold_curve = self._load_threshold_curve()
+        print(self.format_threshold_tradeoff(self.maxProbabilityThreshold))
         if (precache):
            #for i in range(5):
            #    self.test_model(i)
@@ -1323,6 +1327,84 @@ class ClassifierPnm:
         model.eval()
         return model
 
+    # ------------------------------------------------------------------
+    # Threshold curve: what a gate setting actually costs
+    # ------------------------------------------------------------------
+    # The trainer writes "<stem>_threshold_curve.json" next to the model with a
+    # full defect-vs-clean operating curve (detected / false_alarm sampled every
+    # 0.005). Loading it lets the runtime answer "what does threshold 0.90 buy
+    # me?" instead of the operator guessing. A high threshold is often the RIGHT
+    # deployment choice -- tile false alarms are multiplied by ~thousands of tiles
+    # per frame -- but the cost in missed defects should be stated, not implied.
+    def _load_threshold_curve(self):
+        """Load the trainer's sweep for this model. Returns {} when absent."""
+        path = os.path.splitext(self.model_path)[0] + "_threshold_curve.json"
+        if not os.path.isfile(path):
+            print(f"No threshold curve at {path} — gate trade-offs will not be reported")
+            return {}
+        try:
+            with open(path, "r") as f:
+                curve = json.load(f)
+            print(f"Loaded threshold curve {path}")
+            return curve
+        except Exception as e:
+            print(f"Failed reading threshold curve {path}: {repr(e)}")
+            return {}
+
+    def describe_threshold(self, threshold, gateMode=None):
+        """Expected (detected, false_alarm) at `threshold`, linearly interpolated
+        from the trainer's sweep. Returns None when no curve is available or the
+        curve has no sweep for this gate mode."""
+        curve = getattr(self, "threshold_curve", None) or {}
+        mode = gateMode or self.gateMode
+        sweep = (curve.get("sweeps") or {}).get(mode) or curve.get("sweep")
+        if not sweep:
+            return None
+        pts = sorted(sweep, key=lambda s: s["threshold"])
+        t = float(threshold)
+        if t <= pts[0]["threshold"]:
+            lo = hi = pts[0]
+        elif t >= pts[-1]["threshold"]:
+            lo = hi = pts[-1]
+        else:
+            hi = next(p for p in pts if p["threshold"] >= t)
+            lo = max((p for p in pts if p["threshold"] <= t), key=lambda p: p["threshold"])
+        span = hi["threshold"] - lo["threshold"]
+        w = 0.0 if span <= 0 else (t - lo["threshold"]) / span
+        lerp = lambda a, b: a + w * (b - a)
+        return {
+            "threshold":   t,
+            "mode":        mode,
+            "detected":    lerp(lo["detected"],    hi["detected"]),
+            "false_alarm": lerp(lo["false_alarm"], hi["false_alarm"]),
+        }
+
+    def format_threshold_tradeoff(self, threshold, gateMode=None):
+        """Human-readable summary of `threshold` plus the trainer's named picks,
+        for logging whenever the gate is initialised or changed."""
+        at = self.describe_threshold(threshold, gateMode)
+        if at is None:
+            return (f"gate {gateMode or self.gateMode} @ {float(threshold):.3f} "
+                    f"(no threshold curve for this model — trade-off unknown)")
+        lines = [f"gate {at['mode']} @ {at['threshold']:.3f} -> "
+                 f"detects {at['detected']:.1%} of defect tiles, "
+                 f"false-alarms on {at['false_alarm']:.2%} of clean tiles"]
+        # The trainer's named operating points, for context on where this sits.
+        gate_cfg = self.cfg.get("gate", {}) if isinstance(self.cfg, dict) else {}
+        named = [("model gate (KPI, misses x2)", gate_cfg.get("threshold"))]
+        for label, alt in (gate_cfg.get("alternatives") or {}).items():
+            if isinstance(alt, dict):
+                named.append((label, alt.get("threshold")))
+        for label, t in named:
+            if t is None:
+                continue
+            d = self.describe_threshold(t, gateMode)
+            if d:
+                mark = "  <-- in use" if abs(float(t) - at["threshold"]) < 1e-6 else ""
+                lines.append(f"    {label:32s} {float(t):.3f}  "
+                             f"detect {d['detected']:6.1%}  FA {d['false_alarm']:6.2%}{mark}")
+        return "\n".join(lines)
+
     @staticmethod
     def _is_valid_pth(path):
         """Return True if the file is a readable zip/pickle (PyTorch checkpoint)."""
@@ -1396,6 +1478,14 @@ class ClassifierPnm:
             print(f"Failed to load model '{name}': {e}")
             print(f"The file '{model_path}' may be corrupted or incomplete.")
             return False
+        # Adopt the NEW model's calibrated gate + its curve. Thresholds are not
+        # portable between models, so a hot-swap must re-read both.
+        gate_cfg = self.cfg.get("gate", {}) if isinstance(self.cfg, dict) else {}
+        self.gateMode                = gate_cfg.get("mode", GATE_DEFECT_MASS)
+        self.maxProbabilityThreshold = float(gate_cfg.get("threshold", 0.0))
+        self.assignBestDefectClass   = bool(gate_cfg.get("assign_best_defect_class", True))
+        self.threshold_curve         = self._load_threshold_curve()
+        print(self.format_threshold_tradeoff(self.maxProbabilityThreshold))
         self.class_colors = getNDifferentColors(len(self.tile_classes))
         print(f"Reload complete: {name}")
         return True

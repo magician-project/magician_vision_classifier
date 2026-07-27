@@ -300,7 +300,24 @@ class DefectPublisher(Node):
         # Runtime tunables (dynamic via services)
         self._target_fps = 23.0
         self._step_size = 18
-        self._threshold = 0.90  # min softmax confidence for a tile prediction to be kept; tiles below this are reassigned to the low-confidence class (0.90: FP-reduction bias)
+        # Gate score threshold. NOTE the semantics depend on the model's gate MODE
+        # (classifierPnm.gate_tiles): under the default "defect_mass" this thresholds
+        # 1 - P(clean), NOT the max softmax probability, so it is NOT comparable to a
+        # max_prob threshold of the same numeric value.
+        #
+        # 0.90 is a deliberate FALSE-ALARM-SUPPRESSING choice and is intentionally
+        # stricter than the model's own KPI-optimal gate: a frame holds thousands of
+        # tiles, so a per-tile FA rate that looks small becomes many crosses per
+        # frame. On allclass_forthalt_custom the trainer's sweep gives
+        #   0.675 (model KPI gate) -> detect 88.9%  FA 15.92%
+        #   0.900 (this default)   -> detect 73.6%  FA  1.97%
+        # The cost in missed defects is real, so it is logged at startup and on every
+        # change rather than left implicit -- see _log_threshold_tradeoff.
+        #
+        # Set to None (or call set_threshold with a negative value) to FOLLOW THE
+        # MODEL's own calibrated gate instead of pinning a value here.
+        self._threshold = 0.90
+        self._last_pushed_threshold = None   # avoid re-assigning an unchanged value every frame
         self._erosion_kernel = 1   # neighborhood radius for tile voting: (2k+1)^2 tiles
         self._min_votes = 2        # activated tiles (incl. itself) required in the neighborhood to accept a tile; 0/1 = voting off
         self._majority_voting = True
@@ -450,14 +467,39 @@ class DefectPublisher(Node):
         return response
 
     def _set_threshold_cb(self, request, response):
-        """Set the min softmax confidence threshold; tiles whose max-class probability falls below this are reassigned to the low-confidence class instead of keeping the model's prediction."""
-        thr = max(0.0, min(1.0, float(request.data)))
+        """Set the gate score threshold. Semantics depend on the model's gate mode
+        (under the default "defect_mass" this thresholds 1 - P(clean), not the max
+        softmax probability). A NEGATIVE value clears the override and follows the
+        model's own calibrated gate. The expected detection / false-alarm trade-off
+        at the new setting is looked up from the model's threshold curve and
+        returned in the response."""
+        raw = float(request.data)
+        thr = None if raw < 0.0 else max(0.0, min(1.0, raw))
         with self._lock:
             self._threshold = thr
+        if thr is None:
+            response.message = "Threshold override CLEARED — following the model's calibrated gate"
+        else:
+            response.message = f"Gate threshold set to {thr:.3f}\n" + self._threshold_tradeoff_text(thr)
         response.success = True
-        response.message = f"Max probability threshold set to {self._threshold}"
         self.get_logger().info(response.message)
         return response
+
+    def _threshold_tradeoff_text(self, threshold):
+        """Expected trade-off at `threshold`, from the active model's curve."""
+        clf = self._single_classifier
+        if clf is None or not hasattr(clf, "format_threshold_tradeoff"):
+            return "  (no classifier loaded yet — trade-off unavailable)"
+        try:
+            return clf.format_threshold_tradeoff(threshold)
+        except Exception as e:
+            return f"  (threshold curve lookup failed: {e})"
+
+    def _log_threshold_tradeoff(self, threshold, context=""):
+        """Log what the current gate setting buys and costs. Called at startup and
+        whenever the value actually changes — never per frame."""
+        self.get_logger().info(
+            f"{context}{self._threshold_tradeoff_text(threshold)}")
 
     def _set_erosion_kernel_cb(self, request, response):
         """Set the voting neighborhood radius k; votes are counted over the (2k+1)^2 tiles around each activation."""
@@ -926,6 +968,13 @@ def main():
     ros_node._model_dir = PATH
     ros_node._single_classifier = single_classifier
 
+    # State the gate's expected trade-off once, up front. The runtime default is
+    # deliberately stricter than the model's KPI-optimal gate to suppress false
+    # alarms; this makes the cost in missed defects explicit instead of implicit.
+    ros_node._log_threshold_tradeoff(
+        ros_node.get_max_probability_threshold(),
+        "Startup gate setting — ")
+
     ensemble_classifier = EnsembleClassifierPnm(
         initial_model_cfg=(
             f"{PATH}/binary_small_cnn.pth",
@@ -995,7 +1044,9 @@ def main():
                 if ros_node.two_stage_enabled():
                     with ros_node._model_lock:
                         ensemble_classifier.step = ros_node.get_step_size()
-                        ensemble_classifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
+                        thr = ros_node.get_max_probability_threshold()
+                        if thr is not None and thr != ensemble_classifier.maxProbabilityThreshold:
+                            ensemble_classifier.maxProbabilityThreshold = thr
                         tile_size = ensemble_classifier.tile_size
 
                         heatmap, occupancy, responses = ensemble_classifier.forward(
@@ -1007,7 +1058,14 @@ def main():
                 else:
                     with ros_node._model_lock:
                         single_classifier.step = ros_node.get_step_size()
-                        single_classifier.maxProbabilityThreshold = ros_node.get_max_probability_threshold()
+                        # Push the override only when it CHANGED. Assigning every frame
+                        # meant a model hot-swap silently lost the new model's calibrated
+                        # gate (reload_model re-reads it, then the next frame overwrote
+                        # it again). A None override leaves the model's own gate alone.
+                        thr = ros_node.get_max_probability_threshold()
+                        if thr is not None and thr != single_classifier.maxProbabilityThreshold:
+                            single_classifier.maxProbabilityThreshold = thr
+                            ros_node._log_threshold_tradeoff(thr, "Gate threshold changed: ")
                         tile_size = single_classifier.tile_size
 
                         heatmap, occupancy, responses = single_classifier.forward(

@@ -550,7 +550,13 @@ class CategoricalFocalLoss(nn.Module):
         Categorical Focal Loss for multi-class classification.
 
         :param gamma: Focusing parameter (higher values focus more on hard examples)
-        :param alpha: Class weighting (list or tensor of shape [num_classes] or None)
+        :param alpha: Class weighting (TENSOR of shape [num_classes], or None).
+                      NOTE: the trainer never supplies this -- it always builds
+                      CategoricalFocalLoss(gamma=2.0, alpha=None) and handles class
+                      imbalance through the sampler instead. See the "DEAD FEATURE:
+                      class_weight" comment in main() for why, and note that a
+                      scalar (like the 0.25 default below) would crash the
+                      `self.alpha[targets]` lookup -- only a per-class tensor works.
         :param reduction: Reduction mode: 'none' | 'mean' | 'sum'
         """
         super(CategoricalFocalLoss, self).__init__()
@@ -1393,13 +1399,32 @@ class Classifier(pl.LightningModule):
         self.precision.reset()
         self.auroc.reset()
 
-    # Parameter-name fragments identifying the NON-body (input adapter / stem /
-    # classifier head) parameters — the ones we replaced and that should keep
+    # Parameter-name PREFIXES identifying the NON-body (input adapter / stem /
+    # classifier head) parameters — the ones we replaced above and that should keep
     # training while the pretrained body is frozen. Everything else is "body".
-    _NONBODY_KEYS = ('conv1', 'bn1', 'stem', 'fc', 'classifier', 'head', 'features.0')
+    #
+    # These must be matched as PREFIXES, not substrings. The original code used
+    # `key in name`, which meant 'conv1' also matched 'layer1.0.conv1.weight' and
+    # 'bn1' also matched 'layer2.1.bn1.bias' — so on resnet18 only 33 tensors were
+    # frozen while 29 stayed trainable, including most of the residual body. The
+    # freeze silently did roughly half of what its docstring claims.
+    #
+    # One entry per backbone's replaced stem/head, matching the constructor above:
+    #   conv1.         resnet18* (incl. the Sequential stems), resnext50, shufflenet
+    #   bn1. / fc.     resnet18*, resnext50, regnet, shufflenet
+    #   stem.          regnet
+    #   features.0.    convnext, efficientnet, swin, mobilenet, squeezenet
+    #   features.conv0. densenet121
+    #   layers.0.      mnasnet
+    #   classifier. / head.  every classifier head
+    # The trailing dot is required: it is what stops 'fc' from also matching a
+    # hypothetical 'fc_extra' and, more importantly, anchors the match at the top
+    # level of the module tree.
+    _NONBODY_PREFIXES = ('conv1.', 'bn1.', 'stem.', 'fc.', 'classifier.', 'head.',
+                         'features.0.', 'features.conv0.', 'layers.0.')
 
     def _is_body_param(self, name):
-        return not any(k in name for k in self._NONBODY_KEYS)
+        return not name.startswith(self._NONBODY_PREFIXES)
 
     def _set_body_frozen(self, frozen):
         if self._body_frozen_state is frozen:
@@ -2291,12 +2316,65 @@ if __name__ == "__main__":
 
 
 
+    # Targets of the TRAINING split only (a Subset indexes into its parent).
+    if isinstance(train_dataset, torch.utils.data.Subset):
+        train_targets = [train_dataset.dataset.targets[i] for i in train_dataset.indices]
+    else:
+        train_targets = train_dataset.targets
+
     # Create DataLoaders
-    if balanced_sampling:
-        if isinstance(train_dataset, torch.utils.data.Subset):
-            train_targets = [train_dataset.dataset.targets[i] for i in train_dataset.indices]
-        else:
-            train_targets = train_dataset.targets
+    #
+    # `dataloader.sampling_temperature` (tau) is an OPT-IN alternative to
+    # BalancedBatchSampler, for experimentation -- it is NOT the default and
+    # changes nothing unless the key is present. Sample weight = n_c^(tau-1), so
+    # the class is drawn with probability proportional to n_c^tau:
+    #     tau = 0.0  fully balanced   (same class PROPORTIONS as BalancedBatchSampler)
+    #     tau = 0.5  sqrt-frequency   (the usual middle ground)
+    #     tau = 1.0  natural frequency (no correction at all)
+    # CAUTION -- tau=0.0 is NOT a drop-in replacement for BalancedBatchSampler.
+    # Both give uniform class exposure, but this sampler draws len(train) samples
+    # per epoch while BalancedBatchSampler draws max(class_count)*num_classes:
+    # on train_nonaltinay_v2 that is 241,784 vs 1,934,350 draws per class, an
+    # 8.06x shorter epoch. Scale training_epochs accordingly before comparing.
+    # Motivation, measured on train_nonaltinay_v2 (10 classes, batch 504):
+    # BalancedBatchSampler gives every class 50 slots x 38,687 batches, i.e. one
+    # "epoch" draws 19.5M samples = 8.06x the 2.42M-tile dataset, and the rarest
+    # class (MaterialDefectClassA, 3,440 tiles) is replayed 562x per epoch --
+    # ~2,250x over a 4-epoch run, which is a lot of memorization pressure on the
+    # classes that generalize worst cross-site. At tau=0.5 that replay drops to
+    # ~24x and an epoch is one real pass. UNVERIFIED whether it helps the KPI;
+    # that is exactly what the knob is for. Leave the key out to reproduce every
+    # result obtained so far.
+    sampling_temperature = config_json['dataloader'].get('sampling_temperature', None)
+
+    if sampling_temperature is not None:
+        tau = float(sampling_temperature)
+        counts = np.bincount(np.asarray(train_targets, dtype=np.int64),
+                             minlength=len(dataset.classes))
+        weights = np.power(np.maximum(counts, 1), tau - 1.0)[np.asarray(train_targets)]
+        sampler = torch.utils.data.WeightedRandomSampler(
+            torch.as_tensor(weights, dtype=torch.double),
+            num_samples=len(train_targets),
+            replacement=True,
+        )
+        print(f"Using tempered WeightedRandomSampler (sampling_temperature={tau}, "
+              f"{len(train_targets):,} samples/epoch). Expected replays/epoch per class:")
+        for ci in range(len(dataset.classes)):
+            n = int(counts[ci])
+            if n == 0:
+                continue
+            # draws for class ci = num_samples * (n * n^(tau-1)) / sum_j(n_j^tau)
+            share = (n ** tau) / float(sum(int(c) ** tau for c in counts if c > 0))
+            print(f"    {dataset.classes[ci]:28s} {n:9,} tiles  "
+                  f"{len(train_targets)*share/n:7.1f}x")
+        train_loader = DataLoader(
+                                  train_dataset,
+                                  batch_size=batch_size,
+                                  sampler=sampler,
+                                  num_workers=num_workers,
+                                  drop_last=True,
+                                 )
+    elif balanced_sampling:
         print(f"Using BalancedBatchSampler (batch_size={batch_size}, num_classes={len(dataset.classes)})")
         balanced_sampler = BalancedBatchSampler(
             targets     = train_targets,
@@ -2338,30 +2416,44 @@ if __name__ == "__main__":
               cleanClassID = i
     print(f"Clean class ID is : {cleanClassID}")
 
-    """
+    # ---------------------------------------------------------------------
+    # DEAD FEATURE: "class_weight" / focal-loss alpha.  KEPT FOR THE RECORD.
+    # ---------------------------------------------------------------------
+    # This block used to build an inverse-frequency `alpha` vector, normalize it,
+    # and move it to the device -- and then NOTHING consumed it. Classifier.__init__
+    # hardcodes CategoricalFocalLoss(gamma=2.0, alpha=None), so every run with
+    # "class_weight": true has silently been an unweighted run. All configs in
+    # configs/ set it to false, so no published result is affected.
+    #
+    # It is deliberately NOT being revived, because BalancedBatchSampler already
+    # performs exactly this correction -- by frequency instead of by loss weight.
+    # Wiring alpha back in would double-correct. Measured on train_nonaltinay_v2
+    # (10 classes, batch 504), relative to uniform:
+    #
+    #   class                     tiles    sampler replay  x alpha  = combined
+    #   MaterialDefectClassA      3,440         562x         5.2x      2927x
+    #   DeformationClassA         7,708         251x         2.3x       583x
+    #   WeldingClassA           128,986          15x        0.14x         2x
+    #   clean                 1,934,376           1x       0.009x     0.009x
+    #
+    # i.e. a 3,440-tile class would end up ~3000x over-weighted and the model
+    # would simply predict it. Two further defects if anyone reconsiders:
+    #   * `alpha /= alpha.sum()` normalizes to a simplex, shrinking the total loss
+    #     ~1/num_classes and acting as an uncontrolled learning-rate change.
+    #     Focal-loss alpha is meant to be O(1) per class, not a distribution.
+    #   * `1 / class_counts[i]` raises ZeroDivisionError for any class with zero
+    #     training samples (Counter returns 0 for a missing key).
+    #
+    # To re-balance, prefer `dataloader.sampling_temperature` above, which is the
+    # same idea with a single continuous knob and no double-correction risk.
+    # CategoricalFocalLoss still ACCEPTS an alpha tensor -- only the trainer
+    # declines to supply one.
+    alpha = None
     if class_weight:
-        class_counts = Counter(train_dataset.dataset.targets)
-        alpha = torch.tensor([1 / class_counts[i] for i in range(len(class_counts))])
-        alpha = alpha / alpha.sum() 
-        alpha = alpha.to(device)
-    else:
-        alpha = None
-    """
-    if class_weight:
-        if isinstance(train_dataset, torch.utils.data.Subset):
-            train_targets = [train_dataset.dataset.targets[i] for i in train_dataset.indices]
-        else:
-            train_targets = train_dataset.targets
-
-        class_counts = Counter(train_targets)
-        alpha = torch.tensor(
-            [1 / class_counts[i] for i in range(len(class_names))],
-            dtype=torch.float32
-        )
-        alpha = alpha / alpha.sum()
-        alpha = alpha.to(device)
-    else:
-        alpha = None
+        print("[WARNING] config sets \"class_weight\": true, but class weighting is a DEAD "
+              "option and is ignored -- see the comment above this warning. "
+              "BalancedBatchSampler (or dataloader.sampling_temperature) already handles "
+              "class imbalance; applying both would double-correct.")
 
 
     # Initialize the classifier
