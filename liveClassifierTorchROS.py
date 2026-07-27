@@ -541,6 +541,8 @@ class DefectPublisher(Node):
           { "tile_size": int,
             "background_avg_prob": float,
             "detections": [ {"x", "y", "w", "h", "type", "class_name", "probability"}, ... ] }
+        where x,y are the tile CENTRE in demosaiced (half-res) pixels, same
+        contract as msg/Detection.msg.
 
         Thread-safe: acquires the lock to read shared pointers.
         Returns (success: bool, message: str).
@@ -571,6 +573,8 @@ class DefectPublisher(Node):
             for (x, y), description, confidence in zip(points, classes, confidences):
                 det_type, det_class = filter_type(description)
                 detections.append({
+                    # x,y are the tile CENTRE in demosaiced (half-res) pixels, matching
+                    # Detection.msg -- NOT a top-left corner. See publish_detection.
                     "x":           int(x),
                     "y":           int(y),
                     "w":           int(tile_size),
@@ -885,7 +889,15 @@ class DefectPublisher(Node):
         self.get_logger().debug("Marker scan complete.")
 
     def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z=0.0, ts=0):
-        """Publish a Detection message with 2D bounding box, type, class, and optional depth."""
+        """Publish a Detection message with 2D box, type, class, and optional depth.
+
+        COORDINATE CONTRACT (see msg/Detection.msg): x,y are the tile CENTRE, NOT
+        the top-left corner, in DEMOSAICED (half-resolution) pixels. w,h are the
+        tile size, so the covered box is [x-w/2, y-h/2]..[x+w/2, y+h/2]. This
+        matches responses["points"], which generate_heatmap and
+        process_predictions_erode already emit as centres -- do NOT add half a
+        tile again at the call site.
+        """
         try:
             msg = Detection()
             msg.header.stamp    = unix_ns_to_ros_time(ts)
@@ -903,7 +915,11 @@ class DefectPublisher(Node):
             self.get_logger().error(f"Failed to publish detection: {e}")
 
     def publish_detection_m(self, cx, cy, severity, depth_z, ts):
-        """Publish a DetectionM message with severity, pixel position, and interpolated depth."""
+        """Publish a DetectionM message with severity, pixel position, and interpolated depth.
+
+        cx, cy are the tile CENTRE in demosaiced (half-res) pixels -- the same
+        coordinate carried by Detection.x/y. See publish_detection.
+        """
         if (not USE_LASERS) or (self.publisher_m is None):
             return
         try:
@@ -1091,8 +1107,13 @@ def main():
                 z = 0.0
                 # DetectionM with interpolated depth
                 if USE_LASERS:
-                    cx = float(x) + 0.5 * float(tile_size)
-                    cy = float(y) + 0.5 * float(tile_size)
+                    # responses["points"] already holds the tile CENTRE --
+                    # generate_heatmap / process_predictions_erode append
+                    # (x + tile_size//2, y + tile_size//2). Adding half a tile again
+                    # here shifted every DetectionM location and every laser-depth
+                    # lookup by tile_size/2 (24 px at tile_size 48).
+                    cx = float(x)
+                    cy = float(y)
 
                     depths = ros_node.get_laser_depths()
                     if all(np.isfinite(d) for d in depths):

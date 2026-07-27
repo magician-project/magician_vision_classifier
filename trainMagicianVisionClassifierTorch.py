@@ -399,97 +399,108 @@ def frame_disjoint_split(dataset, val_split, seed):
     return train_idx, val_idx
 
 
-def evaluate_dumped_tiles(model, tiles_dir, classes, device='cuda', batch_size=16):
-    """
-    Evaluates dumped PNG tiles against the current model.
 
-    Args:
-        model (torch.nn.Module): Trained classifier model.
-        tiles_dir (str): Path to the directory containing dumped tiles.
-        classes (list): List of class names (order must match model outputs).
-        device (str): 'cuda' or 'cpu'.
-        batch_size (int): Batch size for inference.
-
-    Returns:
-        dict: metrics containing accuracy, confusion matrix, and report.
-    """
-
-    import re
-    from tqdm import tqdm
-    from sklearn.metrics import confusion_matrix, classification_report
-    model.eval()
-    model.to(device)
-
-    # HWC uint8 → CHW uint8 tensor; /255 normalisation is done inside the model.
-    transform = transforms.Lambda(
-        lambda img: torch.from_numpy(img).permute(2, 0, 1).contiguous()
-    )
-
-    # Collect all .png tiles
-    all_files = [os.path.join(tiles_dir, f) for f in os.listdir(tiles_dir) if f.lower().endswith('.png')]
-    if not all_files:
-        print(f"No PNG files found in {tiles_dir}")
-        return None
-
-    y_true = []
-    y_pred = []
-
-    batch = []
-    batch_gt = []
-
-    print(f"Evaluating {len(all_files)} dumped tiles from '{tiles_dir}'...")
-
-    for fpath in tqdm(all_files):
-        # Parse filename pattern: tile_000001_y0_x0_cls2_dust.png
-        match = re.search(r"_cls(-?\d+)_", os.path.basename(fpath))
-        if not match:
-            print(f"Could not extract class ID from {fpath}")
-            continue
-        gt_cls = int(match.group(1))
-        if gt_cls < 0 or gt_cls >= len(classes):
-            continue  # skip unknown class
-
-        # Load RGBA image
-        img = load_rgba_image(fpath)
-        img = transform(img)
-        batch.append(img)
-        batch_gt.append(gt_cls)
-
-        # Process in batches
-        if len(batch) == batch_size:
-            inputs = torch.stack(batch).to(device)
-            outputs = model(inputs)
-            preds = outputs.argmax(dim=1).detach().cpu().numpy()
-            y_pred.extend(preds)
-            y_true.extend(batch_gt)
-            batch.clear()
-            batch_gt.clear()
-
-    # Handle remainder
-    if batch:
-        inputs = torch.stack(batch).to(device)
-        outputs = model(inputs)
-        preds = outputs.argmax(dim=1).detach().cpu().numpy()
-        y_pred.extend(preds)
-        y_true.extend(batch_gt)
-
-    # Compute metrics
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(classes))))
-    acc = (np.array(y_true) == np.array(y_pred)).mean()
-    report = classification_report(y_true, y_pred, target_names=classes, digits=3)
-
-    print(f"\nEvaluation complete — Accuracy: {acc:.3f}")
-    print("Confusion Matrix:")
-    print(cm)
-    print("\nClassification Report:")
-    print(report)
-
-    # Return results as dictionary
-    return {
-        "accuracy": acc,
-        "confusion_matrix": cm.tolist(),
-        "report": report
-    }
+# ---------------------------------------------------------------------------
+# DEAD CODE (D5) -- COMMENTED OUT 2026-07-28, NOT YET DELETED.
+# Unreachable: the only reference is the commented-out block in main() (search
+# 'evaluate_dumped_tiles'). Also missing torch.no_grad(), so it would build a
+# full autograd graph for every batch if revived.
+# NOTE: metadata_collate_fn, filed alongside this in D5, is NOT dead -- it is
+# imported by six evaluation scripts and must stay.
+# Retained verbatim below so the logic is recoverable; delete once you are sure
+# nothing external depends on it. See ISSUES.md D5.
+# ---------------------------------------------------------------------------
+# def evaluate_dumped_tiles(model, tiles_dir, classes, device='cuda', batch_size=16):
+#     """
+#     Evaluates dumped PNG tiles against the current model.
+#
+#     Args:
+#         model (torch.nn.Module): Trained classifier model.
+#         tiles_dir (str): Path to the directory containing dumped tiles.
+#         classes (list): List of class names (order must match model outputs).
+#         device (str): 'cuda' or 'cpu'.
+#         batch_size (int): Batch size for inference.
+#
+#     Returns:
+#         dict: metrics containing accuracy, confusion matrix, and report.
+#     """
+#
+#     import re
+#     from tqdm import tqdm
+#     from sklearn.metrics import confusion_matrix, classification_report
+#     model.eval()
+#     model.to(device)
+#
+#     # HWC uint8 → CHW uint8 tensor; /255 normalisation is done inside the model.
+#     transform = transforms.Lambda(
+#         lambda img: torch.from_numpy(img).permute(2, 0, 1).contiguous()
+#     )
+#
+#     # Collect all .png tiles
+#     all_files = [os.path.join(tiles_dir, f) for f in os.listdir(tiles_dir) if f.lower().endswith('.png')]
+#     if not all_files:
+#         print(f"No PNG files found in {tiles_dir}")
+#         return None
+#
+#     y_true = []
+#     y_pred = []
+#
+#     batch = []
+#     batch_gt = []
+#
+#     print(f"Evaluating {len(all_files)} dumped tiles from '{tiles_dir}'...")
+#
+#     for fpath in tqdm(all_files):
+#         # Parse filename pattern: tile_000001_y0_x0_cls2_dust.png
+#         match = re.search(r"_cls(-?\d+)_", os.path.basename(fpath))
+#         if not match:
+#             print(f"Could not extract class ID from {fpath}")
+#             continue
+#         gt_cls = int(match.group(1))
+#         if gt_cls < 0 or gt_cls >= len(classes):
+#             continue  # skip unknown class
+#
+#         # Load RGBA image
+#         img = load_rgba_image(fpath)
+#         img = transform(img)
+#         batch.append(img)
+#         batch_gt.append(gt_cls)
+#
+#         # Process in batches
+#         if len(batch) == batch_size:
+#             inputs = torch.stack(batch).to(device)
+#             outputs = model(inputs)
+#             preds = outputs.argmax(dim=1).detach().cpu().numpy()
+#             y_pred.extend(preds)
+#             y_true.extend(batch_gt)
+#             batch.clear()
+#             batch_gt.clear()
+#
+#     # Handle remainder
+#     if batch:
+#         inputs = torch.stack(batch).to(device)
+#         outputs = model(inputs)
+#         preds = outputs.argmax(dim=1).detach().cpu().numpy()
+#         y_pred.extend(preds)
+#         y_true.extend(batch_gt)
+#
+#     # Compute metrics
+#     cm = confusion_matrix(y_true, y_pred, labels=list(range(len(classes))))
+#     acc = (np.array(y_true) == np.array(y_pred)).mean()
+#     report = classification_report(y_true, y_pred, target_names=classes, digits=3)
+#
+#     print(f"\nEvaluation complete — Accuracy: {acc:.3f}")
+#     print("Confusion Matrix:")
+#     print(cm)
+#     print("\nClassification Report:")
+#     print(report)
+#
+#     # Return results as dictionary
+#     return {
+#         "accuracy": acc,
+#         "confusion_matrix": cm.tolist(),
+#         "report": report
+#     }
 
 
 
@@ -878,19 +889,28 @@ class Classifier(pl.LightningModule):
         self.base_input_channels = 4
         self.in_channels = self.base_input_channels + extra_channels
 
+        # `pretrained=False` must reach EVERY backbone, not just resnet18. At
+        # inference time ClassifierPnm rebuilds the architecture and then overwrites
+        # it with the checkpoint, so fetching ImageNet weights first is pure waste --
+        # it costs a download (and fails outright on an offline deployment machine)
+        # for weights that are discarded microseconds later.
+        def _w(weights):
+            """ImageNet weights when pretrained, else None (random init)."""
+            return weights if self.pretrained else None
+
         #RESNEXT
         if self.type == 'resnext50':
-            self.model = resnext50_32x4d(weights=ResNeXt50_32X4D_Weights.IMAGENET1K_V2)
+            self.model = resnext50_32x4d(weights=_w(ResNeXt50_32X4D_Weights.IMAGENET1K_V2))
             self.model.conv1 = nn.Conv2d(self.in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
             self.model.fc = nn.Linear(2048, num_classes)
         elif self.type == 'resnet18':
-            self.model = resnet18(weights=ResNet18_Weights.DEFAULT if getattr(self, 'pretrained', True) else None)
+            self.model = resnet18(weights=_w(ResNet18_Weights.DEFAULT))
             self.model.conv1 = nn.Conv2d(self.in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
             self.model.fc = nn.Linear(512, num_classes)
         elif self.type == 'resnet18_stem':
             # Deeper stem, same downsampling: more early capacity for the small
             # (~3x3) polarization micro-features the stock 7x7/2 conv blurs away.
-            self.model = resnet18(weights=ResNet18_Weights.DEFAULT)
+            self.model = resnet18(weights=_w(ResNet18_Weights.DEFAULT))
             self.model.conv1 = nn.Sequential(
                 nn.Conv2d(self.in_channels, 32, kernel_size=3, stride=2, padding=1, bias=False),
                 nn.BatchNorm2d(32),
@@ -906,7 +926,7 @@ class Classifier(pl.LightningModule):
             # first downsample is layer2 (stride 2). Final map 6x6 (vs 1.5x1.5 stock).
             # ~16x the layer1 FLOPs of stock resnet18 — acceptable: inference cost is
             # traded back at deploy time via a larger tile step. Best fidelity for recall.
-            self.model = resnet18(weights=ResNet18_Weights.DEFAULT)
+            self.model = resnet18(weights=_w(ResNet18_Weights.DEFAULT))
             self.model.conv1 = nn.Sequential(
                 nn.Conv2d(self.in_channels, 32, kernel_size=3, stride=1, padding=1, bias=False),
                 nn.BatchNorm2d(32), nn.ReLU(inplace=True),
@@ -925,7 +945,7 @@ class Classifier(pl.LightningModule):
             # into the channel dimension, THEN a single maxpool downsamples the
             # now-redundant spatial grid. Contrast: stock/stem strides 2 on the
             # first conv (3px -> 0.75px at layer1, unrecoverable).
-            self.model = resnet18(weights=ResNet18_Weights.DEFAULT)
+            self.model = resnet18(weights=_w(ResNet18_Weights.DEFAULT))
             self.model.conv1 = nn.Sequential(
                 nn.Conv2d(self.in_channels, 32, kernel_size=3, stride=1, padding=1, bias=False),
                 nn.BatchNorm2d(32), nn.ReLU(inplace=True),
@@ -940,7 +960,7 @@ class Classifier(pl.LightningModule):
         elif self.type == 'resnet18_fine':
             # Deeper stem AND stride 1: layer1 runs at 24x24 instead of 12x12 for
             # 48px tiles (only the maxpool downsamples). ~4x compute of resnet18.
-            self.model = resnet18(weights=ResNet18_Weights.DEFAULT)
+            self.model = resnet18(weights=_w(ResNet18_Weights.DEFAULT))
             self.model.conv1 = nn.Sequential(
                 nn.Conv2d(self.in_channels, 32, kernel_size=3, stride=1, padding=1, bias=False),
                 nn.BatchNorm2d(32),
@@ -949,60 +969,60 @@ class Classifier(pl.LightningModule):
             )
             self.model.fc = nn.Linear(512, num_classes)
         elif self.type == 'convnext_tiny':
-            self.model = convnext_tiny(weights=ConvNeXt_Tiny_Weights.DEFAULT)
+            self.model = convnext_tiny(weights=_w(ConvNeXt_Tiny_Weights.DEFAULT))
             self.model.features[0][0] = nn.Conv2d(self.in_channels, 96, kernel_size=(4, 4), stride=(4, 4))
             self.model.classifier[2]  = nn.Linear(768, num_classes)
         elif self.type == 'efficientnet_v2_s':
-            self.model = efficientnet_v2_s(weights=EfficientNet_V2_S_Weights.DEFAULT)
+            self.model = efficientnet_v2_s(weights=_w(EfficientNet_V2_S_Weights.DEFAULT))
             self.model.features[0][0] = nn.Conv2d(self.in_channels, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.classifier[1]  = nn.Linear(1280, num_classes, bias=True)
         elif self.type == 'swin_v2_t':
-            self.model = swin_v2_t(weights=Swin_V2_T_Weights.DEFAULT)
+            self.model = swin_v2_t(weights=_w(Swin_V2_T_Weights.DEFAULT))
             self.model.features[0][0] = nn.Conv2d(self.in_channels, 96, kernel_size=(4, 4), stride=(4, 4))
             self.model.head = nn.Linear(768, num_classes)
         elif self.type == 'regnet_y_800mf':
-            self.model = regnet_y_800mf(weights=RegNet_Y_800MF_Weights.DEFAULT)
+            self.model = regnet_y_800mf(weights=_w(RegNet_Y_800MF_Weights.DEFAULT))
             self.model.stem[0] = nn.Conv2d(self.in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.fc = nn.Linear(784, num_classes)
         elif self.type == 'regnet_y_400mf':
-            self.model = torchvision.models.regnet_y_400mf(weights=RegNet_Y_400MF_Weights.DEFAULT)
+            self.model = torchvision.models.regnet_y_400mf(weights=_w(RegNet_Y_400MF_Weights.DEFAULT))
             self.model.stem[0] = nn.Conv2d(self.in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.fc = nn.Linear(440, num_classes)
         elif self.type == 'mobilenet_v3_small':
-            self.model = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
+            self.model = mobilenet_v3_small(weights=_w(MobileNet_V3_Small_Weights.DEFAULT))
             self.model.features[0][0] = nn.Conv2d(self.in_channels, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.classifier[3] = nn.Linear(1024, num_classes)
         elif self.type == 'mobilenet_v3_large':
-            self.model = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT)
+            self.model = mobilenet_v3_large(weights=_w(MobileNet_V3_Large_Weights.DEFAULT))
             self.model.features[0][0] = nn.Conv2d(self.in_channels, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.classifier[3] = nn.Linear(1280, num_classes)
         elif self.type == 'shufflenet_v2_x0_5':
-            self.model = shufflenet_v2_x0_5(weights=ShuffleNet_V2_X0_5_Weights.DEFAULT)
+            self.model = shufflenet_v2_x0_5(weights=_w(ShuffleNet_V2_X0_5_Weights.DEFAULT))
             self.model.conv1[0] = nn.Conv2d(self.in_channels, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.fc = nn.Linear(1024, num_classes)
         elif self.type == 'shufflenet_v2_x1_0':
-            self.model = shufflenet_v2_x1_0(weights=ShuffleNet_V2_X1_0_Weights.DEFAULT)
+            self.model = shufflenet_v2_x1_0(weights=_w(ShuffleNet_V2_X1_0_Weights.DEFAULT))
             self.model.conv1[0] = nn.Conv2d(self.in_channels, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.fc = nn.Linear(1024, num_classes)
         elif self.type == 'squeezenet1_1':
-            self.model = squeezenet1_1(weights=SqueezeNet1_1_Weights.DEFAULT)
+            self.model = squeezenet1_1(weights=_w(SqueezeNet1_1_Weights.DEFAULT))
             self.model.features[0] = nn.Conv2d(self.in_channels, 64, kernel_size=(3, 3), stride=(2, 2))
             self.model.classifier[1] = nn.Conv2d(512, num_classes, kernel_size=(1, 1))
             self.model.num_classes = num_classes
         elif self.type == 'efficientnet_b0':
-            self.model = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
+            self.model = efficientnet_b0(weights=_w(EfficientNet_B0_Weights.DEFAULT))
             self.model.features[0][0] = nn.Conv2d(self.in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.classifier[1] = nn.Linear(1280, num_classes)
         elif self.type == 'densenet121':
-            self.model = densenet121(weights=DenseNet121_Weights.DEFAULT)
+            self.model = densenet121(weights=_w(DenseNet121_Weights.DEFAULT))
             self.model.features.conv0 = nn.Conv2d(self.in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
             self.model.classifier = nn.Linear(1024, num_classes)
         elif self.type == 'mnasnet0_5':
-            self.model = mnasnet0_5(weights=MNASNet0_5_Weights.DEFAULT)
+            self.model = mnasnet0_5(weights=_w(MNASNet0_5_Weights.DEFAULT))
             self.model.layers[0] = nn.Conv2d(self.in_channels, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.classifier[1] = nn.Linear(1280, num_classes)
         elif self.type == 'mnasnet1_0':
-            self.model = mnasnet1_0(weights=MNASNet1_0_Weights.DEFAULT)
+            self.model = mnasnet1_0(weights=_w(MNASNet1_0_Weights.DEFAULT))
             self.model.layers[0] = nn.Conv2d(self.in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
             self.model.classifier[1] = nn.Linear(1280, num_classes)
         elif ('custom' in self.type) or ('cnn' in self.type):
@@ -2724,9 +2744,23 @@ if __name__ == "__main__":
     except _SkipSweep:
         pass   # no clean class; confusion matrix already written above
     except Exception as e:
-        print("Failed generating a confusion matrix:", e)
+        # Do NOT fail silently. This block produces the confusion matrix AND the
+        # gate calibration; if it dies, config_json["gate"] is never set and the
+        # model ships with no operating point at all. ClassifierPnm then falls back
+        # to threshold 0.0 -- the gate is simply OFF -- which is indistinguishable
+        # from a deliberate configuration choice. Previously the only trace was the
+        # literal string "Failed" written into the confusion JSON.
+        import traceback
+        traceback.print_exc()
+        print(f"\n[ERROR] confusion matrix / threshold sweep FAILED: {e!r}")
+        print(f"[ERROR] {model_name}.json will ship WITHOUT a calibrated gate -- "
+              f"the runtime will run with the gate OFF unless you set one by hand.")
+        # Record the failure IN the shipped config so it is visible downstream
+        # instead of looking like an intentional absence.
+        config_json["gate_error"] = repr(e)
+        config_json["gate_traceback"] = traceback.format_exc()
         with open(f"{model_name}_confusion.json", "w") as f:
-            f.write("Failed\n")
+            json.dump({"error": repr(e), "traceback": traceback.format_exc()}, f, indent=2)
 
 
     #Compute MD5 of saved model for corruption detection

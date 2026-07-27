@@ -328,13 +328,23 @@ def flood_fill_with_threshold(image, seed_point, new_value, pixel_threshold):
     else:
         return 0, image
 
-@torch.no_grad()
-def remove_byflood(occupancy):
-    for y in range(occupancy.shape[0]):
-        for x in range(occupancy.shape[0]):
-              if (occupancy[y,x]>0):
-                  num,occupancy = flood_fill_with_threshold(occupancy, (x,y) , 0, 32)
-    return occupancy
+
+# ---------------------------------------------------------------------------
+# DEAD CODE (D2) -- COMMENTED OUT 2026-07-28, NOT YET DELETED.
+# Unreachable: called only by detect_4x4_rectangle, which is itself dead (D3).
+# Also BROKEN -- the inner loop iterates x over range(occupancy.shape[0]) instead
+# of shape[1], so on a typical wide occupancy grid (e.g. 5x40) 35 columns are
+# never visited.
+# Retained verbatim below so the logic is recoverable; delete once you are sure
+# nothing external depends on it. See ISSUES.md D2.
+# ---------------------------------------------------------------------------
+# @torch.no_grad()
+# def remove_byflood(occupancy):
+#     for y in range(occupancy.shape[0]):
+#         for x in range(occupancy.shape[0]):
+#               if (occupancy[y,x]>0):
+#                   num,occupancy = flood_fill_with_threshold(occupancy, (x,y) , 0, 32)
+#     return occupancy
 
 @torch.no_grad()
 def mask_outside_rectangleA(image, rect):
@@ -376,72 +386,82 @@ def mask_outside_rectangle(image, rect):
 
     return image
 
-@torch.no_grad()
-def detect_4x4_rectangle(heatmap, occupancy, thresholdMin=60.0, thresholdMax=68.00):
-    #occupancy = remove_large_blobs(occupancy,45)
-    occupancy = remove_byflood(occupancy)
-    occupancy = mask_outside_rectangle(occupancy, (10,10,occupancy.shape[1]-20,occupancy.shape[0]-20) )
-    final_occupancy = np.zeros_like(occupancy)  
 
-    scaleX = heatmap.shape[0] / occupancy.shape[0] 
-    scaleY = heatmap.shape[1] / occupancy.shape[1]
-
-    data    = [
-               [0, 0, 0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 255,   255,   255,   255, 0],
-               [0, 0, 0, 255,   255,   255,   255, 0],
-               [0, 0, 0, 255,   255,   255,   255, 0],
-               [0, 0, 0, 255,   255,   255,   255, 0],
-               [0, 0, 0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0, 0, 0], 
-              ]
- 
-
-    # Create a NumPy array with dtype uint8
-    pattern = np.array(data, dtype=np.uint8)
-    pattern_height, pattern_width = pattern.shape
-    pattern_pixels = pattern_width * pattern_height
- 
-    dataInv  = [
-               [255, 255, 255, 255, 255, 255],
-               [255, 0,   0,   0,     0, 255],
-               [255, 0,   0,   0,     0, 255],
-               [255, 0,   0,   0,     0, 255],
-               [255, 0,   0,   0,     0, 255],
-               [255, 255, 255, 255, 255, 255],
-              ]
-
-    patternInv = np.array(dataInv, dtype=np.uint8)
-    patternInv_height, patternInv_width = patternInv.shape
-    patternInv_pixels = patternInv_width * patternInv_height
-    windowInv  = patternInv 
-
-    # Scan the image with a sliding window
-    img_height, img_width = occupancy.shape
-    
-    detected_coordinates = []
-    
-    for y in range(img_height - pattern_height + 1):
-        for x in range(img_width - pattern_width + 1):
-
-            window = occupancy[y:y + pattern_height, x:x + pattern_width]
-            score = np.sum(np.abs(window - pattern)) / pattern_pixels
-            if (thresholdMin <= score) and (score <= thresholdMax):  # Allow some tolerance 
-              final_occupancy[y,x]=123
-              draw_cross(heatmap, (int((y+4)*scaleY), int((x+3)*scaleX)) , 10, (0,255,255) )
-              windowInv[:,:] = occupancy[y+1:y+1 + patternInv_height, x+2:x+2 + patternInv_width]#   window[2:,1:7]
-              windowInv      = 255 - windowInv
-              score2 = np.sum(np.abs(windowInv - patternInv)) / patternInv_pixels
-              detected_coordinates.append((x, y))
-              if score2<80:
-              #if np.array_equal(windowInv, patternInv):
-                #detected_coordinates.append((x, y))
-                draw_cross(heatmap, (int((y+4)*scaleY), int((x+3)*scaleX)) , 15, (0,0,255) )
-                final_occupancy[y,x]=255
-
-    #occupancy[:,:] = final_occupancy[:,:]
-    return detected_coordinates, occupancy
+# ---------------------------------------------------------------------------
+# DEAD CODE (D3) -- COMMENTED OUT 2026-07-28, NOT YET DELETED.
+# Unreachable: its only call site is commented out at liveClassifierTorch.py:79.
+# Also BROKEN -- np.abs(window - pattern) on uint8 arrays wraps around, so
+# |0 - 255| evaluates to 1 instead of 255 and the match score is meaningless.
+# Cast to int16 before subtracting if this is ever revived.
+# Retained verbatim below so the logic is recoverable; delete once you are sure
+# nothing external depends on it. See ISSUES.md D3.
+# ---------------------------------------------------------------------------
+# @torch.no_grad()
+# def detect_4x4_rectangle(heatmap, occupancy, thresholdMin=60.0, thresholdMax=68.00):
+#     #occupancy = remove_large_blobs(occupancy,45)
+#     occupancy = remove_byflood(occupancy)
+#     occupancy = mask_outside_rectangle(occupancy, (10,10,occupancy.shape[1]-20,occupancy.shape[0]-20) )
+#     final_occupancy = np.zeros_like(occupancy)  
+#
+#     scaleX = heatmap.shape[0] / occupancy.shape[0] 
+#     scaleY = heatmap.shape[1] / occupancy.shape[1]
+#
+#     data    = [
+#                [0, 0, 0, 0, 0, 0, 0, 0],
+#                [0, 0, 0, 0, 0, 0, 0, 0],
+#                [0, 0, 0, 255,   255,   255,   255, 0],
+#                [0, 0, 0, 255,   255,   255,   255, 0],
+#                [0, 0, 0, 255,   255,   255,   255, 0],
+#                [0, 0, 0, 255,   255,   255,   255, 0],
+#                [0, 0, 0, 0, 0, 0, 0, 0],
+#                [0, 0, 0, 0, 0, 0, 0, 0], 
+#               ]
+#
+#
+#     # Create a NumPy array with dtype uint8
+#     pattern = np.array(data, dtype=np.uint8)
+#     pattern_height, pattern_width = pattern.shape
+#     pattern_pixels = pattern_width * pattern_height
+#
+#     dataInv  = [
+#                [255, 255, 255, 255, 255, 255],
+#                [255, 0,   0,   0,     0, 255],
+#                [255, 0,   0,   0,     0, 255],
+#                [255, 0,   0,   0,     0, 255],
+#                [255, 0,   0,   0,     0, 255],
+#                [255, 255, 255, 255, 255, 255],
+#               ]
+#
+#     patternInv = np.array(dataInv, dtype=np.uint8)
+#     patternInv_height, patternInv_width = patternInv.shape
+#     patternInv_pixels = patternInv_width * patternInv_height
+#     windowInv  = patternInv 
+#
+#     # Scan the image with a sliding window
+#     img_height, img_width = occupancy.shape
+#
+#     detected_coordinates = []
+#
+#     for y in range(img_height - pattern_height + 1):
+#         for x in range(img_width - pattern_width + 1):
+#
+#             window = occupancy[y:y + pattern_height, x:x + pattern_width]
+#             score = np.sum(np.abs(window - pattern)) / pattern_pixels
+#             if (thresholdMin <= score) and (score <= thresholdMax):  # Allow some tolerance 
+#               final_occupancy[y,x]=123
+#               draw_cross(heatmap, (int((y+4)*scaleY), int((x+3)*scaleX)) , 10, (0,255,255) )
+#               windowInv[:,:] = occupancy[y+1:y+1 + patternInv_height, x+2:x+2 + patternInv_width]#   window[2:,1:7]
+#               windowInv      = 255 - windowInv
+#               score2 = np.sum(np.abs(windowInv - patternInv)) / patternInv_pixels
+#               detected_coordinates.append((x, y))
+#               if score2<80:
+#               #if np.array_equal(windowInv, patternInv):
+#                 #detected_coordinates.append((x, y))
+#                 draw_cross(heatmap, (int((y+4)*scaleY), int((x+3)*scaleX)) , 15, (0,0,255) )
+#                 final_occupancy[y,x]=255
+#
+#     #occupancy[:,:] = final_occupancy[:,:]
+#     return detected_coordinates, occupancy
 
 
 
@@ -754,75 +774,86 @@ def process_predictions_erode(predictions, confidences, class_id_to_name, cleanC
 
 
 
-@torch.no_grad()
-def process_predictions(predictions, confidences, class_id_to_name, cleanClassID, rgba_image, tile_size=24, step=2):
-    original_image = torch.as_tensor(rgba_image, dtype=torch.uint8)
-    height, width, _ = original_image.shape
 
-    tilesH = (height - tile_size) // step
-    tilesW = (width - tile_size) // step
-    expected_tiles = (tilesH) * (tilesW)
-
-    #if len(predictions) != expected_tiles:
-    if not (verifyTileNumber(len(predictions), original_image, tile_size, step)):
-        print(f"⚠️ Warning: predictions={len(predictions)} tiles expected={expected_tiles}")
-
-    occupancy = torch.full((tilesH, tilesW), 255, dtype=torch.uint8)
-    responses = {"points": [], "classes": [], "classIDs": [],  "confidences": []}
-    heatmap = original_image[:, :, :3].clone()
-    activations = torch.zeros(len(class_id_to_name), dtype=torch.int32)
-
-    y_indices = torch.arange(0, height - tile_size + 1, step)
-    x_indices = torch.arange(0, width - tile_size + 1, step)
-
-    predicted_classes = torch.as_tensor(predictions, dtype=torch.int32)
-    totalActivations = 0
-    idx = 0
-    num_preds = len(predicted_classes)
-    half_tile_size = tile_size // 2
-
-    bg_prob_sum = 0.0
-    bg_count    = 0
-
-    for vTile, y in enumerate(y_indices):
-        for hTile, x in enumerate(x_indices):
-            if idx >= num_preds:
-                break
-
-            predicted_class = int(predicted_classes[idx])
-
-            # Skip invalid IDs gracefully
-            if predicted_class < 0 or predicted_class >= len(class_id_to_name):
-                idx += 1
-                continue
-
-            if predicted_class != cleanClassID:
-                totalActivations += 1
-                activationCoordinateX = int(x + half_tile_size)
-                activationCoordinateY = int(y + half_tile_size)
-                activations[predicted_class] += 1
-                confidence = float(confidences[idx])
-
-                responses["points"].append( (activationCoordinateX, activationCoordinateY) )
-                responses["classes"].append(class_id_to_name[predicted_class])
-                responses["classIDs"].append(int(predicted_class))
-                responses["confidences"].append(confidence)
-
-                occupancy[vTile, hTile] = 0
-            else:
-                bg_prob_sum += float(confidences[idx])
-                bg_count    += 1
-
-            idx += 1
-
-        if idx >= num_preds:
-            break
-
-    responses["background_avg_prob"] = bg_prob_sum / bg_count if bg_count > 0 else 0.0
-
-    print(f"{totalActivations}/{num_preds} activations")
-    print("Per-class activations:", activations.tolist())
-    return occupancy.cpu().numpy(), responses
+# ---------------------------------------------------------------------------
+# DEAD CODE (D1) -- COMMENTED OUT 2026-07-28, NOT YET DELETED.
+# Unreachable: the only mention is a docstring reference in draw_heatmap. It is also
+# BROKEN -- occupancy is allocated as (H-tile)//step, missing the +1 that the
+# y_indices/x_indices aranges use, so the last row/column raises
+# 'IndexError: index 10 is out of bounds for dimension 1 with size 10'.
+# The live path uses generate_heatmap or process_predictions_erode instead.
+# Retained verbatim below so the logic is recoverable; delete once you are sure
+# nothing external depends on it. See ISSUES.md D1.
+# ---------------------------------------------------------------------------
+# @torch.no_grad()
+# def process_predictions(predictions, confidences, class_id_to_name, cleanClassID, rgba_image, tile_size=24, step=2):
+#     original_image = torch.as_tensor(rgba_image, dtype=torch.uint8)
+#     height, width, _ = original_image.shape
+#
+#     tilesH = (height - tile_size) // step
+#     tilesW = (width - tile_size) // step
+#     expected_tiles = (tilesH) * (tilesW)
+#
+#     #if len(predictions) != expected_tiles:
+#     if not (verifyTileNumber(len(predictions), original_image, tile_size, step)):
+#         print(f"⚠️ Warning: predictions={len(predictions)} tiles expected={expected_tiles}")
+#
+#     occupancy = torch.full((tilesH, tilesW), 255, dtype=torch.uint8)
+#     responses = {"points": [], "classes": [], "classIDs": [],  "confidences": []}
+#     heatmap = original_image[:, :, :3].clone()
+#     activations = torch.zeros(len(class_id_to_name), dtype=torch.int32)
+#
+#     y_indices = torch.arange(0, height - tile_size + 1, step)
+#     x_indices = torch.arange(0, width - tile_size + 1, step)
+#
+#     predicted_classes = torch.as_tensor(predictions, dtype=torch.int32)
+#     totalActivations = 0
+#     idx = 0
+#     num_preds = len(predicted_classes)
+#     half_tile_size = tile_size // 2
+#
+#     bg_prob_sum = 0.0
+#     bg_count    = 0
+#
+#     for vTile, y in enumerate(y_indices):
+#         for hTile, x in enumerate(x_indices):
+#             if idx >= num_preds:
+#                 break
+#
+#             predicted_class = int(predicted_classes[idx])
+#
+#             # Skip invalid IDs gracefully
+#             if predicted_class < 0 or predicted_class >= len(class_id_to_name):
+#                 idx += 1
+#                 continue
+#
+#             if predicted_class != cleanClassID:
+#                 totalActivations += 1
+#                 activationCoordinateX = int(x + half_tile_size)
+#                 activationCoordinateY = int(y + half_tile_size)
+#                 activations[predicted_class] += 1
+#                 confidence = float(confidences[idx])
+#
+#                 responses["points"].append( (activationCoordinateX, activationCoordinateY) )
+#                 responses["classes"].append(class_id_to_name[predicted_class])
+#                 responses["classIDs"].append(int(predicted_class))
+#                 responses["confidences"].append(confidence)
+#
+#                 occupancy[vTile, hTile] = 0
+#             else:
+#                 bg_prob_sum += float(confidences[idx])
+#                 bg_count    += 1
+#
+#             idx += 1
+#
+#         if idx >= num_preds:
+#             break
+#
+#     responses["background_avg_prob"] = bg_prob_sum / bg_count if bg_count > 0 else 0.0
+#
+#     print(f"{totalActivations}/{num_preds} activations")
+#     print("Per-class activations:", activations.tolist())
+#     return occupancy.cpu().numpy(), responses
 
 #----------------------------------------------------------
 #----------------------------------------------------------
@@ -959,7 +990,16 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
     # .build_input_features() dequantises uint8 to [0,1] on the GPU; casting to
     # float32 here would bypass that and feed the model 0-255, which collapses
     # predictions towards class_clean.
-    npTiles = npTiles.permute(0, 3, 1, 2).contiguous().to('cuda')
+    # Follow the MODEL's device instead of hardcoding 'cuda' -- ClassifierPnm
+    # already resolves cuda/cpu, and a hardcoded .to('cuda') crashed outright on a
+    # CPU-only host. fp16 autocast is CUDA-only in practice, so it is enabled only
+    # there; on CPU the same code runs in fp32.
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:                       # parameterless module (unexpected)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    npTiles = npTiles.permute(0, 3, 1, 2).contiguous().to(device)
+    amp_enabled = (device.type == 'cuda')
 
     channels = 4
     if npTiles.shape[1:] != (channels, tile_size, tile_size):
@@ -969,7 +1009,8 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
 
     # Predict in one pass or in chunks
     if chunks == 0:
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+        with torch.amp.autocast(device_type=device.type, dtype=torch.float16,
+                                enabled=amp_enabled):
             preds = model(npTiles)
         probs = torch.nn.functional.softmax(preds.float(), dim=1)
         # max_probs stays the reported per-tile confidence; the gate decides the class.
@@ -983,7 +1024,8 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
     else:
         preds_list = []
         for chunk in npTiles.chunk(chunks):
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.amp.autocast(device_type=device.type, dtype=torch.float16,
+                                    enabled=amp_enabled):
                 preds_list.append(model(chunk))
         preds = torch.cat(preds_list)
         probs = torch.nn.functional.softmax(preds.float(), dim=1)
@@ -1311,6 +1353,12 @@ class ClassifierPnm:
                            custom_channels      = hp.get('custom_channels', None),
                            custom_res_blocks    = hp.get('custom_res_blocks', None),
                            custom_wavelet_pools = hp.get('custom_wavelet_pools', None),
+                           # Inference only ever loads a checkpoint over this architecture,
+                           # so pulling ImageNet weights first is wasted work: a torchvision
+                           # download (which needs network access, and fails on an offline
+                           # deployment box) for weights discarded by the load_state_dict
+                           # below. Random init is overwritten just the same.
+                           pretrained = False,
                            **derived
                           )
 
