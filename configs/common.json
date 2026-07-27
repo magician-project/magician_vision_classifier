@@ -1,5 +1,5 @@
 {
   "class_merges": {"class_Seal": "class_Welding"},
   "drop_severityless_defects": true,
-  "drop_class_families": ["class_Dust"]
+  "drop_class_families": ["class_Dust", "class_Suspicious", "class_Unknown"]
 }
