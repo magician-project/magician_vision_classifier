@@ -143,6 +143,46 @@ def strip_severity_classes(dataset):
     return dataset
 
 
+def _expand_family_merges(merges, classes):
+    """Let a BARE family name in class_merges stand for all of its severity
+    variants, matching the convention drop_class_families already uses.
+
+    Configs are written as {"class_Seal": "class_Welding"}, but a granular dataset
+    holds class_SealClassA / class_SealClassB and no bare class_Seal -- so the
+    exact-match lookup below found nothing and the merge silently no-opped. Here a
+    source that is not itself a class is expanded over every class sharing its base
+    name:
+        class_Seal -> class_Welding   becomes  class_SealClassA -> class_WeldingClassA
+                                              class_SealClassB -> class_WeldingClassB
+    Severity is carried across only when the destination actually has that variant
+    (class_WeldingClassA exists); otherwise every variant collapses onto the plain
+    destination, which is what a binary bucket wants:
+        class_Seal -> class_defect    becomes  class_SealClassA -> class_defect
+    Sources that ARE exact class names are passed through untouched, so datasets
+    with bare class names behave exactly as before.
+    """
+    import re as _re
+    suffix = _re.compile(r'(Class[ABC])$')
+    have = set(classes)
+    out = {}
+    for src, dst in merges.items():
+        matched = False
+        for c in classes:
+            if suffix.sub('', c) != src:
+                continue
+            # Covers the bare class itself (base == src, no suffix) AND every
+            # severity variant, so a family that also has a severityless bucket
+            # -- class_PositiveDent alongside class_PositiveDentClassA -- merges
+            # in full rather than only the exact-name hit.
+            m = suffix.search(c)
+            sev_dst = dst + m.group(1) if m else dst
+            out[c] = sev_dst if sev_dst in have else dst
+            matched = True
+        if not matched:
+            out[src] = dst          # absent either way; filtered out below
+    return out
+
+
 def merge_dataset_classes(dataset, merges):
     """Merge/rename classes at runtime WITHOUT rewriting the H5 file. `merges`: dict
     of {source_class: destination_class}. Source samples are relabeled to the
@@ -159,6 +199,9 @@ def merge_dataset_classes(dataset, merges):
         return dataset
     old_classes = list(dataset.classes)
     old_cti = {c: i for i, c in enumerate(old_classes)}
+    # A bare family name ('class_Seal') stands for its severity variants; see
+    # _expand_family_merges. No-op when the sources are already exact class names.
+    merges = _expand_family_merges(merges, old_classes)
     # source must exist and differ from its destination; destination may be new.
     merges = {s: d for s, d in merges.items() if s in old_cti and s != d}
     if not merges:
@@ -288,8 +331,14 @@ def resolve_auto_drops(classes, config_json, clean_name='class_clean'):
     suffix = _re.compile(r'Class[ABC]$')
     drop = set()
     if config_json.get('drop_severityless_defects'):
+        # A merge DESTINATION is created deliberately by the config, so it is not
+        # "a defect whose severity was never labelled". Without this guard a binary
+        # bucket -- {"class_Welding": "class_defect", ...} -- would be built by the
+        # merge and then immediately auto-dropped for lacking a Class[ABC] suffix,
+        # leaving the run with class_clean alone.
+        protected = set((config_json.get('class_merges') or {}).values())
         for c in classes:
-            if c != clean_name and not suffix.search(c):
+            if c != clean_name and c not in protected and not suffix.search(c):
                 drop.add(c)
     families = set(config_json.get('drop_class_families') or [])
     if families:
