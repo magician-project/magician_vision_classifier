@@ -1176,27 +1176,32 @@ def runSingle(image,
     return heatmapRGBImage, occupancy, responses
 
 def ensure_file(path):
-            import subprocess
+            """Make sure a model's .pth/.json exists locally, fetching it if not.
+
+            Goes through ModelDownload, which reads the SAME server directory the
+            uploader writes and the annotator's "Download & Use" list reads
+            (http://ammar.gr/magician/models/CameraV2Models/, flat
+            {name}_{timestamp}.zip archives holding {name}.pth + {name}.json).
+
+            This used to wget bare files from .../magician/ckpts/ -- a DIFFERENT
+            directory that scripts/uploadModels.sh explicitly warns is not the one
+            being served, so the fallback silently 404'd and ClassifierPnm exited.
+            Because one archive carries both files, fetching for the .pth also
+            satisfies the follow-up .json check without a second download.
+            """
             if os.path.exists(path):
                 return True
 
-            filename = os.path.basename(path)
-            url = f"http://ammar.gr/magician/ckpts/{filename}"
-
-            print(f"File {path} not found. Downloading from {url} ...")
-
+            directory = os.path.dirname(os.path.abspath(path)) or "."
+            stem = os.path.splitext(os.path.basename(path))[0]
+            print(f"File {path} not found. Fetching model '{stem}' from the model server ...")
             try:
-                # -q quiet, -O output file, --show-progress gives progress bar
-                result = subprocess.run(
-                    ["wget", "-q", "--show-progress", "-O", path, url],
-                    check=True
-                )
-                print(f"Downloaded {filename} → {path}")
-                return True
-            except subprocess.CalledProcessError as e:
-                print(f"Failed downloading {url}")
-                print("wget error:", e)
+                from ModelDownload import download_model
+                download_model(stem, directory)
+            except Exception as e:
+                print(f"Failed downloading model '{stem}': {e!r}")
                 return False
+            return os.path.exists(path)
 
 
 

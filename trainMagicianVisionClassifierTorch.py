@@ -92,6 +92,11 @@ def align_dataset_to_classes(dataset, target_classes):
     tgt_idx = {c: i for i, c in enumerate(target_classes)}
     # current class index -> target index (or -1 if the class is not in target)
     cur2tgt = _np.array([tgt_idx.get(c, -1) for c in old_classes], dtype=_np.int64)
+    # Samples of a class absent from `target_classes` are DISCARDED. That is often
+    # intended, but it used to happen without a word -- a whole constituent could
+    # contribute nothing but clean tiles and nobody would notice. Report it.
+    _n_before = len(dataset)
+    _lost_classes = [c for c in old_classes if c not in tgt_idx]
 
     if hasattr(dataset, "labels") and hasattr(dataset, "images"):   # HDF5Dataset
         raw = _np.asarray(dataset.labels[:], dtype=_np.int64)
@@ -119,6 +124,15 @@ def align_dataset_to_classes(dataset, target_classes):
     dataset.classes = list(target_classes)
     dataset.class_to_idx = dict(tgt_idx)
     print(f"[align_classes] -> {len(target_classes)} canonical classes: {list(target_classes)}")
+    if _lost_classes:
+        _lost = _n_before - len(dataset)
+        print(f"[align_classes] WARNING discarded {_lost:,}/{_n_before:,} samples "
+              f"({100.0 * _lost / max(1, _n_before):.1f}%) belonging to classes absent "
+              f"from the canonical list: {_lost_classes}")
+        if _lost >= _n_before:
+            print("[align_classes] WARNING this dataset now contributes NOTHING — "
+                  "its class names almost certainly do not match the canonical scheme "
+                  "(e.g. a base-named dump aligned against a granular canon)")
     return dataset
 
 
@@ -322,6 +336,35 @@ def drop_dataset_classes(dataset, drop):
     dataset.classes = new_classes
     dataset.class_to_idx = new_cti
     print(f"[drop_classes] dropped {sorted(drop_set)} -> {len(new_classes)} classes: {new_classes}")
+    return dataset
+
+
+def apply_class_scheme(dataset, config_json, label="dataset"):
+    """THE single place the config's class scheme is applied: filter -> strip_severity
+    -> merge -> drop. Training and validation MUST go through this same function.
+
+    They used to be written out separately, and the validation copy was missing
+    `strip_severity` (and the `align` below). With "strip_severity": true the training
+    set collapsed severities to base names while validation kept its own ordering, so
+    the two ended up with the SAME class set in a DIFFERENT order and the consistency
+    check further down raised "Training/validation class mismatch" -- i.e. every
+    strip_severity config that also names a validation_dataset failed at startup
+    (crossval_v2_rot_customwide, crossval_v2_rot_alldefect).
+    """
+    if config_json.get('selected_classes') and len(config_json['selected_classes']) > 1:
+        print(f"[class_scheme:{label}] selecting classes", config_json['selected_classes'])
+        filter_dataset_classes(dataset, config_json['selected_classes'])
+    # Non-severity view first (collapse class_XClassY -> class_X), so the merge/drop
+    # below operate on base names. Set "severity": false (or "strip_severity": true).
+    if config_json.get('strip_severity') or config_json.get('severity') is False:
+        strip_severity_classes(dataset)
+    if config_json.get('class_merges'):
+        merge_dataset_classes(dataset, config_json['class_merges'])
+    drops = list(config_json.get('drop_classes') or [])
+    drops += resolve_auto_drops(dataset.classes, config_json)
+    if drops:
+        drop_dataset_classes(dataset, drops)
+    print(f"[class_scheme:{label}] -> {len(dataset.classes)} classes: {dataset.classes}")
     return dataset
 
 
@@ -2205,23 +2248,9 @@ if __name__ == "__main__":
             print("Using Normal PNG dataset loader ", d)
             ds = RGBAImageFolder(root=d, transform=transform)
         # Keep some classes / merge / drop -- applied per dataset so the combined
-        # label space is consistent across all constituents.
-        if config_json.get('selected_classes') and len(config_json['selected_classes']) > 1:
-            print("Only selecting the classes ", config_json['selected_classes'])
-            filter_dataset_classes(ds, config_json['selected_classes'])
-        # Non-severity view first (collapse class_XClassY -> class_X), so the
-        # merge/drop below operate on base names. Set "severity": false (or
-        # "strip_severity": true) in the config. Granular H5 + this flag = the
-        # runtime "non-severity" mode; omit it to train on the full severity truth.
-        if config_json.get('strip_severity') or config_json.get('severity') is False:
-            strip_severity_classes(ds)
-        if config_json.get('class_merges'):
-            merge_dataset_classes(ds, config_json['class_merges'])
-        drops = list(config_json.get('drop_classes') or [])
-        drops += resolve_auto_drops(ds.classes, config_json)
-        if drops:
-            drop_dataset_classes(ds, drops)
-        return ds
+        # label space is consistent across all constituents. Shared with the
+        # validation path via apply_class_scheme so the two cannot drift.
+        return apply_class_scheme(ds, config_json, label=os.path.basename(str(d).rstrip('/')))
 
     subs = [_load_one(d) for d in directories]
     if len(subs) == 1:
@@ -2327,16 +2356,20 @@ if __name__ == "__main__":
         else:
             val_dataset = RGBAImageFolder(root=val_directory, transform=transform)
 
-        if ('selected_classes' in config_json) and config_json['selected_classes']:
-            filter_dataset_classes(val_dataset, config_json['selected_classes'])
+        # SAME scheme as training -- this used to be a hand-copied variant that
+        # omitted strip_severity (see apply_class_scheme).
+        apply_class_scheme(val_dataset, config_json, label="validation")
 
-        if config_json.get('class_merges'):
-            merge_dataset_classes(val_dataset, config_json['class_merges'])
-
-        val_drops = list(config_json.get('drop_classes') or [])
-        val_drops += resolve_auto_drops(val_dataset.classes, config_json)
-        if val_drops:
-            drop_dataset_classes(val_dataset, val_drops)
+        # Force validation onto the TRAINING label list. Even when both end up with
+        # the same class SET, they can reach it in a different ORDER: merge_dataset_
+        # classes keeps survivors in their pre-merge order and appends new
+        # destinations, and a stripped granular dump does not enumerate classes in
+        # the same order as a natively base-named one. Class INDEX is what the model
+        # predicts, so the order must match exactly, not just the set.
+        if val_dataset.classes != dataset.classes:
+            print(f"[class_scheme:validation] reordering to match training: "
+                  f"{val_dataset.classes} -> {dataset.classes}")
+            align_dataset_to_classes(val_dataset, dataset.classes)
 
         print_class_distribution(val_dataset, title="VAL (final label space)")
 

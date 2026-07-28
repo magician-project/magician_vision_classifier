@@ -63,6 +63,76 @@ def unix_ns_to_ros_time(ns):
 
 
 # ========================================================
+# Deployment presets
+# ========================================================
+# Which model to run and at what operating point comes from recommended_configuration.json
+# next to this script. That file is COMMITTED TO GIT, so a deployment site picks up new
+# models and thresholds with a plain `git pull` -- deliberately NOT environment variables,
+# which are awkward to change on-site.
+#
+# The FIRST entry is the startup default; pass `--config NAME` to select another.
+# The model's .pth/.json are auto-fetched on first run (ModelDownload.ensure_model).
+RECOMMENDED_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "recommended_configuration.json")
+
+# Fallback used only if recommended_configuration.json is missing or unreadable, so the
+# node still starts on a sane model rather than dying at the first import.
+FALLBACK_PRESET = {
+    "name": "fallback",
+    "model": "mix_convnext_tiny",
+    "gate": {"mode": "defect_mass", "threshold": 0.90, "assign_best_defect_class": True},
+    "runtime": {"step": 18, "target_fps": 23.0, "erosion_kernel": 1, "min_votes": 2,
+                "majority_voting": True, "frame_limiter": True, "two_stage": False},
+}
+
+
+def load_recommended_configuration(name=None, path=RECOMMENDED_CONFIG_FILE):
+    """Return one preset dict from recommended_configuration.json.
+
+    name=None -> the first entry (the committed default). Otherwise the entry whose
+    "name" matches. Falls back to FALLBACK_PRESET, never raises, because failing to
+    read a preferences file must not stop the node from running.
+    """
+    try:
+        with open(path, "r") as f:
+            doc = json.load(f)
+        presets = doc.get("configurations") or []
+        if not presets:
+            raise ValueError("no 'configurations' entries")
+        if name is None:
+            chosen = presets[0]
+        else:
+            matches = [p for p in presets if p.get("name") == name]
+            if not matches:
+                available = [p.get("name") for p in presets]
+                raise ValueError(f"preset {name!r} not found; available: {available}")
+            chosen = matches[0]
+        # Merge over the fallback so a partial preset cannot leave a key undefined.
+        merged = dict(FALLBACK_PRESET)
+        merged.update(chosen)
+        merged["gate"] = {**FALLBACK_PRESET["gate"], **(chosen.get("gate") or {})}
+        merged["runtime"] = {**FALLBACK_PRESET["runtime"], **(chosen.get("runtime") or {})}
+        return merged
+    except Exception as e:
+        print(f"[config] could not use {path} ({e!r}) — falling back to "
+              f"{FALLBACK_PRESET['model']}")
+        return dict(FALLBACK_PRESET)
+
+
+# Two-stage ensemble members. This path is OPTIONAL: if any member cannot be resolved the
+# ensemble is skipped and the node still starts on the single classifier (previously a
+# missing member called sys.exit(1) inside ClassifierPnm and killed the node before it
+# ever published).
+ENSEMBLE_STAGE1 = "binary_small_cnn"
+ENSEMBLE_MEMBERS = [
+    "allclass_verysmall_cnn",
+    "allclass_resnet18",
+    "allclass_resnext50",
+    "allclass_convnext_tiny",
+]
+
+
+# ========================================================
 # Laser fusion globals (project-specific / fixed hardware)
 # ========================================================
 USE_LASERS = True  # Set to False to disable subscriptions + DetectionM publishing entirely.
@@ -400,6 +470,37 @@ class DefectPublisher(Node):
             self.get_logger().info(f"Laser fusion ENABLED: topics={LASER_TOPICS} xy={LASER_XY_PIXELS} p={LASER_IDW_POWER}")
         else:
             self.get_logger().info("Laser fusion DISABLED")
+
+    def apply_preset(self, preset):
+        """Adopt a recommended_configuration.json preset as the node's startup state.
+
+        These are only DEFAULTS -- every one stays overridable at runtime through the
+        existing services, so an operator can still retune live without editing the file.
+        """
+        rt = preset.get("runtime") or {}
+        gate = preset.get("gate") or {}
+        with self._lock:
+            self._step_size          = int(rt.get("step", self._step_size))
+            self._target_fps         = float(rt.get("target_fps", self._target_fps))
+            self._erosion_kernel     = int(rt.get("erosion_kernel", self._erosion_kernel))
+            self._min_votes          = int(rt.get("min_votes", self._min_votes))
+            self._majority_voting    = bool(rt.get("majority_voting", self._majority_voting))
+            self._frame_limiter      = bool(rt.get("frame_limiter", self._frame_limiter))
+            self._two_stage_enabled  = bool(rt.get("two_stage", self._two_stage_enabled))
+            if gate.get("threshold") is not None:
+                self._threshold = float(gate["threshold"])
+        m = preset.get("measured") or {}
+        self.get_logger().info(
+            f"Preset '{preset.get('name','?')}': model={preset.get('model')} "
+            f"gate={gate.get('mode')}@{gate.get('threshold')} step={self._step_size} "
+            f"fps={self._target_fps} erosion_kernel={self._erosion_kernel} "
+            f"min_votes={self._min_votes} majority_voting={self._majority_voting}")
+        if preset.get("description"):
+            self.get_logger().info(f"  {preset['description']}")
+        if "detected" in m and "false_alarm" in m:
+            self.get_logger().info(
+                f"  expected (from {m.get('source','curve')}): detects {m['detected']:.1%} "
+                f"of defect tiles, false-alarms on {m['false_alarm']:.2%} of clean tiles")
 
     # -------------------------
     # Laser subscriptions
@@ -972,13 +1073,38 @@ def main():
     ros_thread.start()
 
     #PATH="./magician_vision_classifier"
-    PATH="."
+    PATH = os.path.dirname(os.path.abspath(__file__))
 
-    # Initialize Neural Networks (both modes)
+    # --config NAME selects a preset from recommended_configuration.json; default = first.
+    preset_name = None
+    if "--config" in sys.argv:
+        i = sys.argv.index("--config")
+        if i + 1 < len(sys.argv):
+            preset_name = sys.argv[i + 1]
+    preset = load_recommended_configuration(preset_name)
+    model_name = preset["model"]
+    ros_node.apply_preset(preset)
+
+    # Fetch the model if it is not already here, then load it. ensure_model is a no-op
+    # when model_scan() already sees a valid {name}.pth + {name}.json pair.
+    from ModelDownload import ensure_model
+    if not ensure_model(model_name, PATH):
+        ros_node.get_logger().error(
+            f"Could not obtain model '{model_name}'. Check network access to the model "
+            f"server, or place {model_name}.pth + {model_name}.json in {PATH}. "
+            f"Edit recommended_configuration.json to use a different preset.")
+        rclpy.shutdown()
+        return
+
     single_classifier = ClassifierPnm(
-        model_path=f"{PATH}/allclass_small_cnn.pth",
-        cfg_path=f"{PATH}/allclass_small_cnn.json",
+        model_path=os.path.join(PATH, f"{model_name}.pth"),
+        cfg_path=os.path.join(PATH, f"{model_name}.json"),
     )
+    # The preset's gate wins over the model json's own calibration, since the preset is
+    # the deployment decision. Mode too -- a threshold means nothing without its mode.
+    single_classifier.gateMode = preset["gate"].get("mode", single_classifier.gateMode)
+    single_classifier.assignBestDefectClass = bool(
+        preset["gate"].get("assign_best_defect_class", single_classifier.assignBestDefectClass))
 
     # Expose classifier to the ROS node for hot-swap via service
     ros_node._model_dir = PATH
@@ -991,19 +1117,29 @@ def main():
         ros_node.get_max_probability_threshold(),
         "Startup gate setting — ")
 
-    ensemble_classifier = EnsembleClassifierPnm(
-        initial_model_cfg=(
-            f"{PATH}/binary_small_cnn.pth",
-            f"{PATH}/binary_small_cnn.json",
-        ),
-        model_cfg_list=[
-            (f"{PATH}/allclass_verysmall_cnn.pth", f"{PATH}/allclass_verysmall_cnn.json"),
-            (f"{PATH}/allclass_resnet18.pth",       f"{PATH}/allclass_resnet18.json"),
-            (f"{PATH}/allclass_resnext50.pth",      f"{PATH}/allclass_resnext50.json"),
-            # (f"{PATH}/allclass_efficientnet_v2_s.pth", f"{PATH}/allclass_efficientnet_v2_s.json"),  # slowest
-            (f"{PATH}/allclass_convnext_tiny.pth",  f"{PATH}/allclass_convnext_tiny.json"),
-        ],
-    )
+    # Two-stage ensemble is OPTIONAL. Build it only if every member resolves; a
+    # missing member used to reach ClassifierPnm's sys.exit(1) and kill the node
+    # before it published anything, even though two-stage mode is off by default.
+    ensemble_classifier = None
+    _needed = [ENSEMBLE_STAGE1] + ENSEMBLE_MEMBERS
+    _missing = [m for m in _needed
+                if not (os.path.isfile(os.path.join(PATH, m + ".pth"))
+                        and os.path.isfile(os.path.join(PATH, m + ".json")))]
+    if _missing:
+        ros_node.get_logger().warning(
+            f"Two-stage ensemble DISABLED — missing models: {_missing}. "
+            f"Fetch them with: python3 ModelDownload.py {' '.join(_missing)}")
+    else:
+        try:
+            ensemble_classifier = EnsembleClassifierPnm(
+                initial_model_cfg=(os.path.join(PATH, ENSEMBLE_STAGE1 + ".pth"),
+                                   os.path.join(PATH, ENSEMBLE_STAGE1 + ".json")),
+                model_cfg_list=[(os.path.join(PATH, m + ".pth"),
+                                 os.path.join(PATH, m + ".json")) for m in ENSEMBLE_MEMBERS],
+            )
+        except Exception as e:
+            ros_node.get_logger().warning(f"Two-stage ensemble DISABLED — build failed: {e!r}")
+            ensemble_classifier = None
 
     tile_size = 0  # updated inside the inference block each iteration
 
@@ -1017,6 +1153,7 @@ def main():
     )
 
     last_processed_timestamp = None
+    _warned_no_ensemble = False   # log the two-stage fallback once, not every frame
 
     try:
         while True:
@@ -1057,7 +1194,14 @@ def main():
             # Run the neural network
             majority_voting = ros_node.majority_voting_enabled()
             with torch.inference_mode():
-                if ros_node.two_stage_enabled():
+                if ros_node.two_stage_enabled() and ensemble_classifier is None:
+                    if not _warned_no_ensemble:
+                        ros_node.get_logger().warning(
+                            "two_stage requested but the ensemble is unavailable — "
+                            "falling back to the single classifier")
+                        _warned_no_ensemble = True
+
+                if ros_node.two_stage_enabled() and ensemble_classifier is not None:
                     with ros_node._model_lock:
                         ensemble_classifier.step = ros_node.get_step_size()
                         thr = ros_node.get_max_probability_threshold()
