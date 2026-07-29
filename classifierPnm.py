@@ -80,41 +80,58 @@ class bcolors:
 #--------------------------------------------------------------------------
 # Drawing routines to decorate output to make classification understandable
 #--------------------------------------------------------------------------
+# Hand-picked cross colours, ordered so that consecutive classes land on hues that are
+# far apart. Every entry is bright and saturated: no black and no near-black, which the
+# old RGB-cube generator produced (it started the grid at (0,0,0) and then emitted dark
+# duplicates of the base colours), leaving crosses invisible on dark frames.
+DISTINCT_CLASS_COLORS = [
+    (255,  40,  40),   # red
+    (  0, 160, 255),   # azure
+    (255, 220,   0),   # yellow
+    (  0, 220,  60),   # green
+    (255,   0, 200),   # magenta
+    (  0, 235, 235),   # cyan
+    (255, 140,   0),   # orange
+    (150, 110, 255),   # violet
+    (255, 255, 255),   # white
+    (170, 255,  40),   # lime
+    (255, 130, 180),   # pink
+    ( 90, 255, 180),   # mint
+    (200,  80, 255),   # purple
+    (255, 190, 100),   # apricot
+    (120, 180, 255),   # sky
+    (220, 255, 255),   # ice
+]
+
+
 def getNDifferentColors(n):
     """
     Generate n visually distinct RGB colors as (R, G, B) tuples.
-    No external libraries are used.
+    Only the standard library is used.
+
+    The first colours come from DISTINCT_CLASS_COLORS; beyond that hues are walked by
+    the golden angle so new entries fall in the largest remaining gap. Value/saturation
+    stay high on purpose so a cross is always readable over the underlying image.
     """
     if n <= 0:
         return []
 
-    class_colors = []
+    if n <= len(DISTINCT_CLASS_COLORS):
+        return list(DISTINCT_CLASS_COLORS[:n])
 
-    # Predefined base colors (optional)
-    base_colors = [
-        (0, 0, 255),     # Blue
-        (255, 0, 0),     # Red
-        (255, 255, 0),   # Yellow
-        (0, 255, 0),     # Green
-    ]
+    import colorsys
+    class_colors = list(DISTINCT_CLASS_COLORS)
 
-    # If n fits in predefined colors, return the subset
-    if n <= len(base_colors):
-        return base_colors[:n]
-
-    # Otherwise, add base colors and generate more
-    class_colors.extend(base_colors)
-
-    # Generate additional distinct colors
-    step = int(255 / ((n - len(base_colors)) ** (1/3))) or 1
-    for r in range(0, 256, step):
-        for g in range(0, 256, step):
-            for b in range(0, 256, step):
-                if len(class_colors) >= n:
-                    return class_colors[:n]
-                color = (r, g, b)
-                if color not in class_colors:
-                    class_colors.append(color)
+    extra = 0
+    while len(class_colors) < n and extra < 4096:
+        hue = (extra * 0.6180339887) % 1.0            # golden-angle hue walk
+        sat = 1.0 if (extra % 2 == 0) else 0.55       # alternate vivid / pastel
+        val = 1.0 if (extra % 3 != 2) else 0.80       # never dark enough to read as black
+        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+        color = (int(r * 255), int(g * 255), int(b * 255))
+        extra += 1
+        if color not in class_colors:
+            class_colors.append(color)
 
     return class_colors[:n]
 #------------------------------------------------------------------------
@@ -631,7 +648,10 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
                 confidence = float(confidences[idx])
 
 
-                color = (color.float() * confidence).clamp(0, 255).to(torch.uint8)
+                # Confidence only modulates brightness inside a narrow band: scaling the
+                # colour straight by the confidence pushed unsure tiles towards black and
+                # made their class unreadable.
+                color = (color.float() * (0.60 + 0.40 * confidence)).clamp(0, 255).to(torch.uint8)
 
                 draw_cross(heatmap, (activationCoordinateY, activationCoordinateX), 10, color)
 
