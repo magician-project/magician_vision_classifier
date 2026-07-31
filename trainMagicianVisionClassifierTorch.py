@@ -2684,6 +2684,10 @@ if __name__ == "__main__":
 
     trainer = pl.Trainer(
                          max_epochs=epochs,
+                         # Optional fixed cap on training batches/epoch (int) for quick
+                         # architecture screens; default 1.0 = full epoch (unchanged).
+                         # Validation still runs on the full val set.
+                         limit_train_batches=config_json.get('limit_train_batches', 1.0),
                          logger=loggers,
                          callbacks=[best_ckpt],
                          #callbacks=[EarlyStopping(monitor='val_loss')],
