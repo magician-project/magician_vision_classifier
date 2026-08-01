@@ -2750,6 +2750,14 @@ if __name__ == "__main__":
                 pass
 
         print("Generating new confusion matrix data..")
+        # trainer.validate() tears the module down onto the CPU, so classifier.device
+        # is 'cpu' by the time we get here and the loop below would run every val tile
+        # through the net on ONE CPU core -- ~100x slower than the GPU and the real
+        # reason this stage used to take hours (it was never disk-bound). Put the model
+        # back on the accelerator for the sweep.
+        eval_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        classifier.to(eval_device)
+        print(f"Confusion/threshold sweep running on: {eval_device}")
         y_true = []
         y_pred = []
         y_maxp = []   # max softmax probability      -> legacy max_prob gate sweep
