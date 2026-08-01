@@ -431,6 +431,16 @@ def _dataset_source_frames(dataset):
     'source' paths are globally unique across dumps, so combined frame ids stay
     distinct across FORTH / Altinay / etc. without extra offsetting."""
     import json as _json
+    # cacheAllDataToRAM wraps the dataset in RAMPreloadedDataset BEFORE the split,
+    # and that wrapper forwards only classes/targets -- so .datasets/.file (the
+    # frame metadata this needs) become invisible and the split raises below.
+    # Unwrap to the cached-from dataset: RAMPreloadedDataset caches dataset[i] for
+    # i in 0..n-1 in order, so frame i still corresponds to cached sample i, and
+    # _h5_frames honours the .indices row subsets apply_class_scheme installed.
+    if not hasattr(dataset, "datasets") and not hasattr(dataset, "file"):
+        inner = getattr(dataset, "_dataset", None)
+        if inner is not None:
+            dataset = inner
     def _h5_frames(ds):
         raw = ds.file["metadata"][:]
         rows = ds.indices if getattr(ds, "indices", None) is not None else range(len(ds))

@@ -2,8 +2,12 @@
 numpy
 opencv-python
 pillow
-torch
-torchvision
+# Pinned: the host driver on supermicro-nvidia is 535.183.01 (CUDA 12.3). Unpinned
+# torch now resolves to a cu130 (CUDA 13) wheel, which needs driver >=580 and reports
+# cuda.is_available()==False. 2.8.0+cu128 is also the exact stack that produced the
+# R0 miss@FA5=8.4 result, so this keeps reproductions comparable.
+torch==2.8.0
+torchvision==0.23.0
 torchmetrics
 pytorch-lightning
 h5py
