@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 """ 
-Author : "Nikos Vasilikopoulos, Ammar Qammaz"
+Author : "Ammar Qammaz, Nikos Vasilikopoulos"
 Copyright : "2025 Foundation of Research and Technology, Computer Science Department Greece, See license.txt"
 License : "FORTH" 
 """
@@ -53,177 +53,14 @@ from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 
 
 
+#-------------------------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------------------------
+#                                           Main
+#-------------------------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------------------------
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# DEAD CODE (D5) -- COMMENTED OUT 2026-07-28, NOT YET DELETED.
-# Unreachable: the only reference is the commented-out block in main() (search
-# 'evaluate_dumped_tiles'). Also missing torch.no_grad(), so it would build a
-# full autograd graph for every batch if revived.
-# NOTE: metadata_collate_fn, filed alongside this in D5, is NOT dead -- it is
-# imported by six evaluation scripts and must stay.
-# Retained verbatim below so the logic is recoverable; delete once you are sure
-# nothing external depends on it. See ISSUES.md D5.
-# ---------------------------------------------------------------------------
-# def evaluate_dumped_tiles(model, tiles_dir, classes, device='cuda', batch_size=16):
-#     """
-#     Evaluates dumped PNG tiles against the current model.
-#
-#     Args:
-#         model (torch.nn.Module): Trained classifier model.
-#         tiles_dir (str): Path to the directory containing dumped tiles.
-#         classes (list): List of class names (order must match model outputs).
-#         device (str): 'cuda' or 'cpu'.
-#         batch_size (int): Batch size for inference.
-#
-#     Returns:
-#         dict: metrics containing accuracy, confusion matrix, and report.
-#     """
-#
-#     import re
-#     from tqdm import tqdm
-#     from sklearn.metrics import confusion_matrix, classification_report
-#     model.eval()
-#     model.to(device)
-#
-#     # HWC uint8 → CHW uint8 tensor; /255 normalisation is done inside the model.
-#     transform = transforms.Lambda(
-#         lambda img: torch.from_numpy(img).permute(2, 0, 1).contiguous()
-#     )
-#
-#     # Collect all .png tiles
-#     all_files = [os.path.join(tiles_dir, f) for f in os.listdir(tiles_dir) if f.lower().endswith('.png')]
-#     if not all_files:
-#         print(f"No PNG files found in {tiles_dir}")
-#         return None
-#
-#     y_true = []
-#     y_pred = []
-#
-#     batch = []
-#     batch_gt = []
-#
-#     print(f"Evaluating {len(all_files)} dumped tiles from '{tiles_dir}'...")
-#
-#     for fpath in tqdm(all_files):
-#         # Parse filename pattern: tile_000001_y0_x0_cls2_dust.png
-#         match = re.search(r"_cls(-?\d+)_", os.path.basename(fpath))
-#         if not match:
-#             print(f"Could not extract class ID from {fpath}")
-#             continue
-#         gt_cls = int(match.group(1))
-#         if gt_cls < 0 or gt_cls >= len(classes):
-#             continue  # skip unknown class
-#
-#         # Load RGBA image
-#         img = load_rgba_image(fpath)
-#         img = transform(img)
-#         batch.append(img)
-#         batch_gt.append(gt_cls)
-#
-#         # Process in batches
-#         if len(batch) == batch_size:
-#             inputs = torch.stack(batch).to(device)
-#             outputs = model(inputs)
-#             preds = outputs.argmax(dim=1).detach().cpu().numpy()
-#             y_pred.extend(preds)
-#             y_true.extend(batch_gt)
-#             batch.clear()
-#             batch_gt.clear()
-#
-#     # Handle remainder
-#     if batch:
-#         inputs = torch.stack(batch).to(device)
-#         outputs = model(inputs)
-#         preds = outputs.argmax(dim=1).detach().cpu().numpy()
-#         y_pred.extend(preds)
-#         y_true.extend(batch_gt)
-#
-#     # Compute metrics
-#     cm = confusion_matrix(y_true, y_pred, labels=list(range(len(classes))))
-#     acc = (np.array(y_true) == np.array(y_pred)).mean()
-#     report = classification_report(y_true, y_pred, target_names=classes, digits=3)
-#
-#     print(f"\nEvaluation complete — Accuracy: {acc:.3f}")
-#     print("Confusion Matrix:")
-#     print(cm)
-#     print("\nClassification Report:")
-#     print(report)
-#
-#     # Return results as dictionary
-#     return {
-#         "accuracy": acc,
-#         "confusion_matrix": cm.tolist(),
-#         "report": report
-#     }
-
-
-
-#-------------------------------------------------------------------------------
-#-------------------------------------------------------------------------------
-#-------------------------------------------------------------------------------
-#-------------------------------------------------------------------------------
-
-
-
-  # Return per-sample loss if 'none'
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-  # HWC uint8, values 0–255
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#Main
 def main():
     """The training pipeline: config -> datasets -> loaders -> fit -> evaluate.
 
@@ -321,14 +158,13 @@ def main():
           "/ Max", use_maxp, "/ Min", use_minp, "/ Range", use_rngp)
     #-----------------------------------------------------------------
 
-
-
     #Let's Go..
     if torch.cuda.is_available():
         device = 'cuda'
     else:
         device = 'cpu'
     directory =  config_json['training_dataset']
+
 
     # Rearrange HWC uint8 numpy array → CHW uint8 tensor.
     # We do NOT divide by 255 here; normalisation happens inside Classifier.forward()
