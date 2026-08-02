@@ -8,6 +8,10 @@ pillow
 # R0 miss@FA5=8.4 result, so this keeps reproductions comparable.
 torch==2.8.0
 torchvision==0.23.0
+# timm: the small/edge backbone families (convnext_atto..nano, repvgg, mobileone,
+# ghostnet, lcnet, mobilenetv4, fastvit, edgenext). Unlike the torchvision branches
+# it also ADAPTS the pretrained stem to in_chans instead of discarding it.
+timm
 torchmetrics
 pytorch-lightning
 h5py
