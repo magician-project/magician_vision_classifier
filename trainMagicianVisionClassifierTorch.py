@@ -765,7 +765,7 @@ class CustomCNN(nn.Module):
         → Linear → InstanceNorm1d → ReLU → Dropout
         → Linear → num_classes logits
     """
-    def __init__(self, in_channels=4, intended_tile_size=64, num_classes=4, dropout_rate=0.5, base_channels=32, final_dense_layer=512, early_convs=0, channels=None, res_blocks=None, wavelet_pools=None):
+    def __init__(self, in_channels=4, intended_tile_size=64, num_classes=4, dropout_rate=0.5, base_channels=32, final_dense_layer=512, early_convs=0, channels=None, res_blocks=None, wavelet_pools=None, wavelet_stem=0):
         super(CustomCNN, self).__init__()
         if res_blocks is None:
             res_blocks = [0, 0, 0, 0]
@@ -773,6 +773,24 @@ class CustomCNN(nn.Module):
         # 1-based stage indices whose MaxPool2d(2) is replaced by a lossless Haar
         # WaveletPool (which also widens that stage's output 4x, for free).
         wavelet_pools = set(int(s) for s in (wavelet_pools or []))
+        # wavelet_stem: N levels of lossless Haar DWT applied to the RAW INPUT,
+        # before conv1 -- the cheap analogue of convnext's stride-4 patchify stem.
+        # Each level does CxHxW -> 4C x H/2 x W/2, so conv1 and every early_conv
+        # then run on 1/4 the spatial positions per level. That is the dominant
+        # inference cost: full-res early convs are bandwidth-bound, and measured
+        # on an A6000 one level cut a batch-504 forward from 59.2 ms to 16.1 ms
+        # (3.7x) at +0.02M params, since the DWT itself has none.
+        #
+        # NOTE this is NOT what custom_wavelet_pools=[1] does. That swaps stage 1's
+        # pool, which happens AFTER the full-res conv1/early_convs and so removes
+        # none of their cost. The two are independent and can be combined.
+        #
+        # The docstring on WaveletPool warns the decimated DWT is not shift-invariant
+        # on raw pixels. Counter-evidence: convnext_tiny collapses 48->12 with a
+        # stride-4 patchify on raw tiles and is the campaign's most accurate model,
+        # and a DWT is invertible where patchify is a lossy learned projection.
+        # Unproven either way -> screen it before trusting it.
+        wavelet_stem = int(wavelet_stem or 0)
 
         # channels: explicit per-stage width [c1,c2,c3,c4]. Default is the
         # narrow-early/wide-late convention [base, 2base, 4base, 4base]. A
@@ -783,9 +801,30 @@ class CustomCNN(nn.Module):
         c1, c2, c3, c4 = [int(x) for x in channels]
         print("Custom CNN (",base_channels,",",final_dense_layer,") constructor / early_convs",
               early_convs, "/ channels", [c1,c2,c3,c4], "/ wavelet_pools", sorted(wavelet_pools))
+        # Validation in forward() is against the ORIGINAL tile the loader sends;
+        # the stem transformation happens inside this module.
         self.channels  = in_channels
         self.tile_size = intended_tile_size
         self.early_convs = int(early_convs)
+
+        # Build the wavelet stem and work out what conv1 actually receives.
+        self.wavelet_stem = nn.ModuleList()
+        stem_ch, stem_sz = in_channels, int(intended_tile_size)
+        for _ in range(wavelet_stem):
+            if stem_sz % 2 != 0:
+                raise ValueError(f"wavelet_stem: tile size {stem_sz} is not divisible by 2; "
+                                 f"{wavelet_stem} levels is too many for a {intended_tile_size}px tile")
+            self.wavelet_stem.append(WaveletPool(stem_ch))
+            stem_ch *= 4
+            stem_sz //= 2
+        # Each of the 4 stages halves the map, so the body needs >= 16px to survive
+        # pool1-4. Catch it here rather than as an opaque conv error mid-forward.
+        if wavelet_stem and stem_sz < 16:
+            raise ValueError(f"wavelet_stem={wavelet_stem} leaves a {stem_sz}x{stem_sz} map, "
+                             f"too small for 4 pooling stages (needs >=16). Use fewer levels.")
+        if wavelet_stem:
+            print(f"Custom CNN wavelet_stem: {wavelet_stem} level(s) -> body sees "
+                  f"{stem_ch}ch @ {stem_sz}x{stem_sz} (from {in_channels}ch @ {intended_tile_size}x{intended_tile_size})")
 
         def make_pool(stage, ch):
             """1-based stage -> (pool module, channels it emits)."""
@@ -793,7 +832,7 @@ class CustomCNN(nn.Module):
                 return WaveletPool(ch), ch * 4
             return nn.MaxPool2d(2), ch
 
-        self.conv1 = nn.Conv2d(in_channels, c1, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(stem_ch, c1, kernel_size=3, padding=1)
         self.bn1   = nn.BatchNorm2d(c1)
         # 3px-feature preservation: extra stride-1 3x3 convs at FULL tile
         # resolution before the first pool, so a ~3px (300um) defect is encoded
@@ -865,6 +904,10 @@ class CustomCNN(nn.Module):
         """
         if x.shape[1:] != (self.channels, self.tile_size, self.tile_size):  # Sanity check on desired input size
           raise ValueError(f"Input size must be {self.channels}x{self.tile_size}x{self.tile_size}, got {x.shape[1:]}")
+        # Lossless Haar collapse before any full-res convolution (see wavelet_stem
+        # in __init__). No-op when the stem is empty, which is the default.
+        for lvl in self.wavelet_stem:
+            x = lvl(x)
         x = F.relu(self.bn1(self.conv1(x)))
         for blk in self.early:
             x = blk(x)                     # extract 3px feature at full res
@@ -929,6 +972,7 @@ class Classifier(pl.LightningModule):
                       custom_channels=None,
                       custom_res_blocks=None,
                       custom_wavelet_pools=None,
+                      custom_wavelet_stem=0,
                       pretrained=True
                  ):
         super(Classifier, self).__init__()
@@ -964,6 +1008,7 @@ class Classifier(pl.LightningModule):
         self.custom_channels = custom_channels
         self.custom_res_blocks = custom_res_blocks
         self.custom_wavelet_pools = custom_wavelet_pools
+        self.custom_wavelet_stem  = custom_wavelet_stem
         self.pretrained = bool(pretrained)
         self.frozen_body_start_epochs = int(frozen_body_start_epochs)
         self.frozen_body_end_epochs   = int(frozen_body_end_epochs)
@@ -1132,7 +1177,8 @@ class Classifier(pl.LightningModule):
                                    early_convs=getattr(self, 'custom_early_convs', 0),
                                    channels=getattr(self, 'custom_channels', None),
                                    res_blocks=getattr(self, 'custom_res_blocks', None),
-                                   wavelet_pools=getattr(self, 'custom_wavelet_pools', None)
+                                   wavelet_pools=getattr(self, 'custom_wavelet_pools', None),
+                                   wavelet_stem=getattr(self, 'custom_wavelet_stem', 0)
                                   )
         else:
             raise ValueError(f"Unsupported model type: {model}. Supported types are 'resnext50', 'resnet18', 'convnext_tiny', 'efficientnet_v2_s', 'swin_v2_t', 'regnet_y_800mf'.")
@@ -2207,6 +2253,7 @@ if __name__ == "__main__":
     custom_channels          = config_json['hparams'].get('custom_channels', None)
     custom_res_blocks        = config_json['hparams'].get('custom_res_blocks', None)
     custom_wavelet_pools     = config_json['hparams'].get('custom_wavelet_pools', None)
+    custom_wavelet_stem      = int(config_json['hparams'].get('custom_wavelet_stem', 0) or 0)
     pretrained_backbone      = bool(config_json['hparams'].get('pretrained', True))
     print("Augmentation: gain_jitter ", gain_jitter, "/ polar_flip ", polar_flip,
           "/ channel_jitter ", channel_jitter, "/ monochrome ", monochrome,
@@ -2611,6 +2658,7 @@ if __name__ == "__main__":
                             custom_channels=custom_channels,
                             custom_res_blocks=custom_res_blocks,
                             custom_wavelet_pools=custom_wavelet_pools,
+                            custom_wavelet_stem=custom_wavelet_stem,
                             pretrained=pretrained_backbone,
                             AoLP=use_AoLP,
                             DoLP=use_DoLP,
