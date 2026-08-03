@@ -3,12 +3,15 @@
 # them to the server directory the wxAnnotator "Download & Use" button reads
 # (ModelDownload.py BASE_URL = http://ammar.gr/magician/models/CameraV2Models/).
 #
-# The store (/media/ammar/games2/Datasets/Models) is the local hub of
-# {name}_{timestamp}.zip archives; the server is a mirror of it.
+# The store is <repo>/models/ -- resolved from THIS SCRIPT's own location, not from the
+# caller's working directory, so it works from anywhere and on any machine. That is
+# also exactly where the trainer drops its archives (`os.makedirs("models/")` +
+# `zip -r models/{name}_{ts}.zip`), so a plain `uploadModels.sh` with no arguments
+# pushes whatever training has produced.
 #
 # Usage:
-#   uploadModels.sh name [name ...]   # package each {name}.pth+.json -> store, then push
-#   uploadModels.sh                   # push whatever zips already sit in the store
+#   uploadModels.sh                   # push everything in <repo>/models/
+#   uploadModels.sh name [name ...]   # also package each {name}.pth+.json first, then push
 #   SRC=/path uploadModels.sh name    # override where the .pth/.json live
 #   STORE=/path SERVER_DIR=... uploadModels.sh ...
 #
@@ -18,8 +21,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-SRC="${SRC:-$( cd "$SCRIPT_DIR/.." && pwd )}"          # default: classifier repo root
-STORE="${STORE:-/media/ammar/games2/Datasets/Models}"
+REPO_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"             # the classifier repo, via this script
+SRC="${SRC:-$REPO_DIR}"                                # where {name}.pth / .json live
+STORE="${STORE:-$REPO_DIR/models}"                     # ../models relative to this script
 SSH_PORT="${SSH_PORT:-2222}"
 SERVER="${SERVER:-ammar@ammar.gr}"
 SERVER_DIR="${SERVER_DIR:-/home/ammar/public_html/magician/models/CameraV2Models/}"
