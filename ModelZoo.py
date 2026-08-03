@@ -12,6 +12,8 @@ Contents:
   build_backbone(...)                      - name -> nn.Module, torchvision + timm + custom
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torchvision                    # the regnet_y_400mf branch uses the full path
@@ -309,10 +311,54 @@ TIMM_BACKBONES = {
 REPARAM_BACKBONES = {'repvgg_a0', 'mobileone_s0', 'mobileone_s1'}
 
 
+def _stem_like(old_conv, in_channels, seed=True, tag=''):
+    """Replacement for a pretrained 3-channel first conv that KEEPS the pretrained
+    kernel instead of throwing it away.
+
+    Every torchvision branch below has to widen the stem from RGB to our 4(+derived)
+    polarization channels, and the obvious way -- assigning a fresh nn.Conv2d --
+    silently discards the single most transferable layer in the network. timm's
+    `in_chans=` does not: it tiles the pretrained RGB kernel across the new channels
+    and rescales by 3/in_chans so the response magnitude is preserved. That is the
+    only reason the timm sweep was not directly comparable with the earlier
+    torchvision full trains (convnext_tiny 4.00 / efficientnet_b0 5.9 /
+    regnet_y_800mf 6.2) -- those ran with random stems. This reproduces timm's
+    adapt_input_conv so both families start from the same place.
+
+    Geometry (out_channels, kernel, stride, padding, dilation, groups, bias) is copied
+    from `old_conv`, so this only applies to the drop-in stem swaps. The resnet18_*
+    variants deliberately build a DIFFERENT stem (deeper, different stride) and cannot
+    be seeded -- they stay random, as before.
+
+    seed=False reproduces the historical random-stem behaviour exactly.
+    """
+    new = nn.Conv2d(in_channels, old_conv.out_channels,
+                    kernel_size=old_conv.kernel_size, stride=old_conv.stride,
+                    padding=old_conv.padding, dilation=old_conv.dilation,
+                    groups=old_conv.groups, bias=old_conv.bias is not None)
+    if not seed:
+        return new
+    if old_conv.in_channels != 3:
+        # Not an ImageNet RGB stem (pretrained=False builds random weights anyway).
+        print(f"[stem] {tag}: NOT seeded (source stem has {old_conv.in_channels} in-channels, expected 3)")
+        return new
+    with torch.no_grad():
+        w = old_conv.weight.detach().float()
+        reps = int(math.ceil(in_channels / 3))
+        w = w.repeat(1, reps, 1, 1)[:, :in_channels] * (3.0 / in_channels)
+        new.weight.copy_(w.to(new.weight.dtype))
+        if new.bias is not None and old_conv.bias is not None:
+            new.bias.copy_(old_conv.bias.detach())
+    print(f"[stem] {tag}: seeded {in_channels}ch stem from the pretrained 3ch kernel "
+          f"(tiled x{reps}, scaled {3.0/in_channels:.3f})")
+    return new
+
+
 def build_backbone(model_type,
                    in_channels,
                    num_classes,
                    pretrained=True,
+                   seed_pretrained_stem=True,
                    tile_size=48,
                    dropout_rate=0.5,
                    base_channels=32,
@@ -324,19 +370,28 @@ def build_backbone(model_type,
                    custom_wavelet_stem=0):
     """Build a backbone by name. Covers the torchvision zoo (stem/head surgery for
     the 4+ channel polarization input), the timm registry, and the from-scratch
-    CustomCNN. Raises ValueError on an unknown name."""
+    CustomCNN. Raises ValueError on an unknown name.
+
+    seed_pretrained_stem (default True) makes the torchvision stem swaps carry the
+    pretrained RGB kernel over to the wider polarization stem, the way timm's
+    in_chans= already does -- see _stem_like. Set it False to reproduce a run from
+    before this existed (every torchvision result up to 2026-08 used random stems).
+    """
     def _w(weights):
         """ImageNet weights when pretrained, else None (random init)."""
         return weights if pretrained else None
 
+    # Only meaningful when there ARE pretrained weights to carry over.
+    _seed = bool(pretrained) and bool(seed_pretrained_stem)
+
     #RESNEXT
     if model_type == 'resnext50':
         model = resnext50_32x4d(weights=_w(ResNeXt50_32X4D_Weights.IMAGENET1K_V2))
-        model.conv1 = nn.Conv2d(in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        model.conv1 = _stem_like(model.conv1, in_channels, seed=_seed, tag='resnext50.conv1')
         model.fc = nn.Linear(2048, num_classes)
     elif model_type == 'resnet18':
         model = resnet18(weights=_w(ResNet18_Weights.DEFAULT))
-        model.conv1 = nn.Conv2d(in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        model.conv1 = _stem_like(model.conv1, in_channels, seed=_seed, tag='resnet18.conv1')
         model.fc = nn.Linear(512, num_classes)
     elif model_type == 'resnet18_stem':
         # Deeper stem, same downsampling: more early capacity for the small
@@ -401,60 +456,60 @@ def build_backbone(model_type,
         model.fc = nn.Linear(512, num_classes)
     elif model_type == 'convnext_tiny':
         model = convnext_tiny(weights=_w(ConvNeXt_Tiny_Weights.DEFAULT))
-        model.features[0][0] = nn.Conv2d(in_channels, 96, kernel_size=(4, 4), stride=(4, 4))
+        model.features[0][0] = _stem_like(model.features[0][0], in_channels, seed=_seed, tag='convnext_tiny.features.0.0')
         model.classifier[2]  = nn.Linear(768, num_classes)
     elif model_type == 'efficientnet_v2_s':
         model = efficientnet_v2_s(weights=_w(EfficientNet_V2_S_Weights.DEFAULT))
-        model.features[0][0] = nn.Conv2d(in_channels, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        model.features[0][0] = _stem_like(model.features[0][0], in_channels, seed=_seed, tag='efficientnet_v2_s.features.0.0')
         model.classifier[1]  = nn.Linear(1280, num_classes, bias=True)
     elif model_type == 'swin_v2_t':
         model = swin_v2_t(weights=_w(Swin_V2_T_Weights.DEFAULT))
-        model.features[0][0] = nn.Conv2d(in_channels, 96, kernel_size=(4, 4), stride=(4, 4))
+        model.features[0][0] = _stem_like(model.features[0][0], in_channels, seed=_seed, tag='swin_v2_t.features.0.0')
         model.head = nn.Linear(768, num_classes)
     elif model_type == 'regnet_y_800mf':
         model = regnet_y_800mf(weights=_w(RegNet_Y_800MF_Weights.DEFAULT))
-        model.stem[0] = nn.Conv2d(in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        model.stem[0] = _stem_like(model.stem[0], in_channels, seed=_seed, tag='regnet_y_800mf.stem.0')
         model.fc = nn.Linear(784, num_classes)
     elif model_type == 'regnet_y_400mf':
         model = torchvision.models.regnet_y_400mf(weights=_w(RegNet_Y_400MF_Weights.DEFAULT))
-        model.stem[0] = nn.Conv2d(in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        model.stem[0] = _stem_like(model.stem[0], in_channels, seed=_seed, tag='regnet_y_400mf.stem.0')
         model.fc = nn.Linear(440, num_classes)
     elif model_type == 'mobilenet_v3_small':
         model = mobilenet_v3_small(weights=_w(MobileNet_V3_Small_Weights.DEFAULT))
-        model.features[0][0] = nn.Conv2d(in_channels, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        model.features[0][0] = _stem_like(model.features[0][0], in_channels, seed=_seed, tag='mobilenet_v3_small.features.0.0')
         model.classifier[3] = nn.Linear(1024, num_classes)
     elif model_type == 'mobilenet_v3_large':
         model = mobilenet_v3_large(weights=_w(MobileNet_V3_Large_Weights.DEFAULT))
-        model.features[0][0] = nn.Conv2d(in_channels, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        model.features[0][0] = _stem_like(model.features[0][0], in_channels, seed=_seed, tag='mobilenet_v3_large.features.0.0')
         model.classifier[3] = nn.Linear(1280, num_classes)
     elif model_type == 'shufflenet_v2_x0_5':
         model = shufflenet_v2_x0_5(weights=_w(ShuffleNet_V2_X0_5_Weights.DEFAULT))
-        model.conv1[0] = nn.Conv2d(in_channels, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        model.conv1[0] = _stem_like(model.conv1[0], in_channels, seed=_seed, tag='shufflenet_v2_x0_5.conv1.0')
         model.fc = nn.Linear(1024, num_classes)
     elif model_type == 'shufflenet_v2_x1_0':
         model = shufflenet_v2_x1_0(weights=_w(ShuffleNet_V2_X1_0_Weights.DEFAULT))
-        model.conv1[0] = nn.Conv2d(in_channels, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        model.conv1[0] = _stem_like(model.conv1[0], in_channels, seed=_seed, tag='shufflenet_v2_x1_0.conv1.0')
         model.fc = nn.Linear(1024, num_classes)
     elif model_type == 'squeezenet1_1':
         model = squeezenet1_1(weights=_w(SqueezeNet1_1_Weights.DEFAULT))
-        model.features[0] = nn.Conv2d(in_channels, 64, kernel_size=(3, 3), stride=(2, 2))
+        model.features[0] = _stem_like(model.features[0], in_channels, seed=_seed, tag='squeezenet1_1.features.0')
         model.classifier[1] = nn.Conv2d(512, num_classes, kernel_size=(1, 1))
         model.num_classes = num_classes
     elif model_type == 'efficientnet_b0':
         model = efficientnet_b0(weights=_w(EfficientNet_B0_Weights.DEFAULT))
-        model.features[0][0] = nn.Conv2d(in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        model.features[0][0] = _stem_like(model.features[0][0], in_channels, seed=_seed, tag='efficientnet_b0.features.0.0')
         model.classifier[1] = nn.Linear(1280, num_classes)
     elif model_type == 'densenet121':
         model = densenet121(weights=_w(DenseNet121_Weights.DEFAULT))
-        model.features.conv0 = nn.Conv2d(in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        model.features.conv0 = _stem_like(model.features.conv0, in_channels, seed=_seed, tag='densenet121.features.conv0')
         model.classifier = nn.Linear(1024, num_classes)
     elif model_type == 'mnasnet0_5':
         model = mnasnet0_5(weights=_w(MNASNet0_5_Weights.DEFAULT))
-        model.layers[0] = nn.Conv2d(in_channels, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        model.layers[0] = _stem_like(model.layers[0], in_channels, seed=_seed, tag='mnasnet0_5.layers.0')
         model.classifier[1] = nn.Linear(1280, num_classes)
     elif model_type == 'mnasnet1_0':
         model = mnasnet1_0(weights=_w(MNASNet1_0_Weights.DEFAULT))
-        model.layers[0] = nn.Conv2d(in_channels, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        model.layers[0] = _stem_like(model.layers[0], in_channels, seed=_seed, tag='mnasnet1_0.layers.0')
         model.classifier[1] = nn.Linear(1280, num_classes)
     elif ('custom' in model_type) or ('cnn' in model_type):
         model = CustomCNN(

@@ -121,7 +121,8 @@ class Classifier(pl.LightningModule):
                       custom_res_blocks=None,
                       custom_wavelet_pools=None,
                       custom_wavelet_stem=0,
-                      pretrained=True
+                      pretrained=True,
+                      seed_pretrained_stem=True
                  ):
         super(Classifier, self).__init__()
         #-----------------------------------------
@@ -158,6 +159,10 @@ class Classifier(pl.LightningModule):
         self.custom_wavelet_pools = custom_wavelet_pools
         self.custom_wavelet_stem  = custom_wavelet_stem
         self.pretrained = bool(pretrained)
+        # Carry the pretrained RGB stem kernel into the wider polarization stem
+        # instead of discarding it (what timm's in_chans= does for free). False
+        # reproduces the pre-2026-08 random-stem behaviour of the torchvision branches.
+        self.seed_pretrained_stem = bool(seed_pretrained_stem)
         self.frozen_body_start_epochs = int(frozen_body_start_epochs)
         self.frozen_body_end_epochs   = int(frozen_body_end_epochs)
         self._body_frozen_state = None   # cache to avoid redundant requires_grad churn
@@ -188,6 +193,7 @@ class Classifier(pl.LightningModule):
                                    in_channels=self.in_channels,
                                    num_classes=num_classes,
                                    pretrained=self.pretrained,
+                                   seed_pretrained_stem=self.seed_pretrained_stem,
                                    tile_size=tile_size,
                                    dropout_rate=dropout_rate,
                                    base_channels=self.base_channels,

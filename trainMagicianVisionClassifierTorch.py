@@ -141,6 +141,11 @@ def main():
     custom_wavelet_pools     = config_json['hparams'].get('custom_wavelet_pools', None)
     custom_wavelet_stem      = int(config_json['hparams'].get('custom_wavelet_stem', 0) or 0)
     pretrained_backbone      = bool(config_json['hparams'].get('pretrained', True))
+    # The torchvision branches used to build a FRESH random stem when widening RGB ->
+    # 4+ polarization channels, throwing away the pretrained first layer, while the timm
+    # branch adapts it via in_chans=. That made the two families incomparable. Default
+    # True seeds both the same way; set false to reproduce a pre-2026-08 torchvision run.
+    seed_pretrained_stem     = bool(config_json['hparams'].get('seed_pretrained_stem', True))
     print("Augmentation: gain_jitter ", gain_jitter, "/ polar_flip ", polar_flip,
           "/ channel_jitter ", channel_jitter, "/ monochrome ", monochrome,
           "/ polar_rot ", polar_rot)
@@ -545,6 +550,7 @@ def main():
                             custom_wavelet_pools=custom_wavelet_pools,
                             custom_wavelet_stem=custom_wavelet_stem,
                             pretrained=pretrained_backbone,
+                            seed_pretrained_stem=seed_pretrained_stem,
                             AoLP=use_AoLP,
                             DoLP=use_DoLP,
                             Unpolarized=use_unpol,
