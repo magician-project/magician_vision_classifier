@@ -62,7 +62,7 @@ def miss_at_fa(curve_path, targets=(0.05, 0.10)):
     return {t: (1.0 - interp(t)) * 100.0 for t in targets}
 
 
-def collect(prefixes=('tz', 'p1n', 'p1b')):
+def collect(prefixes=('tz', 'p1n', 'p1b', 'p2', 'p3')):
     """Every screen that has both a config and a finished threshold curve."""
     out = []
     for pfx in prefixes:
@@ -149,6 +149,14 @@ def main():
     if '--dry-run' in sys.argv:
         print('(dry run: no config written)')
         return
+    # Once a Phase-2 config exists the full train has been launched against it, and the
+    # trainer writes its RESULTS back into that same file. Re-deriving it would destroy
+    # them -- and the pick can legitimately move as later screens (p3_*) land.
+    existing = glob.glob('p2_*.json')
+    existing = [p for p in existing if not p.endswith(('_confusion.json', '_threshold_curve.json'))]
+    if existing and '--force' not in sys.argv:
+        sys.exit(f"refusing to overwrite an existing Phase-2 config: {existing}. "
+                 f"Pass --force only if you intend to discard that run's results.")
     out_path = f"p2_{pick['model']}.json"
     cfg = write_full_train(pick, out_path)
     print(f"wrote {out_path}: full data, {cfg['hparams']['training_epochs']} epochs, "

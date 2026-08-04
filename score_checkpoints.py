@@ -121,7 +121,10 @@ def main():
         model = Classifier(
             model=config_json['model'], num_classes=len(class_names),
             tile_size=h['tile_size'], dropout_rate=h['dropout_rate'],
-            base_channels=h['base_channels'], final_dense_layer=h['final_dense_layer'],
+            # .get with the Classifier defaults: these are CustomCNN-only knobs and the
+            # timm/torchvision configs legitimately omit them (this crashed on p2_convnext_pico).
+            base_channels=h.get('base_channels', 32),
+            final_dense_layer=h.get('final_dense_layer', 512),
             clean_class=cleanClassID,
             penalize_false_clean=float(config_json.get('penalize_false_clean', 0.0)),
             AoLP=h.get('AoLP', False), DoLP=h.get('DoLP', False),
