@@ -167,16 +167,63 @@ def _dataset_source_frames(dataset):
     raise ValueError("frame_disjoint_split requires H5 'source' metadata; this "
                      "dataset exposes none (PNG ImageFolder is not frame-aware).")
 
-def frame_disjoint_split(dataset, val_split, seed):
+def frame_disjoint_split(dataset, val_split, seed, frozen_val_frames=None):
     """Split a dataset into (train_idx, val_idx) SAMPLE-index lists by FRAME, not
     by tile — whole source frames go entirely to train or entirely to val, so
     tiles of the same frame/point never straddle the split. Essential when there
     are many tiles per point (v2 has ~16), where a tile-level random_split leaks
     near-duplicate siblings across train/val and inflates the val metric. Works
     across combined datasets (mixed domains) since frame ids are global. Returns
-    indices INTO `dataset` (0..len(dataset)-1)."""
+    indices INTO `dataset` (0..len(dataset)-1).
+
+    frozen_val_frames: path to a JSON written by freeze_val_split.py, or an iterable
+    of frame strings. When given, `val_split` and `seed` are IGNORED and validation is
+    exactly the listed frames — every other frame, INCLUDING ones that did not exist
+    when the list was frozen, goes to train.
+
+    Why that matters: without it the split is a function of the frame SET. `np.unique`
+    renumbers frames densely, so adding a single newly-annotated frame reshuffles the
+    dense ids and `rng.choice` selects a different validation set entirely. Frames that
+    were validation become training and vice versa, which silently makes a new run's
+    numbers incomparable with every number measured before it — and un-recoverable,
+    because the old split cannot be reconstructed once the frame set has changed. With
+    the annotation effort at ~51% and climbing, freeze before growing the data.
+    """
+    import json as _json
     import numpy as _np
     srcs = _np.array(_dataset_source_frames(dataset))
+
+    if frozen_val_frames is not None:
+        if isinstance(frozen_val_frames, str):
+            with open(frozen_val_frames) as fh:
+                frozen = _json.load(fh)
+            frozen = frozen['val_frames'] if isinstance(frozen, dict) else frozen
+        else:
+            frozen = list(frozen_val_frames)
+        frozen = set(frozen)
+        is_val = _np.array([s in frozen for s in srcs])
+        present = set(srcs.tolist())
+        found = frozen & present
+        missing = frozen - present
+        new_frames = len(present - frozen)
+        print(f"[frame_disjoint_split] FROZEN val set: {len(found):,}/{len(frozen):,} frozen "
+              f"frames present -> {int(is_val.sum()):,} val tiles; "
+              f"{new_frames:,} other frames (incl. any added since the freeze) -> train")
+        if missing:
+            pct = 100.0 * len(missing) / max(1, len(frozen))
+            msg = (f"[frame_disjoint_split] WARNING: {len(missing):,} frozen val frames "
+                   f"({pct:.1f}%) are NOT in this dataset -- the val set has SHRUNK, so "
+                   f"metrics are not strictly comparable with runs that had all of them.")
+            print(msg)
+            if pct > 25.0:
+                raise ValueError(msg + " Over 25% missing means this is probably the wrong "
+                                 "dataset for this frozen list; refusing to run silently.")
+        if not is_val.any():
+            raise ValueError("frozen val frame list matches nothing in this dataset")
+        train_idx = _np.where(~is_val)[0].tolist()
+        val_idx = _np.where(is_val)[0].tolist()
+        return train_idx, val_idx
+
     _, frame_id = _np.unique(srcs, return_inverse=True)            # per SAMPLE
     uf = _np.unique(frame_id)
     rng = _np.random.default_rng(seed)

@@ -333,7 +333,12 @@ def main():
         # mixed-domain runs (FORTH+Altinay -> held-out frames from both).
         print("No validation_dataset → FRAME-DISJOINT split of the training set")
         from torch.utils.data import Subset
-        tr_idx, va_idx = frame_disjoint_split(dataset, val_split, seed)
+        # dataloader.frozen_val_frames pins validation by frame NAME (freeze_val_split.py),
+        # so newly-annotated frames all land in train and results stay comparable across
+        # dataset growth. Absent → the historical seed/val_split behaviour.
+        frozen_val = config_json['dataloader'].get('frozen_val_frames') or None
+        tr_idx, va_idx = frame_disjoint_split(dataset, val_split, seed,
+                                              frozen_val_frames=frozen_val)
         train_dataset = Subset(dataset, tr_idx)
         val_dataset   = Subset(dataset, va_idx)
     else:

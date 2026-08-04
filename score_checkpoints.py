@@ -58,7 +58,14 @@ def build_val_loader(config_json):
             align_dataset_to_classes(ds, canon)
         dataset = CombinedDataset(subs)
 
-    seed = config_json['dataloader']['seed']
+    # The TRAINER splits on hparams.seed (trainMagicianVisionClassifierTorch.py:90), so this
+    # must too or a config where the two differ silently rebuilds a DIFFERENT validation set
+    # and reports numbers for the wrong split. They are both 42 in every config written so
+    # far, which is why this never surfaced.
+    seed = config_json['hparams'].get('seed', config_json['dataloader']['seed'])
+    if seed != config_json['dataloader'].get('seed'):
+        print(f"NOTE hparams.seed={seed} != dataloader.seed={config_json['dataloader'].get('seed')}; "
+              f"using hparams.seed to match the trainer's split.")
     val_split = config_json['dataloader']['validation_split']
     batch_size = config_json['hparams']['batch_size']
     num_workers = config_json['dataloader']['num_workers']
@@ -68,7 +75,9 @@ def build_val_loader(config_json):
 
     assert config_json['dataloader'].get('frame_disjoint_split'), \
         'this run did not use a frame-disjoint split; rebuild logic would differ'
-    _, va_idx = frame_disjoint_split(dataset, val_split, seed)
+    _, va_idx = frame_disjoint_split(
+        dataset, val_split, seed,
+        frozen_val_frames=config_json['dataloader'].get('frozen_val_frames') or None)
     val_dataset = Subset(dataset, va_idx)
 
     loader_kwargs = {}
