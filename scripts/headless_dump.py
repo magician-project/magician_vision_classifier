@@ -38,6 +38,11 @@ def main():
     use_severity = bool(grab_opt(args, "--use-severity", 1, int))
     ratio_clean = grab_opt(args, "--ratio-clean", 10, float)
     defect_tiles = grab_opt(args, "--defect-tiles", 32, int)
+    tile_size = grab_opt(args, "--tile-size", 48, int)
+    if bool(grab_opt(args, "--center-defect", 0, int)):
+        import readDataAnnotator as _rda
+        _rda.CENTER_DEFECT = True
+        print("CENTER_DEFECT enabled: one defect tile per point, defect at tile centre")
     # Stream over-acceptance multiplier for cleans (final ratio is enforced at
     # close). Lowering it caps the pre-subsample file size on disk.
     oversample = grab_opt(args, "--clean-oversample", None, float)
@@ -113,7 +118,7 @@ def main():
         threshold=20,
         border=0,
         step=4,
-        tile_size=48,
+        tile_size=tile_size,
         ignoreSamplesWithNoMetadata=False,   # keep datasets without controller.csv
         includeTilesNotAnnotated=False,
         includeTilesAnnotatedByAI=True,
