@@ -354,11 +354,65 @@ def _stem_like(old_conv, in_channels, seed=True, tag=''):
     return new
 
 
+def retune_timm_stem_stride(model, stride, tile_size=48, tag=''):
+    """Re-stride a timm patchify stem WITHOUT touching its pretrained weights.
+
+    Why this exists. ConvNeXt patchifies with a 4x4 stride-4 conv, which on a 48px tile
+    leaves 12x12 before the body. The four stages then halve: 12 -> 6 -> 3 -> 1. The last
+    stage therefore runs on a SINGLE spatial position and the one before it on 3x3, so
+    most of the architecture's spatial reasoning is spent on a map too small to hold the
+    ~3px (300um) defect this classifier exists to find. That is a plausible reason a 8.54M
+    ConvNeXt only ties a 4.02M EfficientNet here.
+
+    The surgery keeps the 4x4 kernel and its pretrained weights EXACTLY as they are and
+    changes only the stride (with padding chosen to keep the output size a clean
+    tile_size/stride), so the filters are unchanged and only the sampling density moves.
+    That is much safer than resizing the kernel, which would need interpolation and would
+    genuinely alter what the pretrained filters compute.
+
+    Cost scales with the square of the density change: stride 4 -> 2 quadruples the spatial
+    positions in every stage, stride 4 -> 3 raises them ~1.8x. Measure, do not assume.
+    """
+    stem = getattr(model, 'stem', None)
+    if stem is None or not isinstance(stem, nn.Sequential) or not isinstance(stem[0], nn.Conv2d):
+        raise ValueError(f"{tag}: no timm-style Sequential(Conv2d, ...) stem to re-stride")
+    old = stem[0]
+    k = old.kernel_size[0]
+    if old.stride[0] == stride:
+        return model
+    # want out = tile_size // stride  ->  pad = ((out-1)*stride + k - tile_size) / 2
+    out = tile_size // stride
+    pad2 = (out - 1) * stride + k - tile_size
+    if pad2 < 0 or pad2 % 2:
+        ok = [s for s in range(1, k + 1)
+              if tile_size % s == 0
+              and ((tile_size // s - 1) * s + k - tile_size) >= 0
+              and ((tile_size // s - 1) * s + k - tile_size) % 2 == 0]
+        raise ValueError(
+            f"{tag}: stride {stride} with kernel {k} does not tile {tile_size}px under "
+            f"symmetric padding (needs {pad2} total, which is negative or odd). "
+            f"Strides that do work here: {ok}. Supporting the rest would need asymmetric "
+            f"padding around the conv, which is not worth the extra module for an arm "
+            f"whose effect the 0.43 noise floor may not resolve anyway.")
+    new = nn.Conv2d(old.in_channels, old.out_channels, kernel_size=k, stride=stride,
+                    padding=pad2 // 2, bias=old.bias is not None)
+    with torch.no_grad():
+        new.weight.copy_(old.weight)
+        if new.bias is not None and old.bias is not None:
+            new.bias.copy_(old.bias)
+    stem[0] = new
+    print(f"[stem-stride] {tag}: patchify stride {old.stride[0]} -> {stride} "
+          f"(kernel {k} kept, pretrained weights copied verbatim, pad {pad2//2}); "
+          f"body now sees {out}x{out} instead of {tile_size//old.stride[0]}x{tile_size//old.stride[0]}")
+    return model
+
+
 def build_backbone(model_type,
                    in_channels,
                    num_classes,
                    pretrained=True,
                    seed_pretrained_stem=True,
+                   timm_stem_stride=None,
                    tile_size=48,
                    dropout_rate=0.5,
                    base_channels=32,
@@ -539,6 +593,9 @@ def build_backbone(model_type,
                                        num_classes=num_classes)
         print(f"[timm] {name} pretrained={pretrained} in_chans={in_channels} "
               f"num_classes={num_classes} params={sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+        if timm_stem_stride:
+            retune_timm_stem_stride(model, int(timm_stem_stride),
+                                    tile_size=tile_size, tag=f'timm/{name}')
         if name in REPARAM_BACKBONES:
             print(f"[timm] NOTE {name} is reparameterizable: training runs the multi-branch "
                   f"graph, but deployment MUST call timm.utils.reparameterize_model() -- worth "

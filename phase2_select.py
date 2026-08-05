@@ -144,6 +144,14 @@ def main():
     else:
         print('  (both 60k runs not finished -- rule 2 cannot be applied)')
 
+    already = [p for p in glob.glob('p2_*.json')
+               if not p.endswith(('_confusion.json', '_threshold_curve.json'))]
+    if already:
+        # Phase 2 has already run. Screens that landed afterwards (p3_*) can move this
+        # line, and a reader glancing at the tail of a log should not mistake it for the
+        # decision that was actually taken.
+        print(f"\nNOTE Phase 2 ALREADY RAN as {already[0]}. The line below is what the rule "
+              f"would pick from TODAY's screens, not what was trained.")
     print(f"\nPHASE 2 PICK: {pick['model']}  DoLP={pick['dolp']}  <- {reason}")
 
     if '--dry-run' in sys.argv:

@@ -146,6 +146,7 @@ def main():
     # branch adapts it via in_chans=. That made the two families incomparable. Default
     # True seeds both the same way; set false to reproduce a pre-2026-08 torchvision run.
     seed_pretrained_stem     = bool(config_json['hparams'].get('seed_pretrained_stem', True))
+    timm_stem_stride         = config_json['hparams'].get('timm_stem_stride', None)
     print("Augmentation: gain_jitter ", gain_jitter, "/ polar_flip ", polar_flip,
           "/ channel_jitter ", channel_jitter, "/ monochrome ", monochrome,
           "/ polar_rot ", polar_rot)
@@ -556,6 +557,7 @@ def main():
                             custom_wavelet_stem=custom_wavelet_stem,
                             pretrained=pretrained_backbone,
                             seed_pretrained_stem=seed_pretrained_stem,
+                            timm_stem_stride=timm_stem_stride,
                             AoLP=use_AoLP,
                             DoLP=use_DoLP,
                             Unpolarized=use_unpol,

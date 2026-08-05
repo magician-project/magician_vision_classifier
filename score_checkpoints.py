@@ -149,6 +149,7 @@ def main():
             custom_wavelet_stem=h.get('custom_wavelet_stem', 0),
             pretrained=bool(h.get('pretrained', True)),
             seed_pretrained_stem=bool(h.get('seed_pretrained_stem', True)),
+            timm_stem_stride=h.get('timm_stem_stride', None),
         )
         state = torch.load(ck, weights_only=False, map_location='cpu')
         model.load_state_dict(state['state_dict'])

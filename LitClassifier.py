@@ -122,7 +122,8 @@ class Classifier(pl.LightningModule):
                       custom_wavelet_pools=None,
                       custom_wavelet_stem=0,
                       pretrained=True,
-                      seed_pretrained_stem=True
+                      seed_pretrained_stem=True,
+                      timm_stem_stride=None
                  ):
         super(Classifier, self).__init__()
         #-----------------------------------------
@@ -163,6 +164,9 @@ class Classifier(pl.LightningModule):
         # instead of discarding it (what timm's in_chans= does for free). False
         # reproduces the pre-2026-08 random-stem behaviour of the torchvision branches.
         self.seed_pretrained_stem = bool(seed_pretrained_stem)
+        # Re-stride a timm patchify stem so the body sees a larger map (see
+        # ModelZoo.retune_timm_stem_stride). None = leave the architecture alone.
+        self.timm_stem_stride = timm_stem_stride
         self.frozen_body_start_epochs = int(frozen_body_start_epochs)
         self.frozen_body_end_epochs   = int(frozen_body_end_epochs)
         self._body_frozen_state = None   # cache to avoid redundant requires_grad churn
@@ -194,6 +198,7 @@ class Classifier(pl.LightningModule):
                                    num_classes=num_classes,
                                    pretrained=self.pretrained,
                                    seed_pretrained_stem=self.seed_pretrained_stem,
+                                   timm_stem_stride=self.timm_stem_stride,
                                    tile_size=tile_size,
                                    dropout_rate=dropout_rate,
                                    base_channels=self.base_channels,
