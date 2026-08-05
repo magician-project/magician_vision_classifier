@@ -1,5 +1,7 @@
 # Core: training, inference and analysis
-numpy
+# numpy 2.x: must match what torch 2.8.0+cu128 was built against — a 1.x downgrade
+# breaks the compiled extensions with "numpy.dtype size changed".
+numpy>=2,<3
 opencv-python
 pillow
 # Pinned: the host driver on supermicro-nvidia is 535.183.01 (CUDA 12.3). Unpinned
@@ -9,11 +11,19 @@ pillow
 torch==2.8.0
 torchvision==0.23.0
 # timm: the small/edge backbone families (convnext_atto..nano, repvgg, mobileone,
-# ghostnet, lcnet, mobilenetv4, fastvit, edgenext). Unlike the torchvision branches
-# it also ADAPTS the pretrained stem to in_chans instead of discarding it.
-timm
-torchmetrics
-pytorch-lightning
+# ghostnet, lcnet, mobilenetv4, fastvit, edgenext) and timm.utils.reparameterize_model
+# for the repvgg/mobileone deployment fusion. Unlike the torchvision branches it also
+# ADAPTS the pretrained stem to in_chans instead of discarding it (ModelZoo._stem_like
+# reproduces that for the torchvision side).
+# PINNED for the same reason as torch: `pretrained=True` resolves to whatever weights
+# THIS timm version points at, and its model definitions change between releases, so an
+# unpinned timm can silently change what a backbone even is. 1.0.28 produced the whole
+# 2026-08 backbone sweep (convnext_pico 7.51 screen / 4.37 full train).
+timm==1.0.28
+# Pinned: Lightning owns the checkpoint format score_checkpoints.py reads and the
+# Trainer semantics (limit_train_batches, save_top_k) the experiment configs rely on.
+pytorch-lightning==2.5.5
+torchmetrics==1.8.2
 h5py
 tqdm
 psutil
@@ -30,3 +40,21 @@ wandb
 # Optional: 3D detection viewer (integrator3D.py). Also needs system freeglut,
 # e.g. sudo apt install freeglut3-dev
 PyOpenGL
+
+# ---------------------------------------------------------------------------------
+# NOT installed by this file — imported by parts of the tree that are not the trainer:
+#
+#   wx (wxPython)  scripts/headless_dump.py, which drives the annotator's dump path.
+#                  Left out deliberately: it is a heavy GTK build, it is not needed to
+#                  train, score or deploy, and it is absent from this container. Install
+#                  it only on a machine that runs the annotator:
+#                      sudo apt install libgtk-3-dev && pip install wxPython
+#
+#   rclpy, std_msgs, geometry_msgs, std_srvs, builtin_interfaces
+#                  liveClassifierTorchROS.py. These come from a ROS 2 installation
+#                  (apt / rosdep), NOT from pip — `pip install rclpy` does not give you
+#                  a working one. Source the ROS 2 setup script instead.
+#
+#   datasetCreator, magician_vision_classifier
+#                  sibling packages of this repo, resolved on PYTHONPATH.
+# ---------------------------------------------------------------------------------
