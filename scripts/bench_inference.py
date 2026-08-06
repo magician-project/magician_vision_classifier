@@ -71,6 +71,13 @@ def main():
     ap.add_argument('--in-channels', type=int, default=5, help='4 polarization + DoLP')
     ap.add_argument('--num-classes', type=int, default=12)
     ap.add_argument('--iters', type=int, default=30)
+    ap.add_argument('--tiles', type=int, nargs='+', default=[TILE],
+                    help='tile size(s) to benchmark, e.g. --tiles 32 48. Smaller tiles give '
+                         'slightly MORE tiles per frame but each costs (t/48)^2 in the '
+                         'compute-bound regime -- which is exactly the question: a 4080 bench '
+                         'on the other campaign measured 32px and 48px within 1% of each other '
+                         'at batch 504, i.e. overhead/memory-bound, where input size barely '
+                         'matters and the (t/48)^2 saving never materializes.')
     ap.add_argument('--out', default='phase4_inference_bench.json')
     args = ap.parse_args()
 
@@ -87,14 +94,44 @@ def main():
               f'running and these numbers will be contended, exactly the problem this '
               f'benchmark exists to fix.\n')
 
+    if len(args.tiles) > 1:
+        rows_all = []
+        for t in args.tiles:
+            print(f'\n{"="*100}\n=== TILE {t}px\n{"="*100}')
+            rows_all += _run(args, device, t)
+        print(f'\n{"="*100}\n=== TILE-SIZE COMPARISON (Hz @ step 16, real geometry per tile size)')
+        by = {}
+        for r in rows_all:
+            by.setdefault((r['model'], r['variant']), {})[r['tile']] = r
+        print(f"\n{'model':24s} {'variant':8s} " +
+              ' '.join(f'{("t"+str(t)+" ms"):>9s} {("t"+str(t)+" Hz"):>9s}' for t in args.tiles) +
+              f" {'speedup':>9s}")
+        for k, v in sorted(by.items(), key=lambda kv: -(list(kv[1].values())[0]['hz_step16'])):
+            if len(v) < len(args.tiles):
+                continue
+            cells = ' '.join(f"{v[t]['ms_per_batch']:9.2f} {v[t]['hz_step16']:9.1f}" for t in args.tiles)
+            sp = v[args.tiles[-1]]['ms_per_batch'] / v[args.tiles[0]]['ms_per_batch']
+            print(f'{k[0]:24s} {k[1]:8s} {cells} {sp:8.2f}x')
+        ideal = (args.tiles[-1] / args.tiles[0]) ** 2
+        print(f"\ncompute-bound expectation if it scaled with pixel count: {ideal:.2f}x")
+        print('A measured speedup well below that means the forward pass is overhead/'
+              'memory-bound at\nthis batch size, so tile size buys little or no throughput.')
+        json.dump({'device': torch.cuda.get_device_name(0), 'batch': args.batch,
+                   'tiles_benchmarked': args.tiles, 'rows': rows_all},
+                  open(args.out, 'w'), indent=2)
+        print(f'\nwrote {args.out}')
+        return
+    return _run(args, device, args.tiles[0], write=True)
+
+
+def _run(args, device, TILE, write=False):
     candidates = args.models or [
         'convnext_atto', 'convnext_femto', 'convnext_pico', 'convnext_nano',
         'lcnet_050', 'mobilenetv4_conv_small', 'edgenext_xx_small', 'ghostnet_100',
         'repvgg_a0', 'mobileone_s0', 'mobileone_s1', 'fastvit_t8',
         'efficientnet_b0', 'regnet_y_800mf', 'convnext_tiny', 'custom',
     ]
-
-    geom = {s: tiles_per_frame(s) for s in STEPS}
+    geom = {s: tiles_per_frame(s, tile=TILE) for s in STEPS}
     print('deployment geometry: %dx%d, tile %d' % (FRAME_H, FRAME_W, TILE))
     for s, n in geom.items():
         print(f'    step {s:2d} -> {n:6,d} tiles/frame'
@@ -121,12 +158,14 @@ def main():
 
         for tag, m in variants:
             try:
-                ms, tps = bench(m, args.in_channels, args.batch, device, iters=args.iters)
+                ms, tps = bench(m, args.in_channels, args.batch, device,
+                                iters=args.iters, tile=TILE)
             except Exception as e:                  # noqa: BLE001
                 print(f'  {name} [{tag}]: SKIP ({type(e).__name__}: {e})')
                 continue
             rows.append({
                 'model': name, 'variant': tag, 'params_M': round(params, 2),
+                'tile': TILE,
                 'ms_per_batch': round(ms, 2), 'tiles_per_s': round(tps),
                 'hz_legacy_2175': round(tps / LEGACY_TILES_PER_FRAME, 1),
                 **{f'hz_step{s}': round(tps / n, 1) for s, n in geom.items()},
@@ -145,12 +184,14 @@ def main():
               f"{r['ms_per_batch']:7.2f} {r['tiles_per_s']:9,d} {r['hz_legacy_2175']:8.1f} "
               + ' '.join(f"{r[f'hz_step{s}']:8.1f}" for s in STEPS) + flag)
 
-    json.dump({'device': torch.cuda.get_device_name(0), 'batch': args.batch,
-               'in_channels': args.in_channels, 'dtype': 'fp16',
-               'frame': [FRAME_H, FRAME_W], 'tile': TILE,
-               'tiles_per_frame': geom, 'rows': rows},
-              open(args.out, 'w'), indent=2)
-    print(f'\nwrote {args.out}')
+    if write:
+        json.dump({'device': torch.cuda.get_device_name(0), 'batch': args.batch,
+                   'in_channels': args.in_channels, 'dtype': 'fp16',
+                   'frame': [FRAME_H, FRAME_W], 'tile': TILE,
+                   'tiles_per_frame': geom, 'rows': rows},
+                  open(args.out, 'w'), indent=2)
+        print(f'\nwrote {args.out}')
+    return rows
 
 
 if __name__ == '__main__':
