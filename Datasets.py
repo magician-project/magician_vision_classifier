@@ -167,6 +167,40 @@ def _dataset_source_frames(dataset):
     raise ValueError("frame_disjoint_split requires H5 'source' metadata; this "
                      "dataset exposes none (PNG ImageFolder is not frame-aware).")
 
+def exclude_frames_indices(dataset, exclude_frames):
+    """Indices of `dataset` whose source frame is NOT in `exclude_frames`.
+
+    Used to carve the coverage validation set OUT of training. This has to be a removal,
+    not a copy: a coverage set drawn from frames the model also trains on measures
+    memorisation rather than detection, so it would report high recall on a model that
+    cannot generalise at all -- the exact failure it exists to catch.
+
+    `exclude_frames` is a path to the JSON written by build_coverage_val.py (or any dict
+    with a 'frames' key, or a plain list of frame strings).
+    """
+    import json as _json
+    import numpy as _np
+    if isinstance(exclude_frames, str):
+        with open(exclude_frames) as fh:
+            payload = _json.load(fh)
+        frames = payload['frames'] if isinstance(payload, dict) else payload
+    else:
+        frames = list(exclude_frames)
+    frames = set(frames)
+    srcs = _np.array(_dataset_source_frames(dataset))
+    drop = _np.array([s in frames for s in srcs])
+    present = len(set(srcs.tolist()) & frames)
+    keep = _np.where(~drop)[0].tolist()
+    print(f"[exclude_frames] {present:,}/{len(frames):,} listed frames present -> removing "
+          f"{int(drop.sum()):,} tiles from train, {len(keep):,} remain")
+    if present == 0:
+        raise ValueError("exclude_frames matched nothing in this dataset -- wrong list for "
+                         "this dump? Training would silently include the coverage set.")
+    if not keep:
+        raise ValueError("exclude_frames removed the entire training set")
+    return keep
+
+
 def frame_disjoint_split(dataset, val_split, seed, frozen_val_frames=None):
     """Split a dataset into (train_idx, val_idx) SAMPLE-index lists by FRAME, not
     by tile — whole source frames go entirely to train or entirely to val, so

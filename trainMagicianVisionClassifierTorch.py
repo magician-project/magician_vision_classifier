@@ -35,7 +35,8 @@ from Config import (
 )
 from Datasets import (
     _human_bytes, _get_available_ram_bytes, _get_path_size_bytes, _estimate_dataset_ram_bytes,
-    _dataset_source_frames, frame_disjoint_split, load_rgba_image, load_rgba_image_pil,
+    _dataset_source_frames, frame_disjoint_split, exclude_frames_indices,
+    load_rgba_image, load_rgba_image_pil,
     load_png_comment_metadata, metadata_collate_fn, RGBAImageFolder, RAMPreloadedDataset,
     CombinedDataset, BalancedBatchSampler,
 )
@@ -328,7 +329,17 @@ def main():
             raise ValueError("Training/validation class_to_idx mismatch")
 
         train_dataset = dataset
+        # Carve the coverage val OUT of train (see build_coverage_val.py). Must be a
+        # removal, not a copy -- otherwise the coverage set scores memorisation.
+        _excl = config_json['dataloader'].get('exclude_frames') or None
+        if _excl:
+            from torch.utils.data import Subset as _Subset
+            train_dataset = _Subset(dataset, exclude_frames_indices(dataset, _excl))
     elif config_json['dataloader'].get('frame_disjoint_split'):
+        if config_json['dataloader'].get('exclude_frames'):
+            raise ValueError("dataloader.exclude_frames is only supported with an explicit "
+                             "validation_dataset; combining it with frame_disjoint_split would "
+                             "make the held-out set ambiguous. Set validation_dataset instead.")
         # Train/test split of the (possibly combined) training set BY FRAME (no
         # tile leakage). Used for the within-domain ceiling (FORTH->FORTH) and for
         # mixed-domain runs (FORTH+Altinay -> held-out frames from both).
