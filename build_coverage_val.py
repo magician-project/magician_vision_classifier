@@ -93,9 +93,11 @@ def main():
     ap.add_argument('--out', default='val_coverage_frames.json')
     ap.add_argument('--min-tiles', type=int, default=1500,
                     help='target val tiles per class before a class is considered covered')
+    ap.add_argument('--train-h5', default=TRAIN_H5,
+                    help='train dataset.h5 to carve coverage from (default: supermicro path)')
     args = ap.parse_args()
 
-    labels, rec_id, frame_id, rec_names, frame_names, class_names = extract(TRAIN_H5)
+    labels, rec_id, frame_id, rec_names, frame_names, class_names = extract(args.train_h5)
     clean = class_names.index('class_clean')
     print(f'{len(labels):,} tiles, {len(rec_names)} recordings, {len(frame_names):,} frames')
 
@@ -203,7 +205,7 @@ def main():
                     'never quote them as generalization); TIER_C are vestigial and not '
                     'evaluated. The factory val (Aug26_78K/val) is untouched and remains the '
                     'ship/no-ship metric.'),
-        'source': TRAIN_H5,
+        'source': args.train_h5,
         'held_out_recordings': sorted(rec_names[r] for r in selected_recs),
         'n_frames': len(chosen_frames),
         'n_tiles': int(sel.sum()),
