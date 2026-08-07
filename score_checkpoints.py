@@ -35,19 +35,46 @@ from Evaluation import run_confusion_and_threshold_sweep
 from LitClassifier import Classifier
 
 
+def _load_one_dir(d, config_json, label=None):
+    h5 = '%s/dataset.h5' % d
+    assert checkIfFileExists(h5), f'expected an h5 dataset at {h5}'
+    from DatasetConverter import HDF5Dataset
+    ds = HDF5Dataset(h5)
+    ds.metadata = None
+    return apply_class_scheme(ds, config_json,
+                              label=label or os.path.basename(str(d).rstrip('/')))
+
+
 def build_val_loader(config_json):
     """Rebuild the run's validation split. Mirrors the trainer's dataset path."""
     directory = config_json['training_dataset']
     directories = directory if isinstance(directory, list) else [directory]
 
     def _load_one(d):
-        h5 = '%s/dataset.h5' % d
-        assert checkIfFileExists(h5), f'expected an h5 dataset at {h5}'
-        from DatasetConverter import HDF5Dataset
-        ds = HDF5Dataset(h5)
-        ds.metadata = None
-        return apply_class_scheme(ds, config_json,
-                                  label=os.path.basename(str(d).rstrip('/')))
+        return _load_one_dir(d, config_json)
+
+    # An explicit validation_dataset (Aug26 and everything after it) IS the validation
+    # set -- there is no split to rebuild, and the training set never has to be loaded.
+    # Mirrors trainMagicianVisionClassifierTorch.py:296-330, including the alignment of
+    # val onto the TRAINING class order: class index is what the model predicts, and the
+    # two dumps can reach the same class SET in a different ORDER.
+    val_dir = config_json.get('validation_dataset')
+    if val_dir:
+        val_dir = val_dir[0] if isinstance(val_dir, list) else val_dir
+        print(f'Using explicit validation dataset: {val_dir}')
+        train_ds = _load_one_dir(directories[0], config_json, label='train(classes only)')
+        val_ds = _load_one_dir(val_dir, config_json, label='validation')
+        if list(val_ds.classes) != list(train_ds.classes):
+            print(f'[class_scheme:validation] reordering to match training: '
+                  f'{val_ds.classes} -> {train_ds.classes}')
+            align_dataset_to_classes(val_ds, train_ds.classes)
+        if list(val_ds.classes) != list(train_ds.classes):
+            raise ValueError(f'train/val class mismatch: {train_ds.classes} vs {val_ds.classes}')
+        bs = config_json['hparams']['batch_size']
+        nw = config_json['dataloader']['num_workers']
+        kw = {'pin_memory': True, 'persistent_workers': True} if nw > 0 else {}
+        return val_ds, DataLoader(val_ds, batch_size=bs, shuffle=False,
+                                  num_workers=nw, drop_last=False, **kw)
 
     subs = [_load_one(d) for d in directories]
     if len(subs) == 1:
@@ -112,7 +139,13 @@ def main():
     print(f'\nval tiles: {len(val_loader.dataset)}\n')
 
     class_names = list(dataset.classes)
-    cleanClassID = next((i for i, c in enumerate(class_names) if 'clean' in c.lower()), None)
+    # Exact match, not substring: 'class_WeldingClassAClean' contains "clean" and sorts
+    # BEFORE 'class_clean' (ASCII: 'W' < 'c'), so a substring test silently picks a
+    # 2-tile vestigial class as the clean class -- and defect_mass = 1 - P(that) makes
+    # every tile score as a defect. Audited: no run in this campaign had both classes
+    # present, so no recorded number is affected. Reported by the dev box, who hit it.
+    cleanClassID = next((i for i, c in enumerate(class_names)
+                         if c.lower() in ('class_clean', 'clean')), None)
     h = config_json['hparams']
 
     trainer = pl.Trainer(accelerator=config_json.get('accelerator', 'auto'),

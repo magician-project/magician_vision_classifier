@@ -470,6 +470,7 @@ class RAMPreloadedDataset(Dataset):
         self._dataset = dataset
         self.classes = getattr(dataset, 'classes', None)
         self.targets = getattr(dataset, 'targets', None)
+        self.class_to_idx = getattr(dataset, 'class_to_idx', None)
 
         n = len(dataset)
         print("\n[WARNING] cacheAllDataToRAM=True -> Preloading ALL dataset samples into RAM...")
@@ -494,6 +495,28 @@ class RAMPreloadedDataset(Dataset):
             self.targets = [y for (_, y) in self._cached]
 
         print("[OK] Dataset cached to RAM. Starting training...\n")
+
+    def __getattr__(self, name):
+        """Forward anything not defined here to the wrapped dataset.
+
+        This wrapper explicitly copied only `classes` and `targets`, which meant every
+        OTHER attribute of the underlying dataset silently vanished behind it. That has
+        now caused two separate crashes: `_dataset_source_frames` losing `.file`/.datasets
+        (which broke cacheAllDataToRAM + frame_disjoint_split), and `class_to_idx`
+        disappearing from the trainer's train/val consistency check on the
+        explicit-validation path. Delegating by default fixes the class of bug rather
+        than the instance.
+
+        Only called when normal attribute lookup fails, so the cached fast paths
+        (__getitem__/__len__/classes/targets) are untouched. The `_dataset` guard stops
+        infinite recursion if this fires before __init__ has bound it.
+        """
+        if name.startswith('_') and name not in ('_dataset',):
+            raise AttributeError(name)
+        inner = object.__getattribute__(self, '__dict__').get('_dataset')
+        if inner is None:
+            raise AttributeError(name)
+        return getattr(inner, name)
 
     def __len__(self):
         """Return the number of cached samples."""
