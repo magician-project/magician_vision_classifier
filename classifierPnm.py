@@ -926,6 +926,74 @@ GATE_MAX_PROB    = "max_prob"
 GATE_OFF         = "off"
 
 
+# ---------------------------------------------------------------------------
+# Deployment presets (recommended_configuration.json)
+# ---------------------------------------------------------------------------
+# Which model to run and at what operating point, committed to git so a deployment
+# site picks up new models and thresholds with a plain `git pull` -- deliberately not
+# environment variables, which are awkward to change on-site.
+#
+# Lives HERE rather than in liveClassifierTorchROS so every consumer shares one
+# definition: the ROS node, wxAnnotator (which cannot import rclpy), and anything
+# else. The first entry of "configurations" is the default.
+# ---------------------------------------------------------------------------
+RECOMMENDED_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "recommended_configuration.json")
+
+# Used only if the file is missing or unreadable, so a bad preferences file can never
+# stop a caller from running.
+FALLBACK_PRESET = {
+    "name": "fallback",
+    "model": "mix_convnext_tiny",
+    "gate": {"mode": GATE_DEFECT_MASS, "threshold": 0.90, "assign_best_defect_class": True},
+    "runtime": {"step": 18, "target_fps": 23.0, "erosion_kernel": 1, "min_votes": 2,
+                "majority_voting": True, "frame_limiter": True, "two_stage": False},
+}
+
+
+def load_recommended_configuration(name=None, path=RECOMMENDED_CONFIG_FILE, quiet=False):
+    """Return one preset dict from recommended_configuration.json.
+
+    name=None -> the first entry (the committed default); otherwise the entry whose
+    "name" matches. Never raises: falls back to FALLBACK_PRESET, because failing to
+    read a preferences file must not stop the caller from running.
+    """
+    try:
+        with open(path, "r") as f:
+            doc = json.load(f)
+        presets = doc.get("configurations") or []
+        if not presets:
+            raise ValueError("no 'configurations' entries")
+        if name is None:
+            chosen = presets[0]
+        else:
+            matches = [p for p in presets if p.get("name") == name]
+            if not matches:
+                raise ValueError(f"preset {name!r} not found; "
+                                 f"available: {[p.get('name') for p in presets]}")
+            chosen = matches[0]
+        # Merge over the fallback so a partial preset cannot leave a key undefined.
+        merged = dict(FALLBACK_PRESET)
+        merged.update(chosen)
+        merged["gate"] = {**FALLBACK_PRESET["gate"], **(chosen.get("gate") or {})}
+        merged["runtime"] = {**FALLBACK_PRESET["runtime"], **(chosen.get("runtime") or {})}
+        return merged
+    except Exception as e:
+        if not quiet:
+            print(f"[config] could not use {path} ({e!r}) — falling back to "
+                  f"{FALLBACK_PRESET['model']}")
+        return dict(FALLBACK_PRESET)
+
+
+def recommended_configuration_available(path=RECOMMENDED_CONFIG_FILE):
+    """True when a usable presets file is present (so callers can say 'if detected')."""
+    try:
+        with open(path, "r") as f:
+            return bool((json.load(f).get("configurations") or []))
+    except Exception:
+        return False
+
+
 def gate_tiles(probs, cleanClassID, threshold,
                gateMode=GATE_DEFECT_MASS,
                assignBestDefectClass=True):

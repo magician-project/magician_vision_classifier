@@ -86,9 +86,28 @@ def unix_ns_to_ros_time(ns):
 #
 # The FIRST entry is the startup default; pass `--config NAME` to select another.
 # The model's .pth/.json are auto-fetched on first run (ModelDownload.ensure_model).
+
 # ENSEMBLE_STAGE1 / ENSEMBLE_MEMBERS name the OPTIONAL two-stage ensemble; if any member
 # cannot be resolved the ensemble is skipped and the node still starts on the single
-# classifier.
+# classifier. 
+# The loader lives in classifierPnm so the ROS node, wxAnnotator and any other consumer
+# share ONE definition rather than hand-copied variants that drift apart.
+from classifierPnm import (load_recommended_configuration, FALLBACK_PRESET,
+                           RECOMMENDED_CONFIG_FILE)
+
+
+# Two-stage ensemble members. This path is OPTIONAL: if any member cannot be resolved the
+# ensemble is skipped and the node still starts on the single classifier (previously a
+# missing member called sys.exit(1) inside ClassifierPnm and killed the node before it
+# ever published).
+ENSEMBLE_STAGE1 = "binary_small_cnn"
+ENSEMBLE_MEMBERS = [
+    "allclass_verysmall_cnn",
+    "allclass_resnet18",
+    "allclass_resnext50",
+    "allclass_convnext_tiny",
+]
+
 
 # ========================================================
 # Laser fusion globals (project-specific / fixed hardware)

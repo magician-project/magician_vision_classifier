@@ -1,0 +1,304 @@
+{
+  "class_merges": {
+    "class_Seal": "class_Welding"
+  },
+  "drop_severityless_defects": false,
+  "drop_class_families": [],
+  "hparams": {
+    "tile_size": 48,
+    "batch_size": 504,
+    "training_epochs": 1,
+    "dropout_rate": 0.25,
+    "seed": 1337,
+    "gradient_clip_value": 1.0,
+    "AoLP": true,
+    "DoLP": true,
+    "unpolarized": false,
+    "gain_jitter": 1.0,
+    "polar_flip": true,
+    "channel_jitter": 0.4,
+    "polar_rot": true,
+    "monochrome": false,
+    "pretrained": true
+  },
+  "early_stopping": {
+    "monitor": "loss",
+    "mode": "min",
+    "patience": 16,
+    "min_delta": 0.0005,
+    "verbose": 1,
+    "restore_best_weights": true
+  },
+  "optimizer": {
+    "type": "AdamW",
+    "learning_rate": 0.0005
+  },
+  "dataloader": {
+    "seed": 42,
+    "validation_split": 0.1,
+    "shuffle": false,
+    "label_mode": "categorical",
+    "cacheAllDataToRAM": true,
+    "num_workers": 15,
+    "balanced_sampling": true,
+    "frame_disjoint_split": true,
+    "frozen_val_frames": "val_frames_frozen.json"
+  },
+  "wandb": {
+    "project": "Classifier",
+    "name": "CrossValAltinay",
+    "use_wandb": false
+  },
+  "training_dataset": [
+    "datasets/train_nonaltinay_v2/",
+    "datasets/val_altinay_granular/",
+    "datasets/yongatek_positivedent/"
+  ],
+  "validation_dataset": "",
+  "class_weight": false,
+  "loss": "focal",
+  "penalize_false_clean": 0.5,
+  "accelerator": "auto",
+  "name": "mxaolp1337",
+  "model": "convnext_pico",
+  "devices": 1,
+  "selected_classes": [],
+  "checkpoint_monitor": "val_detect_auroc",
+  "checkpoint_save_top_k": 1,
+  "checkpoint_dir": "datasets/mix_ckpts/mxaolp1337_convnext_pico",
+  "checkpoint_mode": "max",
+  "limit_train_batches": 30000,
+  "classes_int": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11
+  ],
+  "classes": [
+    "class_DeformationClassA",
+    "class_DustClassA",
+    "class_MaterialDefectClassA",
+    "class_NegativeDentClassA",
+    "class_NegativeDentClassB",
+    "class_NegativeDentClassC",
+    "class_PositiveDent",
+    "class_PositiveDentClassA",
+    "class_PositiveDentClassB",
+    "class_PositiveDentClassC",
+    "class_WeldingClassA",
+    "class_clean"
+  ],
+  "confusion_matrix": [
+    [
+      768,
+      0,
+      0,
+      1,
+      1,
+      1,
+      0,
+      2,
+      1,
+      1,
+      9,
+      30
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      238,
+      0,
+      0,
+      0,
+      0,
+      2,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      7,
+      4358,
+      24,
+      42,
+      2,
+      38,
+      30,
+      19,
+      6,
+      76
+    ],
+    [
+      1,
+      0,
+      0,
+      75,
+      8237,
+      226,
+      0,
+      20,
+      70,
+      59,
+      12,
+      266
+    ],
+    [
+      0,
+      0,
+      1,
+      18,
+      52,
+      3297,
+      0,
+      37,
+      44,
+      90,
+      2,
+      235
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      2,
+      0,
+      0,
+      0,
+      14
+    ],
+    [
+      7,
+      0,
+      1,
+      16,
+      51,
+      98,
+      1,
+      24275,
+      830,
+      174,
+      24,
+      987
+    ],
+    [
+      4,
+      0,
+      37,
+      8,
+      65,
+      77,
+      0,
+      538,
+      9116,
+      116,
+      15,
+      568
+    ],
+    [
+      5,
+      0,
+      0,
+      16,
+      40,
+      107,
+      0,
+      92,
+      115,
+      2749,
+      9,
+      387
+    ],
+    [
+      93,
+      0,
+      14,
+      21,
+      35,
+      65,
+      0,
+      70,
+      36,
+      28,
+      53260,
+      603
+    ],
+    [
+      1691,
+      2,
+      1085,
+      1992,
+      8840,
+      17010,
+      58,
+      22885,
+      30555,
+      17302,
+      12867,
+      441793
+    ]
+  ],
+  "best_threshold_balanced": {
+    "threshold": 0.66,
+    "detected": 0.9002712804969647,
+    "false_alarm": 0.053269313767803195
+  },
+  "best_threshold_kpi": {
+    "threshold": 0.51,
+    "detected": 0.9477232762200996,
+    "false_alarm": 0.12469788519637462
+  },
+  "best_threshold_deployment": {
+    "threshold": 0.935,
+    "detected": 0.7576678713759312,
+    "false_alarm": 0.004785282693137678
+  },
+  "gate": {
+    "mode": "defect_mass",
+    "threshold": 0.77,
+    "assign_best_defect_class": true,
+    "calibrated_on": "",
+    "detected": 0.9387277209787306,
+    "false_alarm": 0.07539562652855704,
+    "alternatives": {
+      "balanced": {
+        "threshold": 0.855,
+        "detected": 0.9148691756430761,
+        "false_alarm": 0.03979643216803338
+      },
+      "deployment": {
+        "threshold": 0.98,
+        "detected": 0.8123127766928522,
+        "false_alarm": 0.004864407998849086
+      }
+    }
+  },
+  "model_md5": "de9108c168e272bafa6499381acd0178"
+}
