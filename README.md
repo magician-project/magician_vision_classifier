@@ -339,10 +339,23 @@ Archives are flat zips named `{model_name}_{timestamp}.zip` containing the `.pth
 Run the classifier outside of ROS2, reading frames from shared memory and displaying a live heatmap:
 
 ```bash
-python3 liveClassifierTorch.py
+python3 liveClassifierTorch.py                       # first preset of recommended_configuration.json
+python3 liveClassifierTorch.py --list-configs        # show the presets
+python3 liveClassifierTorch.py --config low_false_alarm --no-visualization \
+                               --detections-jsonl detections.jsonl
 ```
 
-The inference core itself — tiling, heatmaps, majority voting, erosion, gating and model scanning — lives in `classifierPnm.py`. `liveClassifierTorch.py` re-exports it, so existing `from liveClassifierTorch import ...` imports keep working, and the ROS node, the annotator and `ModelDownload.py` all share one implementation.
+This is the **same runtime as the ROS node**, minus ROS: same presets and auto-download, same gate / step / voting / erosion / frame-limiter / FPS defaults, the same optional two-stage ensemble, the same `data/` frame + sidecar-JSON contract, and the same ArUco scan and depth-fusion maths. The differences are only at the edges:
+
+| ROS node | Standalone |
+|----------|------------|
+| Services (`set_threshold`, `pause`, `snapshot`, …) | Command line flags, plus single-key commands while running (press `h` for the list) |
+| Topics (`detections`, `detections_m`, `background_activations`, `markers`) | A per-frame console summary, and one JSON object per frame with `--detections-jsonl FILE` |
+| Laser depth from three `Float32` subscriptions | `--laser-depths d1,d2,d3` (no laser source exists outside ROS); omit it and depth stays unfused |
+
+Keys mirror the services one-to-one: `v` visualization, `p` pause, `2` two-stage, `m` majority voting, `f` frame limiter, `a` autosave, `d`/`c` remember defect/clean, `s` snapshot, `k` scan markers, `t`/`T` gate threshold, `0` follow the model's own gate, `[`/`]` step, `e`/`E` erosion kernel, `n`/`N` min votes, `,`/`.` target FPS, `r` hot-swap model, `q` quit.
+
+The inference core itself — tiling, heatmaps, majority voting, erosion, gating and model scanning — lives in `classifierPnm.py`. `liveClassifierTorch.py` re-exports it, so existing `from liveClassifierTorch import ...` imports keep working, and it additionally owns everything non-ROS (presets, laser/marker geometry, detection bookkeeping, the frame loop). `liveClassifierTorchROS.py` imports those from it rather than keeping a second copy, so the two runners cannot drift apart again.
 
 ### ROS2 Mode
 

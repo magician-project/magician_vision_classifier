@@ -19,7 +19,20 @@ import torch
 from torch.nn import functional as F
 
 # --------------------------------------------------------
-from liveClassifierTorch import ClassifierPnm
+# Everything that is not ROS-specific lives in liveClassifierTorch.py, which is also
+# the standalone runner. Importing it here (rather than keeping a second copy) is what
+# keeps the ROS node and the standalone node at feature parity: presets, gate/step/vote
+# knobs, laser geometry, marker maths and the detection contract have ONE definition.
+from liveClassifierTorch import (
+    ClassifierPnm,
+    RECOMMENDED_CONFIG_FILE, FALLBACK_PRESET, load_recommended_configuration,
+    ENSEMBLE_STAGE1, ENSEMBLE_MEMBERS,
+    LASER_XY_PIXELS, LASER_IDW_POWER, idw_depth,
+    MARKER_SCAN_DURATION_S, ARUCO_DICT_NAME, DEFAULT_MARKER_LENGTH_M,
+    CHESSBOARD_W, CHESSBOARD_H, CHESSBOARD_SQUARE_M,
+    estimatePoseSingleMarkers, make_approx_camera_matrix, rvec_to_quaternion,
+    resize_to_fit_screen, filter_type, class_to_severity,
+)
 from EnsembleClassifier import EnsembleClassifierPnm
 from SharedMemoryManager import SharedMemoryManager
 
@@ -66,71 +79,16 @@ def unix_ns_to_ros_time(ns):
 # Deployment presets
 # ========================================================
 # Which model to run and at what operating point comes from recommended_configuration.json
-# next to this script. That file is COMMITTED TO GIT, so a deployment site picks up new
+# (RECOMMENDED_CONFIG_FILE / load_recommended_configuration, imported above from
+# liveClassifierTorch). That file is COMMITTED TO GIT, so a deployment site picks up new
 # models and thresholds with a plain `git pull` -- deliberately NOT environment variables,
 # which are awkward to change on-site.
 #
 # The FIRST entry is the startup default; pass `--config NAME` to select another.
 # The model's .pth/.json are auto-fetched on first run (ModelDownload.ensure_model).
-RECOMMENDED_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       "recommended_configuration.json")
-
-# Fallback used only if recommended_configuration.json is missing or unreadable, so the
-# node still starts on a sane model rather than dying at the first import.
-FALLBACK_PRESET = {
-    "name": "fallback",
-    "model": "mix_convnext_tiny",
-    "gate": {"mode": "defect_mass", "threshold": 0.90, "assign_best_defect_class": True},
-    "runtime": {"step": 18, "target_fps": 23.0, "erosion_kernel": 1, "min_votes": 2,
-                "majority_voting": True, "frame_limiter": True, "two_stage": False},
-}
-
-
-def load_recommended_configuration(name=None, path=RECOMMENDED_CONFIG_FILE):
-    """Return one preset dict from recommended_configuration.json.
-
-    name=None -> the first entry (the committed default). Otherwise the entry whose
-    "name" matches. Falls back to FALLBACK_PRESET, never raises, because failing to
-    read a preferences file must not stop the node from running.
-    """
-    try:
-        with open(path, "r") as f:
-            doc = json.load(f)
-        presets = doc.get("configurations") or []
-        if not presets:
-            raise ValueError("no 'configurations' entries")
-        if name is None:
-            chosen = presets[0]
-        else:
-            matches = [p for p in presets if p.get("name") == name]
-            if not matches:
-                available = [p.get("name") for p in presets]
-                raise ValueError(f"preset {name!r} not found; available: {available}")
-            chosen = matches[0]
-        # Merge over the fallback so a partial preset cannot leave a key undefined.
-        merged = dict(FALLBACK_PRESET)
-        merged.update(chosen)
-        merged["gate"] = {**FALLBACK_PRESET["gate"], **(chosen.get("gate") or {})}
-        merged["runtime"] = {**FALLBACK_PRESET["runtime"], **(chosen.get("runtime") or {})}
-        return merged
-    except Exception as e:
-        print(f"[config] could not use {path} ({e!r}) — falling back to "
-              f"{FALLBACK_PRESET['model']}")
-        return dict(FALLBACK_PRESET)
-
-
-# Two-stage ensemble members. This path is OPTIONAL: if any member cannot be resolved the
-# ensemble is skipped and the node still starts on the single classifier (previously a
-# missing member called sys.exit(1) inside ClassifierPnm and killed the node before it
-# ever published).
-ENSEMBLE_STAGE1 = "binary_small_cnn"
-ENSEMBLE_MEMBERS = [
-    "allclass_verysmall_cnn",
-    "allclass_resnet18",
-    "allclass_resnext50",
-    "allclass_convnext_tiny",
-]
-
+# ENSEMBLE_STAGE1 / ENSEMBLE_MEMBERS name the OPTIONAL two-stage ensemble; if any member
+# cannot be resolved the ensemble is skipped and the node still starts on the single
+# classifier.
 
 # ========================================================
 # Laser fusion globals (project-specific / fixed hardware)
@@ -143,182 +101,9 @@ LASER_TOPICS = [
     "magician_grabber/distance3",
 ]
 
-# Laser locations in the classifier's 2D image plane (pixels)
-# (x0,y0), (x1,y1), (x2,y2)
-LASER_XY_PIXELS = [
-    (120.0, 200.0),
-    (320.0, 200.0),
-    (520.0, 200.0),
-]
-
-LASER_IDW_POWER = 2.0  # IDW interpolation power
-
-# ========================================================
-# Marker scanning globals
-# ========================================================
-MARKER_SCAN_DURATION_S   = 3.0          # seconds each scan_markers call stays active
-ARUCO_DICT_NAME          = "DICT_6X6_250"
-DEFAULT_MARKER_LENGTH_M  = 0.05         # 5 cm default ArUco marker side length
-CHESSBOARD_W             = 9            # inner corner columns
-CHESSBOARD_H             = 6            # inner corner rows
-CHESSBOARD_SQUARE_M      = 0.024        # 24 mm square size
-
-
-# ========================================================
-# Helpers
-# ========================================================
-
-def resize_to_fit_screen(img, max_w=1280, max_h=720, only_shrink=True):
-    """
-    Resize an image to fit within (max_w, max_h) while preserving aspect ratio.
-
-    When only_shrink=True and the image is smaller than the limits, it is returned
-    unchanged. Uses INTER_AREA for downscaling and INTER_LINEAR for upscaling.
-    Returns (resized_img, scale_factor).
-    """
-    h, w = img.shape[:2]
-    scale = min(max_w / float(w), max_h / float(h))
-
-    if only_shrink and scale >= 1.0:
-        return img, 1.0
-
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-
-    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-    return cv2.resize(img, (new_w, new_h), interpolation=interp), scale
-
-
-
-def filter_type(det_type: str):
-    """
-    Strip the 'class_' prefix and trailing severity suffix from a detection label.
-
-    Example: 'class_NegativeDentClassB' -> ('NegativeDent', 'ClassB')
-
-    Args:
-        det_type: Raw detection type string (e.g. 'class_NegativeDentClassB').
-
-    Returns:
-        (clean_type, det_class) where det_class is one of 'ClassA/B/C' or 'Unknown'.
-    """
-    det_class  = "Unknown"
-    clean_type = det_type
-
-    if clean_type.startswith("class_"):
-        clean_type = clean_type[len("class_"):]
-
-    for cls in ("ClassA", "ClassB", "ClassC"):
-        if clean_type.endswith(cls):
-            det_class  = cls
-            clean_type = clean_type[:-len(cls)]
-            break
-
-    return clean_type, det_class
-
-
-# DetectionM.msg severity convention: ClassA=1, ClassB=2, ClassC=3, unknown=0
-_SEVERITY_MAP: dict[str, int] = {"ClassA": 1, "ClassB": 2, "ClassC": 3}
-
-def class_to_severity(det_class: str) -> int:
-    """Map a severity class label (ClassA/B/C) to the DetectionM integer severity field."""
-    return _SEVERITY_MAP.get(det_class, 0)
-
-
-def idw_depth(x: float, y: float, xy_list, d_list, p: float = 2.0) -> float:
-    """
-    Inverse Distance Weighting (IDW) interpolation at point (x, y) from 3 known samples.
-
-    Each sample is a (pixel_x, pixel_y) position with a measured depth value.
-    Returns NaN if no finite samples are available. Uses power parameter *p*
-    (default 2.0, matching LASER_IDW_POWER).
-    """
-    # Exact hit
-    for (sx, sy), d in zip(xy_list, d_list):
-        if sx == x and sy == y:
-            return float(d)
-
-    wsum = 0.0
-    acc = 0.0
-    for (sx, sy), d in zip(xy_list, d_list):
-        r = math.hypot(x - sx, y - sy)
-        r = max(r, 1e-6)
-        w = 1.0 / (r ** p)
-        wsum += w
-        acc += w * float(d)
-
-    if wsum <= 0.0:
-        return float("nan")
-    return float(acc / wsum)
-
-
-def estimatePoseSingleMarkers(corners_list, marker_length, K, dist):
-    """
-    Estimate camera pose from ArUco marker corners (OpenCV 4.7+ compatible).
-
-    Wraps cv2.aruco.estimatePoseSingleMarkers when available; falls back to
-    cv2.solvePnP with IPPE_SQUARE for newer OpenCV versions where the function
-    was removed. Returns (rvecs, tvecs) as lists of (3,) arrays.
-    """
-    if hasattr(cv2.aruco, "estimatePoseSingleMarkers"):
-        rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-            corners_list, marker_length, K, dist
-        )
-        return [r.reshape(3) for r in rvecs], [t.reshape(3) for t in tvecs]
-
-    half = marker_length / 2.0
-    marker_objp = np.array([
-        [-half,  half, 0.0],
-        [ half,  half, 0.0],
-        [ half, -half, 0.0],
-        [-half, -half, 0.0],
-    ], dtype=np.float32)
-
-    rvecs, tvecs = [], []
-    for corners in corners_list:
-        img_pts = corners.reshape(4, 2).astype(np.float32)
-        ok, rvec, tvec = cv2.solvePnP(
-            marker_objp, img_pts, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE
-        )
-        rvecs.append(rvec.reshape(3) if ok else np.zeros(3))
-        tvecs.append(tvec.reshape(3) if ok else np.zeros(3))
-    return rvecs, tvecs
-
-
-def make_approx_camera_matrix(width, height):
-    """
-    Return an approximate pinhole camera matrix (K) and zero distortion coefficients (dist).
-
-    Uses fx = fy = 0.9 * max(width, height) with principal point at image center.
-    This is a rough estimate suitable for ArUco pose estimation when a calibrated
-    camera matrix is not available.
-    """
-    fx = fy = 0.9 * max(width, height)
-    cx = width  / 2.0
-    cy = height / 2.0
-    K = np.array([[fx, 0, cx],
-                  [0, fy, cy],
-                  [0,  0,  1]], dtype=np.float32)
-    dist = np.zeros((5, 1), dtype=np.float32)
-    return K, dist
-
-
-def rvec_to_quaternion(rvec):
-    """
-    Convert an OpenCV Rodrigues rotation vector to a (qx, qy, qz, qw) quaternion.
-
-    Returns identity (0, 0, 0, 1) for zero-norm rotation vectors.
-    """
-    rvec = np.asarray(rvec, dtype=np.float64).reshape(3)
-    angle = float(np.linalg.norm(rvec))
-    if angle < 1e-10:
-        return 0.0, 0.0, 0.0, 1.0  # identity
-    axis = rvec / angle
-    s = math.sin(angle / 2.0)
-    return (float(axis[0] * s),
-            float(axis[1] * s),
-            float(axis[2] * s),
-            float(math.cos(angle / 2.0)))
+# LASER_XY_PIXELS (the laser positions in the classifier's 2D image plane) and
+# LASER_IDW_POWER are imported from liveClassifierTorch so both runners fuse depth
+# identically; only the ROS topics that feed them are node-specific.
 
 
 # ========================================================
