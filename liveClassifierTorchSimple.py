@@ -18,10 +18,10 @@ if __name__ == "__main__":
     #image_path    = sys.argv[3]
 
     step=16
-    tile_size=64
+    threshold = 0.9
 
-
-    modelC = ClassifierPnm(model_path='last.pth',cfg_path='last.json',step=step,tile_size=tile_size)
+    modelC = ClassifierPnm(model_path='last.pth',cfg_path='last.json',step=step)
+    modelC.maxProbabilityThreshold = threshold
     model=modelC.model
     if torch.cuda.is_available():
         device = 'cuda'
