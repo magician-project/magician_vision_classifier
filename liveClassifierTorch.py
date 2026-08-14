@@ -252,8 +252,14 @@ def rvec_to_quaternion(rvec):
 # ========================================================
 # Helpers
 # ========================================================
+# Default box the visualization window is fitted into. --window-scale multiplies it.
+VISUALIZATION_MAX_W = 1280
+VISUALIZATION_MAX_H = 720
+WINDOW_SCALE_MIN    = 0.25
+WINDOW_SCALE_MAX    = 8.0
 
-def resize_to_fit_screen(img, max_w=1280, max_h=720, only_shrink=True):
+
+def resize_to_fit_screen(img, max_w=VISUALIZATION_MAX_W, max_h=VISUALIZATION_MAX_H, only_shrink=True):
     """
     Resize an image to fit within (max_w, max_h) while preserving aspect ratio.
 
@@ -272,6 +278,24 @@ def resize_to_fit_screen(img, max_w=1280, max_h=720, only_shrink=True):
 
     interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
     return cv2.resize(img, (new_w, new_h), interpolation=interp), scale
+
+
+def scale_window_image(img, scale):
+    """
+    Multiply an already-fitted visualization image by *scale* for display.
+
+    scale=1.0 returns the image untouched (the historical behaviour). Nearest
+    neighbour is used when magnifying so the tile grid of a heatmap stays crisp
+    instead of being smeared by interpolation.
+    """
+    if scale == 1.0:
+        return img
+
+    h, w = img.shape[:2]
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    interp = cv2.INTER_NEAREST if scale > 1.0 else cv2.INTER_AREA
+    return cv2.resize(img, (new_w, new_h), interpolation=interp)
 
 
 def filter_type(det_type: str):
@@ -424,6 +448,11 @@ class LiveClassifier:
         # Internal execution state. Visualization defaults ON here (the whole point of
         # running standalone is watching the heatmap); the node defaults it off.
         self._visualization_enabled = True
+        # On-screen size multiplier for the visualization window. 1.0 = the heatmap
+        # fitted inside VISUALIZATION_MAX_W x VISUALIZATION_MAX_H (the old behaviour);
+        # 2.0 shows that same view twice as big, for inspecting tiles on a large
+        # monitor. Purely a display setting -- inference is untouched.
+        self._window_scale = 1.0
         self._inference_paused = False
         self._two_stage_enabled = False
         self._autosave_defect_snapshots = False
@@ -541,6 +570,8 @@ class LiveClassifier:
             if args.frame_limiter is not None:   self._frame_limiter = bool(args.frame_limiter)
             if args.two_stage is not None:       self._two_stage_enabled = bool(args.two_stage)
             if args.visualization is not None:   self._visualization_enabled = bool(args.visualization)
+            if args.window_scale is not None:
+                self._window_scale = max(WINDOW_SCALE_MIN, min(WINDOW_SCALE_MAX, float(args.window_scale)))
             if args.autosave_defects:            self._autosave_defect_snapshots = True
             if args.threshold is not None:
                 self._threshold = None if args.threshold < 0.0 else max(0.0, min(1.0, float(args.threshold)))
@@ -561,6 +592,15 @@ class LiveClassifier:
         if not enabled:
             cv2.destroyAllWindows()
         self.logger.info("Visualization ENABLED" if enabled else "Visualization DISABLED")
+
+    def set_window_scale(self, scale):
+        """Scale the visualization window up/down; 1.0 is the default fit-to-screen size."""
+        scale = max(WINDOW_SCALE_MIN, min(WINDOW_SCALE_MAX, float(scale)))
+        with self._lock:
+            self._window_scale = scale
+        # The window itself needs no resizing: it is a WINDOW_AUTOSIZE one, so the
+        # next imshow of a bigger image grows it.
+        self.logger.info(f"Visualization window scale set to {scale:.2f}x")
 
     def pause_inference(self, paused):
         """Pause/resume inference."""
@@ -845,6 +885,11 @@ class LiveClassifier:
         with self._lock:
             return self._visualization_enabled
 
+    def get_window_scale(self):
+        """Thread-safe getter for the visualization window scale factor."""
+        with self._lock:
+            return self._window_scale
+
     def inference_paused(self):
         """Thread-safe getter for the inference pause state."""
         with self._lock:
@@ -1060,6 +1105,7 @@ Keys (the standalone equivalent of the ROS services):
   t / T  gate threshold -/+ 0.01         0      clear threshold override (follow model gate)
   [ / ]  step size -/+ 1                 e / E  erosion kernel -/+ 1
   n / N  min votes -/+ 1                 , / .  target FPS -/+ 1  (0 = unlimited)
+  - / +  visualization window scale -/+ 0.25    =      reset window scale to 1.0
   r      hot-swap to the next model found next to this script  (set_model)
 """
 
@@ -1105,6 +1151,10 @@ def handle_key(key, runtime, model_names):
         runtime.set_min_votes(runtime.get_min_votes() + (1 if key == "N" else -1))
     elif key in (",", "."):
         runtime.set_fps(runtime.get_target_fps() + (1.0 if key == "." else -1.0))
+    elif key in ("-", "_", "+"):
+        runtime.set_window_scale(runtime.get_window_scale() + (0.25 if key == "+" else -0.25))
+    elif key == "=":
+        runtime.set_window_scale(1.0)
     elif key == "r":
         if not model_names:
             runtime.logger.warning("No other models found next to this script")
@@ -1159,6 +1209,10 @@ def parse_arguments(argv=None):
     parser.add_argument("--visualization", dest="visualization", action="store_true", default=None,
                         help="show the live heatmap window (default on)")
     parser.add_argument("--no-visualization", dest="visualization", action="store_false")
+    parser.add_argument("--window-scale", type=float, default=None,
+                        help=f"visualization window size multiplier ({WINDOW_SCALE_MIN}..{WINDOW_SCALE_MAX}); "
+                             f"1.0 (default) fits the heatmap in {VISUALIZATION_MAX_W}x{VISUALIZATION_MAX_H}, "
+                             f"2.0 shows that twice as big. Adjustable live with the -/+ keys")
 
     parser.add_argument("--autosave-defects", action="store_true",
                         help="save frame + sidecar JSON whenever a defect is detected")
@@ -1457,6 +1511,12 @@ def main(argv=None):
             # Visualization
             if runtime.visualization_enabled():
                 heatmapForAWindow,scale = resize_to_fit_screen(heatmap)
+                # --window-scale (keys -/+) multiplies the window we would normally
+                # show, so 2.0 is exactly twice the default size whatever the heatmap
+                # resolution is -- deliberately AFTER the fit, so a 4K heatmap is
+                # still shrunk to the fit box first instead of being blown past it.
+                heatmapForAWindow = scale_window_image(heatmapForAWindow,
+                                                       runtime.get_window_scale())
                 cv2.imshow("Classifier Output",heatmapForAWindow)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
