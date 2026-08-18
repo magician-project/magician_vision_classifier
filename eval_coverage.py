@@ -30,7 +30,13 @@ from Config import checkIfFileExists, load_hyperparameters
 from Datasets import _dataset_source_frames
 from LitClassifier import Classifier
 
-COVERAGE = 'val_coverage_frames.json'
+# The coverage carve-out. Resolved rather than hardcoded to a root path: the file now lives
+# under experiments/configs_frozen/ (tracked, so both boxes can use a byte-identical copy --
+# coverage numbers computed on different holdout sets are not comparable), and the repo root
+# is being cleared of loose .json. find_artifact checks the root first, so a local copy still
+# wins if one is present.
+from artifact_paths import find_artifact          # noqa: E402
+COVERAGE = find_artifact('val_coverage_frames.json') or 'val_coverage_frames.json'
 
 
 def build_coverage_loader(config_json, coverage_path=COVERAGE):
@@ -77,10 +83,26 @@ def main():
     ckpt = sys.argv[2] if len(sys.argv) > 2 else None
     if ckpt is None:
         import glob
+        import re
         cks = sorted(glob.glob(os.path.join(cfg['checkpoint_dir'], '*.ckpt')))
         if not cks:
             sys.exit(f'no checkpoints in {cfg["checkpoint_dir"]}')
-        ckpt = cks[-1]
+        # Pick the MONITORED-BEST checkpoint, not the last one. save_top_k>1 keeps every
+        # epoch, and the last is routinely the worst: on the anchor, epoch 5 scored 12.22
+        # miss@FA5 against epoch 1's 9.24, so defaulting to the tail silently reported
+        # coverage for a model we would never ship.
+        mon = cfg.get('checkpoint_monitor', 'val_detect_auroc')
+        best = 'max' if cfg.get('checkpoint_mode', 'max') == 'max' else 'min'
+        scored = [(float(m.group(1)), c) for c in cks
+                  if (m := re.search(rf'{re.escape(mon)}=([0-9]+\.[0-9]+)', c))]
+        if scored:
+            ckpt = (max if best == 'max' else min)(scored)[1]
+            print(f'[coverage] {len(cks)} checkpoints; picking best {mon} '
+                  f'({best}) -> {os.path.basename(ckpt)}')
+        else:
+            ckpt = cks[-1]
+            print(f'[coverage] WARNING: no "{mon}=" in checkpoint names; falling back to '
+                  f'the last one ({os.path.basename(ckpt)}), which may not be the best.')
     print(f'[coverage] scoring {os.path.basename(ckpt)}')
 
     model = Classifier(

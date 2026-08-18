@@ -1,0 +1,79 @@
+# The repo had no .gitignore, so 1,337 untracked files -- 5.9 GB of run artifacts --
+# sat in the root drowning `git status` and burying the 51 source files. None of it was
+# ever tracked; it was just invisible to git and very visible to anyone using the repo.
+#
+# Everything below is REGENERATED from a config plus a checkpoint. Nothing here is a
+# result that would be lost: the numbers that matter live in PLAN.md, and the artifacts
+# can be rebuilt with score_checkpoints.py / eval_coverage.py.
+
+# --- per-run artifacts, written to the cwd by the trainer and the scorers -------------
+*_threshold_curve.json
+*_confusion.json
+*_coverage.json
+*_confusion_raw.png
+*_confusion_row_normalized.png
+*_confusion_total_normalized.png
+*_confusion_hybrid_row_normalized.png
+*_threshold_curve_curve.png
+
+# --- weights -------------------------------------------------------------------------
+# 5.4 GB of these were loose in the root. Checkpoints belong in datasets/mix_ckpts/.
+*.pth
+*.ckpt
+
+# --- the archive ---------------------------------------------------------------------
+# tidy_experiments.py files finished artifacts here. Ignored wholesale EXCEPT the parts
+# that are provenance rather than output:
+#
+#   configs_frozen/  the handful of inputs the campaign depends on -- the anchor config
+#                    (with its calibrated gate), the inference benches, and above all
+#                    val_coverage_frames.json, which DEFINES the coverage carve-out. Both
+#                    boxes must use a byte-identical copy of that file or their coverage
+#                    numbers are not comparable, so it belongs in git.
+#   configs_runs/    one config per training run: the recipe behind every number in
+#                    PLAN.md. 55 files, 356K.
+#
+# Everything else here -- weights, plots, curves, confusion matrices -- is regenerable
+# from a config plus a checkpoint and stays ignored.
+experiments/*
+!experiments/README.md
+!experiments/configs_frozen/
+!experiments/configs_runs/
+!experiments/zoo_sweep_manifest.tsv
+
+# --- exported deployment bundles -----------------------------------------------------
+# 5.1 GB of timestamped .zip exports. models/PLACEHOLDER stays tracked so the directory
+# survives a clone.
+models/*.zip
+
+# --- symlink to the storage array, not repo content ----------------------------------
+/datasets
+
+# --- bench scratch under scripts/ ----------------------------------------------------
+scripts/*.txt
+scripts/*.txt.[0-9]
+scripts/*.csv
+scripts/*.png
+scripts/*.bak
+
+# --- scratch -------------------------------------------------------------------------
+*.json.bak
+__pycache__/
+*.pyc
+tensorboard/
+
+# --- generated per-run model configs --------------------------------------------------
+# One config per training run, emitted by seed_replicates.py / model_sweep.py /
+# full_zoo_sweep.py / pfc_variance.py. These are the same class of file being removed from
+# the repo root upstream, and the trainer rewrites them in place after each run (appending
+# confusion_matrix, gate, model_md5), so they are outputs as much as inputs. Archived under
+# experiments/configs_runs/ instead.
+/ms*_*.json
+/fz*_*.json
+/pfc4s*_*.json
+/anc1337_*.json
+/anc7_*.json
+/ancs21337_*.json
+/ancs27_*.json
+/ancs2_convnext_pico.json
+/zoo_inference_bench.json

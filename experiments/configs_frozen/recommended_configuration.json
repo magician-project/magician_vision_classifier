@@ -1,0 +1,226 @@
+{
+  "_README": [
+    "Deployment presets for liveClassifierTorchROS.py. This file is COMMITTED TO GIT so a",
+    "deployment site picks up new models and operating points with a plain `git pull` --",
+    "no environment variables to set on-site.",
+    "",
+    "The FIRST entry of \"configurations\" is the one used at startup. To switch, either",
+    "reorder the list (and commit) or pass the preset name as an argument:",
+    "    ros2 run magician_vision_classifier liveClassifierTorchROS --config low_false_alarm",
+    "",
+    "The model's .pth/.json are auto-downloaded on first run from",
+    "http://ammar.gr/magician/models/CameraV2Models/ (ModelDownload.ensure_model), the same",
+    "directory scripts/uploadModels.sh pushes to.",
+    "",
+    "gate.threshold semantics depend on gate.mode. Under the default \"defect_mass\" it",
+    "thresholds 1 - P(clean) -- the total probability mass on ANY defect class -- NOT the",
+    "max softmax probability. A max_prob threshold of the same number means something",
+    "completely different. Thresholds are NOT portable between models: re-read them from",
+    "that model's <name>_threshold_curve.json.",
+    "",
+    "Every number under \"measured\" is read from the named threshold-curve file, not",
+    "estimated. They come from the run's held-out split, which was ALSO used to select the",
+    "checkpoint, so treat the absolute values as slightly optimistic -- the ranking between",
+    "operating points is sound (see ISSUES.md M3).",
+    "",
+    "runtime.step / runtime.target_fps are the existing node defaults and are NOT tuned per",
+    "model: no throughput has been measured for these models yet (perf.csv has no rows for",
+    "them). Run benchmarkAllModels.py before trusting them on new hardware."
+  ],
+
+  "version": 1,
+
+  "threshold_reference": {
+    "_comment": [
+      "Measured operating curve for the default model, so an operator can pick a gate",
+      "level without opening the curve file. Read verbatim from",
+      "mix_convnext_tiny_threshold_curve.json (gate mode defect_mass, score = 1 - P(clean)).",
+      "detected = fraction of DEFECT tiles flagged. false_alarm = fraction of CLEAN tiles",
+      "flagged; multiply by the tiles-per-frame count to get crosses per frame.",
+      "",
+      "NOTE the curve is unusually FLAT: 0.30 -> 0.96 cuts false alarms 21x (10.27% ->",
+      "0.49%) for only 6 points of detection. High thresholds are cheap on this model.",
+      "This is model-specific -- on allclass_forthalt_custom the same move costs 15 points.",
+      "",
+      "A false-alarm rate below ~0.15% is NOT reachable: the sweep stops at 0.995."
+    ],
+    "model": "mix_convnext_tiny",
+    "gate_mode": "defect_mass",
+    "source": "mix_convnext_tiny_threshold_curve.json",
+    "curve": [
+      {"threshold": 0.300, "detected": 0.972, "false_alarm": 0.1027},
+      {"threshold": 0.500, "detected": 0.960, "false_alarm": 0.0492},
+      {"threshold": 0.590, "detected": 0.955, "false_alarm": 0.0363, "pick": "best_kpi"},
+      {"threshold": 0.700, "detected": 0.947, "false_alarm": 0.0249},
+      {"threshold": 0.800, "detected": 0.939, "false_alarm": 0.0152},
+      {"threshold": 0.850, "detected": 0.934, "false_alarm": 0.0119},
+      {"threshold": 0.885, "detected": 0.929, "false_alarm": 0.0098},
+      {"threshold": 0.900, "detected": 0.927, "false_alarm": 0.0088, "pick": "default"},
+      {"threshold": 0.940, "detected": 0.918, "false_alarm": 0.0062},
+      {"threshold": 0.960, "detected": 0.911, "false_alarm": 0.0049, "pick": "deployment"},
+      {"threshold": 0.980, "detected": 0.898, "false_alarm": 0.0034},
+      {"threshold": 0.990, "detected": 0.883, "false_alarm": 0.0022},
+      {"threshold": 0.995, "detected": 0.865, "false_alarm": 0.0015}
+    ],
+    "lowest_threshold_meeting_a_false_alarm_budget": [
+      {"budget": 0.0025, "threshold": 0.990, "detected": 0.883, "false_alarm": 0.0022},
+      {"budget": 0.0050, "threshold": 0.960, "detected": 0.911, "false_alarm": 0.0049},
+      {"budget": 0.0100, "threshold": 0.885, "detected": 0.929, "false_alarm": 0.0098},
+      {"budget": 0.0200, "threshold": 0.740, "detected": 0.944, "false_alarm": 0.0197},
+      {"budget": 0.0500, "threshold": 0.500, "detected": 0.960, "false_alarm": 0.0492},
+      {"budget": 0.1000, "threshold": 0.310, "detected": 0.972, "false_alarm": 0.0984}
+    ]
+  },
+
+  "configurations": [
+    {
+      "name": "default",
+      "description": "mix_convnext_tiny at the node's historical gate setting. Best detection-vs-false-alarm of the mix_* family: 92.7% of defect tiles caught for 0.88% false alarms on clean tiles.",
+      "model": "mix_convnext_tiny",
+      "gate": {
+        "mode": "defect_mass",
+        "threshold": 0.90,
+        "assign_best_defect_class": true
+      },
+      "runtime": {
+        "step": 18,
+        "target_fps": 23.0,
+        "erosion_kernel": 1,
+        "min_votes": 2,
+        "majority_voting": true,
+        "frame_limiter": true,
+        "two_stage": false
+      },
+      "measured": {
+        "source": "mix_convnext_tiny_threshold_curve.json",
+        "detected": 0.927,
+        "false_alarm": 0.0088
+      }
+    },
+
+    {
+      "name": "low_false_alarm",
+      "description": "Same model at its trainer-computed deployment point (highest detection subject to a 0.5% false-alarm budget). Roughly halves false alarms for 1.6 points of detection.",
+      "model": "mix_convnext_tiny",
+      "gate": {
+        "mode": "defect_mass",
+        "threshold": 0.96,
+        "assign_best_defect_class": true
+      },
+      "runtime": {
+        "step": 18,
+        "target_fps": 23.0,
+        "erosion_kernel": 1,
+        "min_votes": 2,
+        "majority_voting": true,
+        "frame_limiter": true,
+        "two_stage": false
+      },
+      "measured": {
+        "source": "mix_convnext_tiny_threshold_curve.json",
+        "detected": 0.911,
+        "false_alarm": 0.0049
+      }
+    },
+
+    {
+      "name": "minimal_false_alarm",
+      "description": "Strictest useful gate: 0.22% false alarms, still catching 88.3% of defect tiles. Use when crosses are acted on automatically and a false stop is expensive. Below roughly 0.15% FA is not reachable on this model.",
+      "model": "mix_convnext_tiny",
+      "gate": {
+        "mode": "defect_mass",
+        "threshold": 0.99,
+        "assign_best_defect_class": true
+      },
+      "runtime": {
+        "step": 18,
+        "target_fps": 23.0,
+        "erosion_kernel": 1,
+        "min_votes": 2,
+        "majority_voting": true,
+        "frame_limiter": true,
+        "two_stage": false
+      },
+      "measured": {
+        "source": "mix_convnext_tiny_threshold_curve.json",
+        "detected": 0.883,
+        "false_alarm": 0.0022
+      }
+    },
+
+    {
+      "name": "one_percent_fa",
+      "description": "Highest detection available inside a 1% false-alarm budget. Practically the same detection as the default (92.9% vs 92.7%) at a marginally higher false-alarm rate -- pick whichever budget the line actually enforces.",
+      "model": "mix_convnext_tiny",
+      "gate": {
+        "mode": "defect_mass",
+        "threshold": 0.885,
+        "assign_best_defect_class": true
+      },
+      "runtime": {
+        "step": 18,
+        "target_fps": 23.0,
+        "erosion_kernel": 1,
+        "min_votes": 2,
+        "majority_voting": true,
+        "frame_limiter": true,
+        "two_stage": false
+      },
+      "measured": {
+        "source": "mix_convnext_tiny_threshold_curve.json",
+        "detected": 0.929,
+        "false_alarm": 0.0098
+      }
+    },
+
+    {
+      "name": "high_recall",
+      "description": "mix_convnext_tiny at its KPI-optimal gate (misses weighted 2x against false alarms). Use only where an operator reviews the crosses -- the false-alarm rate is an order of magnitude higher than the default.",
+      "model": "mix_convnext_tiny",
+      "gate": {
+        "mode": "defect_mass",
+        "threshold": 0.59,
+        "assign_best_defect_class": true
+      },
+      "runtime": {
+        "step": 18,
+        "target_fps": 23.0,
+        "erosion_kernel": 1,
+        "min_votes": 2,
+        "majority_voting": true,
+        "frame_limiter": true,
+        "two_stage": false
+      },
+      "measured": {
+        "source": "mix_convnext_tiny_threshold_curve.json",
+        "detected": 0.955,
+        "false_alarm": 0.0363
+      }
+    },
+
+    {
+      "name": "lightweight",
+      "description": "mix_shufflenet_v2_x1_0 -- by far the smallest archive (14 MB vs 311 MB) for constrained hardware or slow links. Detection is materially worse at a matched false-alarm budget, so prefer the default unless throughput or download size forces this.",
+      "model": "mix_shufflenet_v2_x1_0",
+      "gate": {
+        "mode": "defect_mass",
+        "threshold": 0.985,
+        "assign_best_defect_class": true
+      },
+      "runtime": {
+        "step": 18,
+        "target_fps": 23.0,
+        "erosion_kernel": 1,
+        "min_votes": 2,
+        "majority_voting": true,
+        "frame_limiter": true,
+        "two_stage": false
+      },
+      "measured": {
+        "source": "mix_shufflenet_v2_x1_0_threshold_curve.json",
+        "detected": 0.762,
+        "false_alarm": 0.0039
+      }
+    }
+  ]
+}
