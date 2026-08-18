@@ -717,26 +717,29 @@ def main():
     #os.system("rm last.pth last.json && ln -s %s.pth last.pth && ln -s %s.json last.json" % (model_name,model_name) )
     #No longer needed
 
-    # Build zip filename with timestamp
+    # Package the run -- export_models.py is the single source of truth
     #------------------------------------------------------------------
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_name = f"{model_name}_{timestamp}.zip"
-
-    print(f"Saving everything as {zip_name} archive")
-    os.makedirs("models/", exist_ok=True)
-    zip_inputs = (
-        [f"{model_name}.json", f"{model_name}_confusion.json", f"{model_name}.pth"]
-        + glob.glob(f"{model_name}*.png")
-        + glob.glob("tensorboard/*/*/*")
-    )
-    subprocess.run(["zip", "-r", f"models/{zip_name}"] + zip_inputs, check=False)
-
-
-    print('To upload ALL models copy/paste:') 
-    print("scp -P 2222 models/*.zip ammar@ammar.gr:/home/ammar/public_html/magician/ckpts2")  
-
-    print('To upload last training results copy/paste:') 
-    print("scp -P 2222 models/%s ammar@ammar.gr:/home/ammar/public_html/magician/ckpts2" % zip_name)
+    # This used to be an inline `subprocess.run(["zip", "-r", ...], check=False)`. It had
+    # no name sanitisation, so a model configured as `timm/<x>` produced an archive path
+    # containing a slash and zip failed; and because the exit code was discarded, the
+    # trainer reported success anyway. Thirteen fully trained models ended up with no
+    # archive and nothing said so. export_run() sanitises the names, includes the .json
+    # sidecars, and VERIFIES the finished archive (weights load, config parses, CRC and
+    # member list check) -- raising instead of failing quietly.
+    from export_models import export_run
+    try:
+        zip_path = export_run(config_json)
+        print(f"Saved everything as {zip_path}")
+        print('To upload ALL models copy/paste:')
+        print("  scripts/uploadModels.sh")
+        print('To upload just this one copy/paste:')
+        print(f"  scp -P 2222 {zip_path} ammar@ammar.gr:"
+              "/home/ammar/public_html/magician/models/CameraV2Models/")
+    except RuntimeError as _exc:
+        # Loud, but not fatal: training and scoring already succeeded and the checkpoints
+        # are on disk, so the run is recoverable with `python export_models.py --apply`.
+        print(f"!! MODEL EXPORT FAILED -- the run itself is fine, re-export with "
+              f"`python export_models.py --apply`\n{_exc}")
 
 
 if __name__ == "__main__":
