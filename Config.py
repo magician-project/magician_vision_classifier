@@ -23,6 +23,47 @@ def checkIfFileExists(filename):
     """Return True if the given path exists and is a file."""
     return os.path.isfile(filename)
 
+def resolve_config(config_file):
+    """Find a config by name, wherever it has been filed.
+
+    Campaign configs live in `configs/`, and a finished run's config is filed beside its
+    weights in `experiments/<campaign>/<run>/`. Callers -- the queue scripts, the report
+    tools, a person on the command line -- pass a bare name like
+    `anc_convnext_pico.json`, and every one of them would have to be updated in step with
+    any move. This is the same fix already applied to artifacts (artifact_paths.
+    find_artifact): the reader resolves a NAME rather than trusting a path.
+
+    An existing path always wins, so nothing that works today changes behaviour.
+    """
+    if os.path.exists(config_file):
+        return config_file
+    here = os.path.dirname(os.path.abspath(__file__))
+    base = os.path.basename(config_file)
+    for cand in (os.path.join(here, 'configs', base),
+                 os.path.join(here, base)):
+        if os.path.exists(cand):
+            return cand
+    import glob as _glob
+    hits = sorted(_glob.glob(os.path.join(here, 'experiments', '**', base), recursive=True))
+    if not hits:
+        return config_file
+    if len(hits) > 1:
+        # A run's config exists twice: the INPUT staged under experiments/configs_runs/,
+        # and the copy the trainer filed beside the weights with `gate`, `classes` and
+        # `model_md5` written back into it. They are not the same file, and picking the
+        # wrong one hands a caller a config with no calibrated gate. Prefer the filed
+        # copy, and say so rather than resolving silently.
+        filed = [h for h in hits if os.sep + 'configs_runs' + os.sep not in h]
+        if filed and len(filed) < len(hits):
+            print(f'[config] {base}: {len(hits)} copies; using the run-dir copy '
+                  f'({os.path.relpath(filed[0], here)}), not the staged input')
+            hits = filed
+        elif len(filed) > 1:
+            print(f'[config] WARNING {base}: {len(hits)} ambiguous copies, using '
+                  f'{os.path.relpath(hits[0], here)}')
+    return hits[0]
+
+
 def load_hyperparameters(config_file):
     """
     Load and parse a JSON configuration file containing model hyperparameters,
@@ -37,6 +78,7 @@ def load_hyperparameters(config_file):
     Exits:
         sys.exit(1) if the file does not exist.
     """
+    config_file = resolve_config(config_file)
     if not checkIfFileExists(config_file):
         print("Config file not found")
         sys.exit(1)

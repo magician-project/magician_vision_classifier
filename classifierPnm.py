@@ -17,6 +17,7 @@ import numpy as np
 # -> 
 #python3 evaluate.py tile_classifier.keras /home/ammar/Documents/Programming/Magician/src/python/classifier/average100/sample01.pnm
 import os
+import glob
 #os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 import sys
 import json
@@ -1551,35 +1552,65 @@ class ClassifierPnm:
             return False
 
     @staticmethod
+    def model_locate(directoryPath, name):
+        """Path to `{name}.pth` / `{name}.json`, flat directory first. (pth, json) or None.
+
+        Two layouts, and the node has to serve both. A DEPLOYED box gets its models
+        unpacked flat into this directory by ModelDownload -- that is the deployment
+        layout and it wins. A TRAINING box files each run under
+        experiments/<campaign>/<run>/, so a model trained here is not in the flat listing
+        at all; before this was added the operator dropdown on the training box went empty
+        and ensure_model tried to re-download models that were already on disk.
+        """
+        flat = (os.path.join(directoryPath, f"{name}.pth"),
+                os.path.join(directoryPath, f"{name}.json"))
+        if os.path.isfile(flat[0]) and os.path.isfile(flat[1]):
+            return flat
+        for pth in sorted(glob.glob(os.path.join(directoryPath, 'experiments',
+                                                 '*', '*', f'{name}.pth'))):
+            cfg = os.path.join(os.path.dirname(pth), f'{name}.json')
+            if os.path.isfile(cfg):
+                return (pth, cfg)
+        return None
+
+    @staticmethod
     def model_scan(directoryPath):
-        """Return list of base names for matching, valid .pth and .json pairs in directory."""
+        """Base names of valid .pth/.json pairs -- flat directory plus filed run dirs."""
         if not os.path.isdir(directoryPath):
             print(f"Directory not found: {directoryPath}")
             return []
 
+        pairs = {}
         files = os.listdir(directoryPath)
         pth_files  = {os.path.splitext(f)[0] for f in files if f.endswith('.pth')}
         json_files = {os.path.splitext(f)[0] for f in files if f.endswith('.json')}
-        matches = sorted(pth_files.intersection(json_files))
+        for name in pth_files.intersection(json_files):
+            pairs[name] = os.path.join(directoryPath, f"{name}.pth")
+        # Locally trained runs, filed beside their configs. setdefault so a flat
+        # (deployed) copy always wins over a training-box copy of the same name.
+        for pth in sorted(glob.glob(os.path.join(directoryPath, 'experiments',
+                                                 '*', '*', '*.pth'))):
+            name = os.path.splitext(os.path.basename(pth))[0]
+            if os.path.isfile(os.path.join(os.path.dirname(pth), f'{name}.json')):
+                pairs.setdefault(name, pth)
 
         valid = []
-        for name in matches:
-            pth_path = os.path.join(directoryPath, f"{name}.pth")
-            if ClassifierPnm._is_valid_pth(pth_path):
+        for name in sorted(pairs):
+            if ClassifierPnm._is_valid_pth(pairs[name]):
                 valid.append(name)
             else:
-                print(f"[WARN] Skipping corrupted/incomplete checkpoint: {pth_path}")
+                print(f"[WARN] Skipping corrupted/incomplete checkpoint: {pairs[name]}")
         return valid
  
     def reload_model(self, directoryPath, name):
         """Unload previous model and reload a new model + config from given name."""
-        model_path = os.path.join(directoryPath, f"{name}.pth")
-        cfg_path   = os.path.join(directoryPath, f"{name}.json")
-        self.name  = os.path.basename(model_path)
-
-        if not (os.path.exists(model_path) and os.path.exists(cfg_path)):
-            print(f"Missing model or config for '{name}' in {directoryPath}")
+        found = ClassifierPnm.model_locate(directoryPath, name)
+        if found is None:
+            print(f"Missing model or config for '{name}' in {directoryPath} "
+                  f"(checked the directory itself and experiments/<campaign>/<run>/)")
             return False
+        model_path, cfg_path = found
+        self.name = os.path.basename(model_path)
 
         try:
             with open(cfg_path, "r") as f:

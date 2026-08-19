@@ -1,0 +1,255 @@
+{
+  "class_merges": {
+    "class_Seal": "class_Welding",
+    "class_SealClassA": "class_WeldingClassA",
+    "class_SealClassB": "class_WeldingClassA"
+  },
+  "drop_severityless_defects": false,
+  "drop_class_families": [],
+  "hparams": {
+    "tile_size": 48,
+    "batch_size": 504,
+    "training_epochs": 3,
+    "dropout_rate": 0.25,
+    "seed": 42,
+    "gradient_clip_value": 1.0,
+    "AoLP": false,
+    "DoLP": true,
+    "unpolarized": false,
+    "gain_jitter": 1.0,
+    "polar_flip": true,
+    "channel_jitter": 0.4,
+    "polar_rot": true,
+    "monochrome": false,
+    "pretrained": true,
+    "timm_stem_stride": 2
+  },
+  "early_stopping": {
+    "monitor": "loss",
+    "mode": "min",
+    "patience": 16,
+    "min_delta": 0.0005,
+    "verbose": 1,
+    "restore_best_weights": true
+  },
+  "optimizer": {
+    "type": "AdamW",
+    "learning_rate": 0.0005
+  },
+  "dataloader": {
+    "seed": 42,
+    "validation_split": 0.1,
+    "shuffle": false,
+    "label_mode": "categorical",
+    "cacheAllDataToRAM": true,
+    "num_workers": 15,
+    "balanced_sampling": true,
+    "frame_disjoint_split": false,
+    "exclude_frames": "experiments/configs_frozen/val_coverage_frames.json"
+  },
+  "wandb": {
+    "project": "Classifier",
+    "name": "CrossValAltinay",
+    "use_wandb": false
+  },
+  "training_dataset": "/storage/ammarkov/magician_datasets/Aug26_78K/train/",
+  "validation_dataset": "/storage/ammarkov/magician_datasets/Aug26_78K/val/",
+  "class_weight": false,
+  "loss": "focal",
+  "penalize_false_clean": 0.5,
+  "accelerator": "auto",
+  "name": "ancs2",
+  "model": "convnext_pico",
+  "devices": 1,
+  "selected_classes": [],
+  "checkpoint_monitor": "val_detect_auroc",
+  "checkpoint_save_top_k": 3,
+  "checkpoint_dir": "datasets/mix_ckpts/ancs2_convnext_pico",
+  "checkpoint_mode": "max",
+  "drop_classes": [
+    "class_Deformation",
+    "class_Dust",
+    "class_DustClassA",
+    "class_NegativeDent",
+    "class_Suspicious",
+    "class_Unknown",
+    "class_WeldingClassAClean"
+  ],
+  "confusion_matrix": [
+    [
+      2201,
+      6,
+      4,
+      0,
+      1,
+      2,
+      2,
+      0,
+      105,
+      567
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      2,
+      0,
+      747,
+      2531,
+      2,
+      7,
+      3,
+      2,
+      19,
+      407
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      2,
+      3,
+      0,
+      3793,
+      2,
+      1,
+      0,
+      15
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      488,
+      3,
+      17,
+      1,
+      4,
+      5,
+      30,
+      2,
+      68736,
+      4285
+    ],
+    [
+      4480,
+      1233,
+      412,
+      1322,
+      258,
+      2402,
+      2299,
+      564,
+      21819,
+      549722
+    ]
+  ],
+  "classes_int": [
+    0,
+    3,
+    5,
+    8,
+    9
+  ],
+  "classes": [
+    "class_DeformationClassA",
+    "class_MaterialDefectClassA",
+    "class_NegativeDentClassA",
+    "class_NegativeDentClassB",
+    "class_NegativeDentClassC",
+    "class_PositiveDentClassA",
+    "class_PositiveDentClassB",
+    "class_PositiveDentClassC",
+    "class_WeldingClassA",
+    "class_clean"
+  ],
+  "best_threshold_balanced": {
+    "threshold": 0.31,
+    "detected": 0.9372105482469194,
+    "false_alarm": 0.05949588630496261
+  },
+  "best_threshold_kpi": {
+    "threshold": 0.31,
+    "detected": 0.9372105482469194,
+    "false_alarm": 0.05949588630496261
+  },
+  "best_threshold_deployment": {
+    "threshold": 0.965,
+    "detected": 0.7255669980355973,
+    "false_alarm": 0.004834810636583401
+  },
+  "gate": {
+    "mode": "defect_mass",
+    "threshold": 0.44,
+    "assign_best_defect_class": true,
+    "calibrated_on": "/storage/ammarkov/magician_datasets/Aug26_78K/val/",
+    "detected": 0.9486040835764034,
+    "false_alarm": 0.07883855051487483,
+    "alternatives": {
+      "balanced": {
+        "threshold": 0.59,
+        "detected": 0.9250074409191024,
+        "false_alarm": 0.046274578237193144
+      },
+      "deployment": {
+        "threshold": 0.975,
+        "detected": 0.7548425501517948,
+        "false_alarm": 0.004947725534677705
+      }
+    }
+  },
+  "model_md5": "73ad38993890bc5098461b3fbb929000"
+}

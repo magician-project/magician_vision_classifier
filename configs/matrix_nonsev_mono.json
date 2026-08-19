@@ -1,0 +1,74 @@
+{
+    "hparams": {
+        "tile_size": 48,
+        "batch_size": 504,
+        "training_epochs": 8,
+        "dropout_rate": 0.25,
+        "seed": 42,
+        "gradient_clip_value": 1.0,
+        "base_channels": 48,
+        "final_dense_layer": 512,
+        "AoLP": false,
+        "DoLP": false,
+        "unpolarized": false,
+        "gain_jitter": 1.0,
+        "polar_flip": true,
+        "channel_jitter": 0.4,
+        "polar_rot": true,
+        "custom_early_convs": 2,
+        "custom_channels": [
+            128,
+            96,
+            64,
+            64
+        ],
+        "monochrome": true
+    },
+    "early_stopping": {
+        "monitor": "loss",
+        "mode": "min",
+        "patience": 16,
+        "min_delta": 0.0005,
+        "verbose": 1,
+        "restore_best_weights": true
+    },
+    "optimizer": {
+        "type": "AdamW",
+        "learning_rate": 0.0005
+    },
+    "dataloader": {
+        "seed": 42,
+        "validation_split": 0.1,
+        "shuffle": false,
+        "label_mode": "categorical",
+        "cacheAllDataToRAM": false,
+        "num_workers": 15,
+        "balanced_sampling": true,
+        "frame_disjoint_split": true
+    },
+    "wandb": {
+        "project": "Classifier",
+        "name": "CrossValAltinay",
+        "use_wandb": false
+    },
+    "training_dataset": [
+        "/home/ammar/Documents/Programming/magician_datasets/train_nonaltinay_v2/",
+        "/home/ammar/Documents/Programming/magician_datasets/val_altinay_granular/"
+    ],
+    "validation_dataset": "",
+    "class_weight": false,
+    "loss": "focal",
+    "penalize_false_clean": 0.0,
+    "accelerator": "auto",
+    "name": "matrix_alldefect_nonsev_mono",
+    "model": "custom",
+    "devices": 1,
+    "selected_classes": [],
+    "drop_classes": [
+        "class_clean"
+    ],
+    "checkpoint_monitor": "val_auroc",
+    "checkpoint_save_top_k": -1,
+    "checkpoint_dir": "/home/ammar/Documents/Programming/magician_datasets/matrix_ckpts/nonsev_mono_ckpts",
+    "strip_severity": true
+}
