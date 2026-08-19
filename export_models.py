@@ -173,12 +173,17 @@ def _locate(model_name, suffix):
     experiments/<campaign>/<run>/. The run directory is checked FIRST so a re-exported run
     picks up its filed copy, with the root as the legacy fallback.
     """
-    from artifact_paths import out_path
+    from artifact_paths import find_artifact, out_path
     filed = out_path(model_name, suffix, create=False)
     if os.path.exists(filed):
         return filed
     legacy = f'{model_name}{suffix}'
-    return legacy if os.path.exists(legacy) else None
+    if os.path.exists(legacy):
+        return legacy
+    # Last resort, by NAME: the frozen configs live at experiments/configs_frozen/, which
+    # is neither the run directory nor the root. Without this the incumbent could not be
+    # exported at all.
+    return find_artifact(os.path.basename(f'{model_name}{suffix}'))
 
 
 def collect_members(model_name, include_tensorboard=True):
@@ -281,9 +286,14 @@ def already_exported():
 
 def discover():
     runs = []
-    # Root for live configs, plus the filed copies each run writes beside its weights.
+    # Root for live configs, plus every config filed anywhere under experiments/.
+    # This was `experiments/*/*/*.json` -- exactly three levels -- which missed the frozen
+    # configs at experiments/configs_frozen/<name>.json, two levels down. The incumbent
+    # `anc_convnext_pico` lives there, so a --force re-export silently skipped the one
+    # model that is actually deployed, leaving it published without its threshold curve
+    # or coverage table.
     for cfg_path in sorted(glob.glob('*.json')) + sorted(
-            glob.glob(os.path.join('experiments', '*', '*', '*.json'))):
+            glob.glob(os.path.join('experiments', '**', '*.json'), recursive=True)):
         try:
             with open(cfg_path) as fh:
                 cfg = json.load(fh)

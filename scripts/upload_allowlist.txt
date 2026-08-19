@@ -1,0 +1,25 @@
+# Models that may be PUBLISHED to the operator-facing "Download & Use" list.
+#
+# uploadModels.sh uploads ONLY what is listed here. This exists because the store holds
+# 170 archives / 11 GB, nearly all of which are research runs: the zoo sweep, the seed
+# replicates, the pfc variance arms, smoke tests, and outright failures like
+# fzmnas05 (40.36 miss@FA5) and fzmnas10 (24.55) against an incumbent at 9.24. Every one
+# of those would otherwise appear in the annotator dropdown with nothing to tell an
+# operator that picking it is a mistake.
+#
+# Publishing is also hard to undo -- the server directory is public_html, so an archive
+# can be fetched, cached or indexed before it is withdrawn. Hence: allowlist, not
+# blocklist. A model nobody has vouched for does not ship.
+#
+# One run name per line, exactly as the archive is named (the sanitised form, e.g.
+# fztinye_timm_tinynet_e). Blank lines and # comments are ignored.
+#
+# To publish everything anyway, deliberately:  ALLOW_ALL=1 scripts/uploadModels.sh
+
+# The incumbent -- what is deployed today.
+anc_convnext_pico
+
+# Candidates under evaluation. Uncomment only when a result is confirmed at n>=3 and
+# you intend operators to be able to select it.
+#fzcnxtiny_convnext_tiny     # best coverage in the 33-model map (77.10 TIER_A), n=1
+#fzr18fine_resnet18_fine     # best factory KPI (7.63 miss@FA5) but coverage 71.94, n=1

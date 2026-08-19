@@ -56,6 +56,11 @@ scripts/*.txt.[0-9]
 scripts/*.csv
 scripts/*.png
 scripts/*.bak
+# ...but NOT the publish allowlist. It decides which models reach the operator-facing
+# "Download & Use" list, so it has to be tracked and reviewable: if it stayed ignored,
+# an edit here would never be committed and the two boxes would publish different sets
+# of models while both looked clean.
+!scripts/upload_allowlist.txt
 
 # --- scratch -------------------------------------------------------------------------
 *.json.bak
