@@ -160,30 +160,15 @@ def main():
         # Mirror the trainer's Classifier construction. Only the args that change the
         # ARCHITECTURE or the input features matter for scoring (augmentation and loss
         # terms are inert in eval), but keeping the list aligned avoids surprises.
-        model = Classifier(
-            model=config_json['model'], num_classes=len(class_names),
-            tile_size=h['tile_size'], dropout_rate=h['dropout_rate'],
-            # .get with the Classifier defaults: these are CustomCNN-only knobs and the
-            # timm/torchvision configs legitimately omit them (this crashed on p2_convnext_pico).
-            base_channels=h.get('base_channels', 32),
-            final_dense_layer=h.get('final_dense_layer', 512),
-            clean_class=cleanClassID,
-            penalize_false_clean=float(config_json.get('penalize_false_clean', 0.0)),
-            AoLP=h.get('AoLP', False), DoLP=h.get('DoLP', False),
-            Unpolarized=bool(h.get('Unpolarized', h.get('unpolarized', False))),
-            MaxPolarization=h.get('MaxPolarization', False),
-            MinPolarization=h.get('MinPolarization', False),
-            RangePolarization=h.get('RangePolarization', False),
-            monochrome=h.get('monochrome', False),
-            custom_early_convs=h.get('custom_early_convs', 0),
-            custom_channels=h.get('custom_channels'),
-            custom_res_blocks=h.get('custom_res_blocks'),
-            custom_wavelet_pools=h.get('custom_wavelet_pools'),
-            custom_wavelet_stem=h.get('custom_wavelet_stem', 0),
-            pretrained=bool(h.get('pretrained', True)),
-            seed_pretrained_stem=bool(h.get('seed_pretrained_stem', True)),
-            timm_stem_stride=h.get('timm_stem_stride', None),
-        )
+        # Single source of truth (LitClassifier.Classifier.from_config). This block used
+        # to omit custom_channels/custom_res_blocks, so a CustomCNN was rebuilt at the
+        # default width. The extra kwargs from_config supplies are the training-only
+        # augmentation knobs (noise/gain_jitter/polar_flip/polar_rot/channel_jitter),
+        # every one of which is gated on self.training -- inert here, where the model is
+        # in eval(). Equivalence on all 167 real configs is asserted by
+        # test_classifier_from_config.py, which is what makes this conversion a no-op.
+        model = Classifier.from_config(config_json, num_classes=len(class_names),
+                                      clean_class=cleanClassID)
         state = torch.load(ck, weights_only=False, map_location='cpu')
         model.load_state_dict(state['state_dict'])
         model.eval()

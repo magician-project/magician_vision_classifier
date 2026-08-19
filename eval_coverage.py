@@ -105,21 +105,15 @@ def main():
                   f'the last one ({os.path.basename(ckpt)}), which may not be the best.')
     print(f'[coverage] scoring {os.path.basename(ckpt)}')
 
-    model = Classifier(
-        model=cfg['model'], num_classes=len(class_names), tile_size=h['tile_size'],
-        dropout_rate=h['dropout_rate'], base_channels=h.get('base_channels', 32),
-        final_dense_layer=h.get('final_dense_layer', 512), clean_class=cleanID,
-        penalize_false_clean=float(cfg.get('penalize_false_clean', 0.0)),
-        AoLP=h.get('AoLP', False), DoLP=h.get('DoLP', False),
-        Unpolarized=bool(h.get('Unpolarized', h.get('unpolarized', False))),
-        MaxPolarization=h.get('MaxPolarization', False),
-        MinPolarization=h.get('MinPolarization', False),
-        RangePolarization=h.get('RangePolarization', False),
-        monochrome=h.get('monochrome', False),
-        pretrained=bool(h.get('pretrained', True)),
-        seed_pretrained_stem=bool(h.get('seed_pretrained_stem', True)),
-        timm_stem_stride=h.get('timm_stem_stride', None),
-    )
+    # Single source of truth (LitClassifier.Classifier.from_config). This block used
+    # to omit custom_channels/custom_res_blocks, so a CustomCNN was rebuilt at the
+    # default width. The extra kwargs from_config supplies are the training-only
+    # augmentation knobs (noise/gain_jitter/polar_flip/polar_rot/channel_jitter),
+    # every one of which is gated on self.training -- inert here, where the model is
+    # in eval(). Equivalence on all 167 real configs is asserted by
+    # test_classifier_from_config.py, which is what makes this conversion a no-op.
+    model = Classifier.from_config(cfg, num_classes=len(class_names),
+                                   clean_class=cleanID)
     model.load_state_dict(torch.load(ckpt, weights_only=False, map_location='cpu')['state_dict'])
     dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(dev).eval()

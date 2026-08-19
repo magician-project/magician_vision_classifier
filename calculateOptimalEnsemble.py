@@ -125,31 +125,10 @@ def _instantiate_classifier(config_json: dict, class_names: list[str]) -> Classi
             if k in hp:            return bool(hp[k])
             if k in config_json:   return bool(config_json[k])
         return False
-    return Classifier(
-        model               = config_json["model"],
-        loss                = config_json.get("loss", "focal"),
-        tile_size           = config_json["hparams"]["tile_size"],
-        num_classes         = len(class_names),
-        dropout_rate        = config_json["hparams"]["dropout_rate"],
-        lr                  = config_json["optimizer"]["learning_rate"],
-        AoLP                = _flag("AoLP"),
-        DoLP                = _flag("DoLP"),
-        Unpolarized         = _flag("Unpolarized", "unpolarized"),
-        MaxPolarization     = _flag("MaxPolarization"),
-        MinPolarization     = _flag("MinPolarization"),
-        RangePolarization   = _flag("RangePolarization"),
-        monochrome          = _flag("monochrome"),
-        penalize_false_clean= float(config_json.get("penalize_false_clean", 0.0)),
-        base_channels       = config_json["hparams"].get("base_channels", 32),
-        final_dense_layer   = config_json["hparams"].get("final_dense_layer", 512),
-        clean_class         = get_clean_class_id(class_names),
-        noise_std           = config_json["hparams"].get("noise_std", 0.0),
-        noise_clip          = config_json["hparams"].get("noise_clip", None),
-        custom_early_convs  = int(config_json["hparams"].get("custom_early_convs", 0)),
-        custom_channels     = config_json["hparams"].get("custom_channels", None),
-        custom_res_blocks   = config_json["hparams"].get("custom_res_blocks", None),
-        custom_wavelet_pools= config_json["hparams"].get("custom_wavelet_pools", None),
-    )
+    # Single source of truth: LitClassifier.Classifier.from_config. Equivalence with
+    # the trainer on all 167 real configs is asserted by test_classifier_from_config.py.
+    return Classifier.from_config(config_json, num_classes=len(class_names),
+                                  clean_class=get_clean_class_id(class_names))
 
 
 def _load_weights(clf: Classifier, pth_path: str, device: str) -> Classifier:

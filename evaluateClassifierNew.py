@@ -204,35 +204,15 @@ def get_clean_class_id(class_names):
 
 def instantiate_classifier_from_config(config_json: dict, class_names):
     """Build a Classifier from a JSON config and class list, ready for inference."""
-    dropout_rate = config_json["hparams"]["dropout_rate"]
-    tile_size = config_json["hparams"]["tile_size"]
-    lr = config_json["optimizer"]["learning_rate"]
-    penalize_false_clean = float(config_json.get("penalize_false_clean", 0.0))
-    base_channels = config_json["hparams"].get("base_channels", 32)
-    final_dense_layer = config_json["hparams"].get("final_dense_layer", 512)
-    noise_std = config_json["hparams"].get("noise_std", 0.0)
-    noise_clip = config_json["hparams"].get("noise_clip", None)
-
-    return Classifier(
-        model=config_json["model"],
-        loss=config_json.get("loss", "focal"),
-        tile_size=tile_size,
-        num_classes=len(class_names),
-        dropout_rate=dropout_rate,
-        lr=lr,
-        AoLP=config_json.get("AoLP", False),
-        DoLP=config_json.get("DoLP", False),
-        Unpolarized=config_json.get("Unpolarized", False),
-        MaxPolarization=config_json.get("MaxPolarization", False),
-        MinPolarization=config_json.get("MinPolarization", False),
-        RangePolarization=config_json.get("RangePolarization", False),
-        penalize_false_clean=penalize_false_clean,
-        base_channels=base_channels,
-        final_dense_layer=final_dense_layer,
-        clean_class=get_clean_class_id(class_names),
-        noise_std=noise_std,
-        noise_clip=noise_clip,
-    )
+    # Single source of truth: Classifier.from_config reads every knob from
+    # config["hparams"], the nesting the trainer writes. This block used to read
+    # AoLP/DoLP/Unpolarized/Max/Min/RangePolarization from the config TOP LEVEL,
+    # where no config has ever carried them (167 have them under hparams, 0 at the
+    # top), so it silently built a 4-channel model for every 5-channel run. It also
+    # never passed monochrome, custom_channels, custom_res_blocks, pretrained or
+    # timm_stem_stride -- see test_classifier_from_config.py.
+    return Classifier.from_config(config_json, num_classes=len(class_names),
+                                  clean_class=get_clean_class_id(class_names))
 
 
 def get_state_dict_from_checkpoint(checkpoint_path: str, device: str):

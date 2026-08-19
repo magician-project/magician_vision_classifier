@@ -542,39 +542,13 @@ def main():
 
 
     # Initialize the classifier
-    classifier = Classifier(
-                            model=config_json['model'],
-                            lr=lr,
-                            num_classes=len(class_names),
-                            tile_size=config_json['hparams']['tile_size'],
-                            dropout_rate=dropout_rate,
-                            penalize_false_clean=penalize_false_clean,
-                            base_channels=base_channels,
-                            final_dense_layer=final_dense_layer,
-                            clean_class=cleanClassID,
-                            noise_std=noise_std,
-                            noise_clip=noise_clip,
-                            gain_jitter=gain_jitter,
-                            polar_flip=polar_flip,
-                            channel_jitter=channel_jitter,
-                            monochrome=monochrome,
-                            polar_rot=polar_rot,
-                            frozen_body_start_epochs=frozen_body_start_epochs,
-                            frozen_body_end_epochs=frozen_body_end_epochs,
-                            custom_early_convs=custom_early_convs,
-                            custom_channels=custom_channels,
-                            custom_res_blocks=custom_res_blocks,
-                            custom_wavelet_pools=custom_wavelet_pools,
-                            custom_wavelet_stem=custom_wavelet_stem,
-                            pretrained=pretrained_backbone,
-                            seed_pretrained_stem=seed_pretrained_stem,
-                            timm_stem_stride=timm_stem_stride,
-                            AoLP=use_AoLP,
-                            DoLP=use_DoLP,
-                            Unpolarized=use_unpol,
-                            MaxPolarization=use_maxp,
-                            MinPolarization=use_minp,
-                            RangePolarization=use_rngp)
+    # Single source of truth: LitClassifier.Classifier.from_config, which was derived
+    # from this very block and is asserted equal to it on all 167 real configs by
+    # test_classifier_from_config.py. Keeping the translation in one place is what
+    # stops the eval tools drifting away from the trainer again.
+    classifier = Classifier.from_config(config_json,
+                                        num_classes=len(class_names),
+                                        clean_class=cleanClassID)
     print(f"Learning rate: {lr}")
     
     model_type = classifier.type

@@ -49,27 +49,15 @@ def _load_state_dict(checkpoint_path: str, device: str):
 
 
 def _build_classifier(cfg: dict, class_names: list) -> Classifier:
-    hp = cfg["hparams"]
-    return Classifier(
-        model=cfg["model"],
-        loss=cfg.get("loss", "focal"),
-        tile_size=hp["tile_size"],
-        num_classes=len(class_names),
-        dropout_rate=hp["dropout_rate"],
-        lr=cfg["optimizer"]["learning_rate"],
-        AoLP=cfg.get("AoLP", False),
-        DoLP=cfg.get("DoLP", False),
-        Unpolarized=cfg.get("Unpolarized", False),
-        MaxPolarization=cfg.get("MaxPolarization", False),
-        MinPolarization=cfg.get("MinPolarization", False),
-        RangePolarization=cfg.get("RangePolarization", False),
-        penalize_false_clean=float(cfg.get("penalize_false_clean", 0.0)),
-        base_channels=hp.get("base_channels", 32),
-        final_dense_layer=hp.get("final_dense_layer", 512),
-        clean_class=_get_clean_class_id(class_names),
-        noise_std=hp.get("noise_std", 0.0),
-        noise_clip=hp.get("noise_clip", None),
-    )
+    # Single source of truth: Classifier.from_config reads every knob from
+    # config["hparams"], the nesting the trainer writes. This block used to read
+    # AoLP/DoLP/Unpolarized/Max/Min/RangePolarization from the config TOP LEVEL,
+    # where no config has ever carried them (167 have them under hparams, 0 at the
+    # top), so it silently built a 4-channel model for every 5-channel run. It also
+    # never passed monochrome, custom_channels, custom_res_blocks, pretrained or
+    # timm_stem_stride -- see test_classifier_from_config.py.
+    return Classifier.from_config(cfg, num_classes=len(class_names),
+                                  clean_class=_get_clean_class_id(class_names))
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _TRY_BATCH_SIZES = [4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 1]

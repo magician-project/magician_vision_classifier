@@ -126,6 +126,13 @@ class Classifier(pl.LightningModule):
                       timm_stem_stride=None
                  ):
         super(Classifier, self).__init__()
+        # Persist every constructor argument into the checkpoint, so a model can be
+        # rebuilt from the checkpoint alone. Before this, eleven call sites each
+        # hand-translated a config dict into these ~31 kwargs, and every one of them was
+        # free to disagree -- which they did. See from_config() for the whole story.
+        # NOTE: checkpoints written before this line have no stored hparams;
+        # load_for_eval() below refuses to guess rather than falling back to defaults.
+        self.save_hyperparameters()
         #-----------------------------------------
         self.type              = model
         self.lr                = lr
@@ -470,3 +477,149 @@ class Classifier(pl.LightningModule):
         # Optimize self.parameters() (all module params) rather than just self.model.parameters(),
         # so any future additions to Classifier itself are covered automatically.
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
+
+    # ------------------------------------------------------------------ from_config
+    # Constructor kwargs read from config['hparams']. Everything the trainer reads from
+    # there is listed, so this is the authoritative nesting: the derived-channel flags,
+    # the augmentation knobs and the architecture knobs all live under `hparams`, NOT at
+    # the config top level. Four eval tools used to read AoLP/DoLP from the top level,
+    # where no config has ever had them -- 167 configs carry them under hparams and zero
+    # at the top -- so those tools silently built a 4-channel model for every 5-channel
+    # run. That class of bug is what this method exists to make impossible.
+    _HPARAM_KWARGS = (
+        'tile_size', 'dropout_rate',
+        'AoLP', 'DoLP', 'Unpolarized',
+        'MaxPolarization', 'MinPolarization', 'RangePolarization',
+        'base_channels', 'final_dense_layer',
+        'noise_std', 'noise_clip',
+        'gain_jitter', 'polar_flip', 'channel_jitter', 'monochrome', 'polar_rot',
+        'frozen_body_start_epochs', 'frozen_body_end_epochs',
+        'custom_early_convs', 'custom_channels', 'custom_res_blocks',
+        'custom_wavelet_pools', 'custom_wavelet_stem',
+        'pretrained', 'seed_pretrained_stem', 'timm_stem_stride',
+    )
+    # Historical spellings that must keep working; first match wins.
+    _HPARAM_ALIASES = {'Unpolarized': ('Unpolarized', 'unpolarized')}
+
+    @classmethod
+    def config_to_kwargs(cls, cfg, *, num_classes, clean_class=0, lr=None, **overrides):
+        """The pure config -> constructor-kwargs translation. THE single definition.
+
+        Separate from from_config() so it can be tested without building a model, and so
+        the defaults are read from the real __init__ signature rather than from whatever
+        happens to be bound to `cls.__init__` at call time.
+        """
+        return cls._config_to_kwargs(cfg, num_classes=num_classes,
+                                     clean_class=clean_class, lr=lr, **overrides)
+
+    @classmethod
+    def _config_to_kwargs(cls, cfg, *, num_classes, clean_class=0, lr=None, **overrides):
+        """Build the constructor kwargs from a training config dict.
+
+        `num_classes` is required and `clean_class` is caller-supplied because both come
+        from the resolved label space, not from the config -- the config's `classes` list
+        is written back by the trainer AFTER a run and is absent on a fresh config.
+
+        Defaults come from this class's own __init__ signature rather than being restated
+        here, so there is exactly one definition of every default. Adding a constructor
+        argument and listing it in _HPARAM_KWARGS is all it takes to make every call site
+        honour it.
+        """
+        import inspect
+        if not isinstance(cfg, dict):
+            raise TypeError(f'from_config expects a config dict, got {type(cfg).__name__}')
+        hp = cfg.get('hparams')
+        if not isinstance(hp, dict):
+            raise ValueError(
+                'config has no "hparams" block -- refusing to build a model from defaults. '
+                'Every architecture-critical knob (DoLP, monochrome, timm_stem_stride, the '
+                'CustomCNN ladder) lives there, and guessing them produces a model that '
+                'loads cleanly and computes the wrong thing.')
+
+        # __func__ so a decorated/patched cls.__init__ cannot change the defaults.
+        init = getattr(cls.__init__, '__func__', cls.__init__)
+        sig = inspect.signature(init).parameters
+        kwargs = {}
+        for key in cls._HPARAM_KWARGS:
+            names = cls._HPARAM_ALIASES.get(key, (key,))
+            for n in names:
+                if n in hp:
+                    kwargs[key] = hp[n]
+                    break
+            else:
+                kwargs[key] = sig[key].default
+
+        # Top-level config keys, matching the trainer.
+        kwargs['model'] = cfg['model']
+        kwargs['penalize_false_clean'] = float(cfg.get('penalize_false_clean', 0.0))
+        kwargs['num_classes'] = num_classes
+        kwargs['clean_class'] = clean_class
+        kwargs['lr'] = (lr if lr is not None
+                        else cfg.get('optimizer', {}).get('learning_rate',
+                                                          sig['lr'].default))
+
+        # Match the trainer's coercions exactly, so a converted call site is a no-op.
+        for k in ('AoLP', 'DoLP', 'Unpolarized', 'MaxPolarization', 'MinPolarization',
+                  'RangePolarization', 'polar_flip', 'monochrome', 'polar_rot',
+                  'pretrained', 'seed_pretrained_stem'):
+            kwargs[k] = bool(kwargs[k])
+        for k in ('gain_jitter', 'channel_jitter'):
+            kwargs[k] = float(kwargs[k])
+        for k in ('frozen_body_start_epochs', 'frozen_body_end_epochs',
+                  'custom_early_convs'):
+            kwargs[k] = int(kwargs[k])
+        kwargs['custom_wavelet_stem'] = int(kwargs['custom_wavelet_stem'] or 0)
+
+        kwargs.update(overrides)
+        return kwargs
+
+    @classmethod
+    def from_config(cls, cfg, *, num_classes, clean_class=0, lr=None, **overrides):
+        """Build a Classifier from a training config dict. THE single translation.
+
+        `num_classes` is required and `clean_class` is caller-supplied because both
+        come from the resolved label space, not the config -- the config's `classes`
+        list is written back by the trainer AFTER a run and is absent beforehand.
+        """
+        return cls(**cls._config_to_kwargs(cfg, num_classes=num_classes,
+                                           clean_class=clean_class, lr=lr,
+                                           **overrides))
+
+    @classmethod
+    def load_for_eval(cls, checkpoint_path, cfg=None, *, num_classes=None,
+                      clean_class=0, map_location='cpu', **overrides):
+        """Rebuild a trained model for evaluation, refusing to guess its architecture.
+
+        Prefers hyperparameters stored in the checkpoint (written by
+        save_hyperparameters()). Checkpoints predating that call have none, so it falls
+        back to `cfg` -- and if neither source has them it RAISES.
+
+        That refusal is the point. Lightning's load_from_checkpoint silently falls back to
+        __init__ defaults when a checkpoint carries no hparams, which rebuilds a
+        4-channel, stride-4, polarization-on model regardless of what was trained. The
+        state dict often loads anyway, and the wrongness only shows up as a slightly
+        disappointing number.
+        """
+        import torch
+        ckpt = torch.load(checkpoint_path, map_location=map_location)
+        stored = ckpt.get('hyper_parameters') if isinstance(ckpt, dict) else None
+        if stored:
+            kwargs = dict(stored)
+            kwargs.update(overrides)
+            if num_classes is not None:
+                kwargs['num_classes'] = num_classes
+            model = cls(**kwargs)
+        elif cfg is not None:
+            if num_classes is None:
+                raise ValueError('num_classes is required when rebuilding from a config')
+            model = cls.from_config(cfg, num_classes=num_classes,
+                                    clean_class=clean_class, **overrides)
+        else:
+            raise ValueError(
+                f'{checkpoint_path} stores no hyper_parameters and no config was given. '
+                'Refusing to rebuild from __init__ defaults -- that would silently '
+                'produce a model with the wrong input channels and/or stem stride.')
+        sd = ckpt.get('state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
+        model.load_state_dict(sd, strict=True)
+        model.eval()
+        return model
