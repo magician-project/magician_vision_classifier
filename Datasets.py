@@ -15,6 +15,7 @@ Two interactions in here are easy to get wrong and are documented at their call 
 
 import os
 import random
+import typing
 
 import numpy as np
 import torch
@@ -694,3 +695,266 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
 
             random.shuffle(batch)
             yield batch
+
+
+# ---------------------------------------------------------------------------------
+# THE validation split. One implementation, four callers.
+# ---------------------------------------------------------------------------------
+# This chain -- load each dir -> apply the run's class scheme -> align class ORDER ->
+# split -- used to exist four times: in the trainer, and hand-mirrored in
+# score_checkpoints.py, eval_coverage.py and eval_ema_tta.py. The copies carried
+# comments like
+#
+#     # Mirrors trainMagicianVisionClassifierTorch.py:296-330, including ...
+#
+# which is a maintenance contract nothing enforces; those line numbers were stale by
+# the time anyone read them. A scorer that rebuilds a DIFFERENT validation set than
+# the run trained on reports a number for the wrong split, and nothing about the
+# output looks wrong.
+#
+# Two behaviours in here are load-bearing and were correct in some copies only:
+#
+#   ORDER, NOT SET. Validation is forced onto the TRAINING class list. Two dumps can
+#   reach the same class SET in a different ORDER -- merge_dataset_classes keeps
+#   survivors in pre-merge order and appends new destinations, and a stripped granular
+#   dump does not enumerate in the same order as a natively base-named one. Class INDEX
+#   is what the model predicts, so the order must match exactly.
+#
+#   THE SPLIT SEED IS hparams.seed, not dataloader.seed. The trainer splits on
+#   hparams.seed; a config where the two differ would otherwise have its validation set
+#   silently rebuilt differently by the scorers. They are equal in every config written
+#   so far, which is exactly why this would not have surfaced until it mattered.
+
+class Split(typing.NamedTuple):
+    """What the dataset chain produces, before any DataLoader exists.
+
+    `dataset` is the full training-side dataset and the authority on class order.
+    `train` is None when the caller asked for validation only.
+    """
+    dataset: object
+    train: object
+    val: object
+    classes: list
+    ram_preloaded: bool = False
+
+
+def _load_one_dir(d, config_json, transform=None, label=None, verbose=True):
+    """One directory -> a dataset carrying the run's class scheme. h5 if present, else PNGs."""
+    h5 = '%s/dataset.h5' % d
+    if os.path.isfile(h5):
+        from DatasetConverter import HDF5Dataset
+        if verbose:
+            print("Using H5 dataset loader ", h5)
+        ds = HDF5Dataset(h5)
+        ds.metadata = None      # train/val steps unpack (x, y) batches only
+    else:
+        if verbose:
+            print("Using Normal PNG dataset loader ", d)
+        ds = RGBAImageFolder(root=d, transform=transform)
+    # Applied per constituent so the combined label space is consistent, and shared with
+    # the validation path so the two cannot drift.
+    from ClassScheme import apply_class_scheme
+    return apply_class_scheme(ds, config_json,
+                              label=label or os.path.basename(str(d).rstrip('/')))
+
+
+def load_training_dataset(config_json, *, transform=None, label=None, verbose=True):
+    """The training-side dataset, class scheme applied and constituents aligned.
+
+    The class space this returns is the AUTHORITY: it is the order the model's output
+    indices refer to. Anything that needs to know what index N means -- the scorers, the
+    coverage carve-out, the hard-negative miner -- must derive it from here rather than
+    from its own dump, or a validation set that reaches the same class SET in a
+    different ORDER will be scored against the wrong indices.
+    """
+    from ClassScheme import align_dataset_to_classes
+
+    directory = config_json['training_dataset']
+    directories = directory if isinstance(directory, list) else [directory]
+    subs = [_load_one_dir(d, config_json, transform=transform,
+                          label=label if (label and i == 0) else None, verbose=verbose)
+            for i, d in enumerate(directories)]
+    if len(subs) == 1:
+        return subs[0]
+    # Constituents may hold different class SUBSETS/orders; force all onto one canonical
+    # list so CombinedDataset accepts them.
+    canon = config_json.get('canonical_classes') or list(subs[0].classes)
+    for ds in subs:
+        align_dataset_to_classes(ds, canon)
+    dataset = CombinedDataset(subs)
+    if verbose:
+        print(f"Combined {len(subs)} datasets -> {len(dataset)} tiles, "
+              f"classes {dataset.classes}")
+    return dataset
+
+
+def clean_class_index(classes):
+    """Index of the clean class. EXACT match, never a substring test.
+
+    A substring test matches 'class_WeldingClassAClean' -- a vestigial class the model
+    never predicts -- so defect_mass would be computed against the wrong column and
+    every tile would look like a defect.
+    """
+    return next((i for i, c in enumerate(classes)
+                 if c == 'class_clean' or c.lower() in ('class_clean', 'clean')), None)
+
+
+def build_train_val(config_json, *, transform=None, val_only=False, preload_ram=None,
+                    verbose=True):
+    """Build the run's train/validation split from its config. THE single definition.
+
+    val_only=True skips the work that only the trainer needs -- RAM preloading and the
+    exclude_frames carve-out, both of which touch the TRAIN side only -- and returns a
+    Split whose .train is None. The validation set it produces is bit-identical to the
+    one the trainer builds, which is the entire point: a scorer must not be able to
+    disagree with the run it is scoring.
+    """
+    from ClassScheme import align_dataset_to_classes
+
+    directory = config_json['training_dataset']
+    dataset = load_training_dataset(config_json, transform=transform,
+                                    label='train(classes only)' if val_only else None,
+                                    verbose=verbose)
+
+    ram_preloaded = False
+    if preload_ram is None:
+        preload_ram = bool(config_json['dataloader'].get('cacheAllDataToRAM'))
+    if preload_ram and not val_only:
+        _assert_ram_headroom(dataset, directory, verbose=verbose)
+        dataset = RAMPreloadedDataset(dataset)
+        ram_preloaded = True
+
+    # Seeded HERE, unconditionally, and before any branch -- matching the trainer, which
+    # seeds after the RAM preload and before the split. This is not only about the split:
+    # the global RNG state left behind is the state the model is initialised from, so
+    # moving this call or making it conditional changes the WEIGHTS a run starts with,
+    # not just which tiles are held out. The RAM-check sampling above runs before it and
+    # is therefore irrelevant, exactly as in the original ordering.
+    seed = config_json['hparams'].get('seed', config_json['dataloader'].get('seed'))
+    if seed != config_json['dataloader'].get('seed') and verbose:
+        print(f"NOTE hparams.seed={seed} != dataloader.seed="
+              f"{config_json['dataloader'].get('seed')}; using hparams.seed to match "
+              f"the trainer's split.")
+    _seed_everything(seed)
+
+    val_dir = config_json.get('validation_dataset')
+    if val_dir:
+        val_dir = val_dir[0] if isinstance(val_dir, list) else val_dir
+        if verbose:
+            print("Using explicit validation dataset:", val_dir)
+        val_dataset = _load_one_dir(val_dir, config_json, transform=transform,
+                                    label='validation', verbose=verbose)
+        if list(val_dataset.classes) != list(dataset.classes):
+            if verbose:
+                print(f"[class_scheme:validation] reordering to match training: "
+                      f"{val_dataset.classes} -> {dataset.classes}")
+            align_dataset_to_classes(val_dataset, dataset.classes)
+        if list(dataset.classes) != list(val_dataset.classes):
+            raise ValueError(f"Training/validation class mismatch: "
+                             f"{dataset.classes} vs {val_dataset.classes}")
+        if dataset.class_to_idx != val_dataset.class_to_idx:
+            raise ValueError("Training/validation class_to_idx mismatch")
+
+        train_dataset = None
+        if not val_only:
+            train_dataset = dataset
+            # Carve the coverage val OUT of train (build_coverage_val.py). A REMOVAL,
+            # not a copy -- a copy would make the coverage set score memorisation.
+            excl = config_json['dataloader'].get('exclude_frames') or None
+            if excl:
+                from torch.utils.data import Subset
+                train_dataset = Subset(dataset, exclude_frames_indices(dataset, excl))
+        return Split(dataset, train_dataset, val_dataset, list(dataset.classes),
+                     ram_preloaded)
+
+    val_split = config_json['dataloader']['validation_split']
+
+    if config_json['dataloader'].get('frame_disjoint_split'):
+        if config_json['dataloader'].get('exclude_frames'):
+            raise ValueError("dataloader.exclude_frames is only supported with an explicit "
+                             "validation_dataset; combining it with frame_disjoint_split "
+                             "would make the held-out set ambiguous. Set validation_dataset "
+                             "instead.")
+        if verbose:
+            print("No validation_dataset -> FRAME-DISJOINT split of the training set")
+        from torch.utils.data import Subset
+        # frozen_val_frames pins validation by frame NAME (freeze_val_split.py) so newly
+        # annotated frames all land in train and results stay comparable as the dataset
+        # grows. Absent -> the historical seed/val_split behaviour.
+        frozen_val = config_json['dataloader'].get('frozen_val_frames') or None
+        tr_idx, va_idx = frame_disjoint_split(dataset, val_split, seed,
+                                              frozen_val_frames=frozen_val)
+        return Split(dataset, None if val_only else Subset(dataset, tr_idx),
+                     Subset(dataset, va_idx), list(dataset.classes), ram_preloaded)
+
+    if val_only:
+        # The tile-level path leaks sibling tiles and no current config uses it. Refuse
+        # rather than rebuild a split that would not match what was trained.
+        raise ValueError(
+            "this run used neither an explicit validation_dataset nor "
+            "dataloader.frame_disjoint_split, so its validation set was a TILE-level "
+            "random_split; rebuilding it here would not reproduce the trained split.")
+    if verbose:
+        print("No validation_dataset provided -> using validation_split (TILE-level; "
+              "may leak sibling tiles -- set dataloader.frame_disjoint_split for a "
+              "clean split)")
+    from torch.utils.data import random_split
+    dataset_size = len(dataset)
+    validation_size = int(val_split * dataset_size)
+    train_dataset, val_dataset = random_split(
+        dataset, [dataset_size - validation_size, validation_size],
+        generator=torch.Generator().manual_seed(seed))
+    return Split(dataset, train_dataset, val_dataset, list(dataset.classes), ram_preloaded)
+
+
+def build_val_only(config_json, **kwargs):
+    """The run's validation split, without loading anything only the trainer needs."""
+    return build_train_val(config_json, val_only=True, **kwargs)
+
+
+def val_dataloader(config_json, split):
+    """The scorers' validation loader. Shuffle off, drop_last off -- every tile, once."""
+    from torch.utils.data import DataLoader
+    nw = config_json['dataloader']['num_workers']
+    kw = {}
+    if nw > 0:
+        kw = {'pin_memory': True, 'persistent_workers': True,
+              'prefetch_factor': int(config_json['dataloader'].get('prefetch_factor', 4))}
+    return DataLoader(split.val, batch_size=config_json['hparams']['batch_size'],
+                      shuffle=False, num_workers=nw, drop_last=False, **kw)
+
+
+def _seed_everything(seed):
+    import pytorch_lightning as pl
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    pl.seed_everything(seed, workers=True)
+
+
+def _assert_ram_headroom(dataset, directory, verbose=True):
+    """Refuse to preload if it would not fit. Extracted verbatim from the trainer."""
+    import sys
+    available_ram = _get_available_ram_bytes()
+    disk_bytes = _get_path_size_bytes(directory)
+    est_ram_bytes = _estimate_dataset_ram_bytes(dataset, sample_count=32)
+    if verbose:
+        print("\n[RAM CHECK] Dataset on disk: ", _human_bytes(disk_bytes))
+        print("[RAM CHECK] System available RAM: ", _human_bytes(available_ram)
+              if available_ram > 0 else "unknown (continuing without hard check).")
+    if available_ram <= 0:
+        return
+    conservative_required = max(est_ram_bytes, int(disk_bytes * 2.0))
+    safety_margin = 0.90
+    limit = int(available_ram * safety_margin)
+    if verbose:
+        print("[RAM CHECK] Estimated RAM needed to cache: ", _human_bytes(conservative_required))
+    if conservative_required > limit:
+        print("\n[ERROR] Not enough available RAM to safely cache the entire dataset.")
+        print("        Required (est.): ", _human_bytes(conservative_required))
+        print("        Available:       ", _human_bytes(available_ram))
+        print("        Safety limit:    ", _human_bytes(limit),
+              f" ({int(safety_margin*100)}% of available)")
+        print("\n        Tip: disable cacheAllDataToRAM or reduce dataset / tile size / "
+              "dtype, or run on a machine with more RAM.\n")
+        sys.exit(1)

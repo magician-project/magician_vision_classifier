@@ -36,6 +36,7 @@ from Config import (
 from Datasets import (
     _human_bytes, _get_available_ram_bytes, _get_path_size_bytes, _estimate_dataset_ram_bytes,
     _dataset_source_frames, frame_disjoint_split, exclude_frames_indices,
+    build_train_val,
     load_rgba_image, load_rgba_image_pil,
     load_png_comment_metadata, metadata_collate_fn, RGBAImageFolder, RAMPreloadedDataset,
     CombinedDataset, BalancedBatchSampler,
@@ -180,192 +181,31 @@ def main():
         lambda img: torch.from_numpy(img).permute(2, 0, 1).contiguous()
     )
 
-    # training_dataset may be a single dir OR a LIST of dirs to combine (e.g.
-    # FORTH + Altinay for a mixed-domain train, then frame_disjoint_split). Each
-    # is loaded and gets the SAME class scheme (filter/merge/drop) BEFORE combining
-    # so class spaces stay consistent.
-    directories = directory if isinstance(directory, list) else [directory]
+    # THE dataset chain: load each dir -> apply the run's class scheme -> align class
+    # ORDER -> split. It lives in Datasets.build_train_val, which score_checkpoints.py,
+    # eval_coverage.py and eval_ema_tta.py also call. It used to live here, with those
+    # three carrying hand-copied mirrors of it coupled by comments naming line numbers in
+    # this file -- line numbers that had already gone stale. A scorer that rebuilds a
+    # different validation set than the run trained on reports a number for the wrong
+    # split, and nothing in the output looks wrong.
+    #
+    # The seeding that used to sit here happens inside, at the same point in the sequence:
+    # after any RAM preload, before the split. It is not only the split that depends on
+    # it -- the global RNG state it leaves behind is what the model is initialised from.
+    #
+    # test_dataset_split.py asserts this call reproduces the block it replaced, tile for
+    # tile, on every distinct dataset chain in the config corpus.
+    split = build_train_val(config_json, transform=transform)
+    dataset       = split.dataset
+    train_dataset = split.train
+    val_dataset   = split.val
+    if split.ram_preloaded:
+        # Each worker would otherwise hold its own copy of the in-RAM dataset.
+        num_workers = 1
+    H5PYFilename = '%s/dataset.h5' % (directory[0] if isinstance(directory, list)
+                                      else directory)   # legacy single-file references
 
-    def _load_one(d):
-        h5 = '%s/dataset.h5' % d
-        if checkIfFileExists(h5):
-            from DatasetConverter import HDF5Dataset
-            print("Using H5 dataset loader ", h5)
-            ds = HDF5Dataset(h5)
-            ds.metadata = None  # training/validation steps unpack (x, y) batches only
-        else:
-            print("Using Normal PNG dataset loader ", d)
-            ds = RGBAImageFolder(root=d, transform=transform)
-        # Keep some classes / merge / drop -- applied per dataset so the combined
-        # label space is consistent across all constituents. Shared with the
-        # validation path via apply_class_scheme so the two cannot drift.
-        return apply_class_scheme(ds, config_json, label=os.path.basename(str(d).rstrip('/')))
-
-    subs = [_load_one(d) for d in directories]
-    if len(subs) == 1:
-        dataset = subs[0]
-    else:
-        # Combining multiple H5s that may have different class SUBSETS/orders
-        # (e.g. base train + a granular dump collapsed to base): force all onto
-        # one canonical list so CombinedDataset accepts them. canonical_classes
-        # in the config, else the primary (first) dataset's post-transform list.
-        canon = config_json.get('canonical_classes') or list(subs[0].classes)
-        for ds in subs:
-            align_dataset_to_classes(ds, canon)
-        dataset = CombinedDataset(subs)   # now identical class spaces
-        print(f"Combined {len(subs)} datasets -> {len(dataset)} tiles, classes {dataset.classes}")
-    H5PYFilename = '%s/dataset.h5' % directories[0]   # legacy single-file references
-
-    # Sanity-check the final training label space before we train on it.
     print_class_distribution(dataset, title="TRAIN (final label space, pre-training)")
-
-    # Optionally preload all samples to RAM (slow startup, fast epoch iteration)
-    if ('cacheAllDataToRAM' in config_json['dataloader']) and (config_json['dataloader']['cacheAllDataToRAM']):
-      # --- Sanity check: ensure there is enough available RAM ---
-      available_ram = _get_available_ram_bytes()
-      # On-disk footprint (quick lower bound)
-      disk_bytes = _get_path_size_bytes(directory)
-      # Heuristic RAM estimate based on sampling decoded items
-      est_ram_bytes = _estimate_dataset_ram_bytes(dataset, sample_count=32)
-    
-      print("\n[RAM CHECK] Dataset on disk: ", _human_bytes(disk_bytes))
-      if available_ram > 0:
-            print("[RAM CHECK] System available RAM: ", _human_bytes(available_ram))
-      else:
-            print("[RAM CHECK] Could not determine available RAM (continuing without hard check).")
-    
-      # If we can measure available RAM, enforce a safety margin.
-      if available_ram > 0:
-            # Use the larger of the decoded estimate and 2x on-disk as a conservative requirement
-            conservative_required = max(est_ram_bytes, int(disk_bytes * 2.0))
-            safety_margin = 0.90  # do not consume more than 90% of available RAM
-            limit = int(available_ram * safety_margin)
-    
-            print("[RAM CHECK] Estimated RAM needed to cache: ", _human_bytes(conservative_required))
-            if conservative_required > limit:
-                  print("\n[ERROR] Not enough available RAM to safely cache the entire dataset.")
-                  print("        Required (est.): ", _human_bytes(conservative_required))
-                  print("        Available:       ", _human_bytes(available_ram))
-                  print("        Safety limit:    ", _human_bytes(limit), f" ({int(safety_margin*100)}% of available)")
-                  print("\n        Tip: disable cacheAllDataToRAM or reduce dataset / tile size / dtype, or run on a machine with more RAM.\n")
-                  sys.exit(1)
-    
-      dataset = RAMPreloadedDataset(dataset)
-      num_workers = 1 #Set workers to 1 to avoid RAM duplication 
-
-
-    # Calculate the sizes for training and validation sets
-    dataset_size    = len(dataset)
-    validation_size = int(val_split * dataset_size)
-    train_size      = dataset_size - validation_size
-    
-    #Set the random seed for reproducibility
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    pl.seed_everything(seed, workers=True)
-
-    
-
-    # Print class distribution BEFORE splitting
-    print_class_distribution(dataset, title="Full Dataset")
-
-
-    """
-    # Split the dataset into training and validation sets
-    train_dataset, val_dataset = random_split(
-                                              dataset,
-                                              [train_size, validation_size],
-                                              generator=torch.Generator().manual_seed(seed),
-                                             )
-
-    print_class_distribution(train_dataset, title="Training Set")
-    print_class_distribution(val_dataset, title="Validation Set")
-    """
-
-
-
-
-    # -----------------------------------------------------------
-    # Optional external validation dataset
-    # -----------------------------------------------------------
-    val_directory = None
-    if "validation_dataset" in config_json and config_json["validation_dataset"]:
-        val_directory = config_json["validation_dataset"]
-
-    if val_directory is not None:
-        print("Using explicit validation dataset:", val_directory)
-
-        H5PYValFilename = f"{val_directory}/dataset.h5"
-
-        if checkIfFileExists(H5PYValFilename):
-            from DatasetConverter import HDF5Dataset
-            val_dataset = HDF5Dataset(H5PYValFilename)
-            val_dataset.metadata = None  # training/validation steps unpack (x, y) batches only
-        else:
-            val_dataset = RGBAImageFolder(root=val_directory, transform=transform)
-
-        # SAME scheme as training -- this used to be a hand-copied variant that
-        # omitted strip_severity (see apply_class_scheme).
-        apply_class_scheme(val_dataset, config_json, label="validation")
-
-        # Force validation onto the TRAINING label list. Even when both end up with
-        # the same class SET, they can reach it in a different ORDER: merge_dataset_
-        # classes keeps survivors in their pre-merge order and appends new
-        # destinations, and a stripped granular dump does not enumerate classes in
-        # the same order as a natively base-named one. Class INDEX is what the model
-        # predicts, so the order must match exactly, not just the set.
-        if val_dataset.classes != dataset.classes:
-            print(f"[class_scheme:validation] reordering to match training: "
-                  f"{val_dataset.classes} -> {dataset.classes}")
-            align_dataset_to_classes(val_dataset, dataset.classes)
-
-        print_class_distribution(val_dataset, title="VAL (final label space)")
-
-        if dataset.classes != val_dataset.classes:
-            raise ValueError(f"Training/validation class mismatch: {dataset.classes} vs {val_dataset.classes}")
-
-        if dataset.class_to_idx != val_dataset.class_to_idx:
-            raise ValueError("Training/validation class_to_idx mismatch")
-
-        train_dataset = dataset
-        # Carve the coverage val OUT of train (see build_coverage_val.py). Must be a
-        # removal, not a copy -- otherwise the coverage set scores memorisation.
-        _excl = config_json['dataloader'].get('exclude_frames') or None
-        if _excl:
-            from torch.utils.data import Subset as _Subset
-            train_dataset = _Subset(dataset, exclude_frames_indices(dataset, _excl))
-    elif config_json['dataloader'].get('frame_disjoint_split'):
-        if config_json['dataloader'].get('exclude_frames'):
-            raise ValueError("dataloader.exclude_frames is only supported with an explicit "
-                             "validation_dataset; combining it with frame_disjoint_split would "
-                             "make the held-out set ambiguous. Set validation_dataset instead.")
-        # Train/test split of the (possibly combined) training set BY FRAME (no
-        # tile leakage). Used for the within-domain ceiling (FORTH->FORTH) and for
-        # mixed-domain runs (FORTH+Altinay -> held-out frames from both).
-        print("No validation_dataset → FRAME-DISJOINT split of the training set")
-        from torch.utils.data import Subset
-        # dataloader.frozen_val_frames pins validation by frame NAME (freeze_val_split.py),
-        # so newly-annotated frames all land in train and results stay comparable across
-        # dataset growth. Absent → the historical seed/val_split behaviour.
-        frozen_val = config_json['dataloader'].get('frozen_val_frames') or None
-        tr_idx, va_idx = frame_disjoint_split(dataset, val_split, seed,
-                                              frozen_val_frames=frozen_val)
-        train_dataset = Subset(dataset, tr_idx)
-        val_dataset   = Subset(dataset, va_idx)
-    else:
-        print("No validation_dataset provided → using validation_split (TILE-level; "
-              "may leak sibling tiles — set dataloader.frame_disjoint_split for a clean split)")
-
-        dataset_size    = len(dataset)
-        validation_size = int(val_split * dataset_size)
-        train_size      = dataset_size - validation_size
-
-        train_dataset, val_dataset = random_split(
-            dataset,
-            [train_size, validation_size],
-            generator=torch.Generator().manual_seed(seed),
-        )
 
     # -----------------------------------------------------------
 

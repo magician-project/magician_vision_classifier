@@ -19,101 +19,33 @@ Usage:
 
 import glob
 import os
-import random
 import re
 import sys
 
 import numpy as np
 import pytorch_lightning as pl
 import torch
-from torch.utils.data import DataLoader, Subset
 
-from ClassScheme import apply_class_scheme, align_dataset_to_classes
-from Config import checkIfFileExists, load_hyperparameters
-from Datasets import CombinedDataset, frame_disjoint_split
+from Config import load_hyperparameters
+from Datasets import build_val_only, val_dataloader
 from Evaluation import run_confusion_and_threshold_sweep
 from LitClassifier import Classifier
 
 
-def _load_one_dir(d, config_json, label=None):
-    h5 = '%s/dataset.h5' % d
-    assert checkIfFileExists(h5), f'expected an h5 dataset at {h5}'
-    from DatasetConverter import HDF5Dataset
-    ds = HDF5Dataset(h5)
-    ds.metadata = None
-    return apply_class_scheme(ds, config_json,
-                              label=label or os.path.basename(str(d).rstrip('/')))
-
-
 def build_val_loader(config_json):
-    """Rebuild the run's validation split. Mirrors the trainer's dataset path."""
-    directory = config_json['training_dataset']
-    directories = directory if isinstance(directory, list) else [directory]
+    """Rebuild the run's validation split -- now by IMPORT, not by mirroring.
 
-    def _load_one(d):
-        return _load_one_dir(d, config_json)
+    This function used to be a hand-copy of the trainer's dataset block, kept in step by
+    a comment naming line numbers in another file. Those line numbers went stale, which
+    is what a comment-as-contract always does. The chain lives in Datasets.build_val_only
+    now, so the trainer and the scorers cannot disagree about what the validation set is.
 
-    # An explicit validation_dataset (Aug26 and everything after it) IS the validation
-    # set -- there is no split to rebuild, and the training set never has to be loaded.
-    # Mirrors trainMagicianVisionClassifierTorch.py:296-330, including the alignment of
-    # val onto the TRAINING class order: class index is what the model predicts, and the
-    # two dumps can reach the same class SET in a different ORDER.
-    val_dir = config_json.get('validation_dataset')
-    if val_dir:
-        val_dir = val_dir[0] if isinstance(val_dir, list) else val_dir
-        print(f'Using explicit validation dataset: {val_dir}')
-        train_ds = _load_one_dir(directories[0], config_json, label='train(classes only)')
-        val_ds = _load_one_dir(val_dir, config_json, label='validation')
-        if list(val_ds.classes) != list(train_ds.classes):
-            print(f'[class_scheme:validation] reordering to match training: '
-                  f'{val_ds.classes} -> {train_ds.classes}')
-            align_dataset_to_classes(val_ds, train_ds.classes)
-        if list(val_ds.classes) != list(train_ds.classes):
-            raise ValueError(f'train/val class mismatch: {train_ds.classes} vs {val_ds.classes}')
-        bs = config_json['hparams']['batch_size']
-        nw = config_json['dataloader']['num_workers']
-        kw = {'pin_memory': True, 'persistent_workers': True} if nw > 0 else {}
-        return val_ds, DataLoader(val_ds, batch_size=bs, shuffle=False,
-                                  num_workers=nw, drop_last=False, **kw)
-
-    subs = [_load_one(d) for d in directories]
-    if len(subs) == 1:
-        dataset = subs[0]
-    else:
-        canon = config_json.get('canonical_classes') or list(subs[0].classes)
-        for ds in subs:
-            align_dataset_to_classes(ds, canon)
-        dataset = CombinedDataset(subs)
-
-    # The TRAINER splits on hparams.seed (trainMagicianVisionClassifierTorch.py:90), so this
-    # must too or a config where the two differ silently rebuilds a DIFFERENT validation set
-    # and reports numbers for the wrong split. They are both 42 in every config written so
-    # far, which is why this never surfaced.
-    seed = config_json['hparams'].get('seed', config_json['dataloader']['seed'])
-    if seed != config_json['dataloader'].get('seed'):
-        print(f"NOTE hparams.seed={seed} != dataloader.seed={config_json['dataloader'].get('seed')}; "
-              f"using hparams.seed to match the trainer's split.")
-    val_split = config_json['dataloader']['validation_split']
-    batch_size = config_json['hparams']['batch_size']
-    num_workers = config_json['dataloader']['num_workers']
-
-    torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
-    pl.seed_everything(seed, workers=True)
-
-    assert config_json['dataloader'].get('frame_disjoint_split'), \
-        'this run did not use a frame-disjoint split; rebuild logic would differ'
-    _, va_idx = frame_disjoint_split(
-        dataset, val_split, seed,
-        frozen_val_frames=config_json['dataloader'].get('frozen_val_frames') or None)
-    val_dataset = Subset(dataset, va_idx)
-
-    loader_kwargs = {}
-    if num_workers > 0:
-        loader_kwargs = {"pin_memory": True, "persistent_workers": True,
-                         "prefetch_factor": int(config_json['dataloader'].get('prefetch_factor', 4))}
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, drop_last=False, **loader_kwargs)
-    return dataset, val_loader
+    test_dataset_split.py asserts the shared chain reproduces this function's previous
+    output tile for tile -- same frames, same labels, same order -- on every distinct
+    dataset chain in the config corpus.
+    """
+    split = build_val_only(config_json)
+    return split.dataset, val_dataloader(config_json, split)
 
 
 def miss_at_fa(curve_path, targets=(0.05, 0.10)):

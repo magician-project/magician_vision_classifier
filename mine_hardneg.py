@@ -37,8 +37,7 @@ import readDataAnnotator as rda          # noqa: E402
 from datasetCreator import H5DatasetWriter  # noqa: E402
 
 from Config import load_hyperparameters   # noqa: E402
-from ClassScheme import apply_class_scheme  # noqa: E402
-from DatasetConverter import HDF5Dataset  # noqa: E402
+from Datasets import clean_class_index, load_training_dataset  # noqa: E402
 from LitClassifier import Classifier      # noqa: E402
 
 # Verified certified, defect-free, operational-exposure folders excluded from Aug26_78K.
@@ -85,18 +84,13 @@ def frame_is_clean(png):
 def build_model(cfg, ckpt):
     """Mirror eval_coverage.py: class space from the training h5 + run's scheme,
     Classifier rebuilt with the run's channel flags, checkpoint loaded."""
-    train_dir = cfg["training_dataset"]
-    train_dir = train_dir[0] if isinstance(train_dir, list) else train_dir
-    ds = HDF5Dataset(f"{train_dir}/dataset.h5")
-    ds.metadata = None
-    apply_class_scheme(ds, cfg, label="mine")
+    # Shared class-space loader (Datasets.load_training_dataset) -- the same call the
+    # trainer makes, so the index space here is the one the checkpoint predicts in.
+    ds = load_training_dataset(cfg, label="mine")
     classes = list(ds.classes)
-    ds.file.close()
-    # Exact match: 'class_clean' -- NOT a substring test, which would wrongly match
-    # 'class_WeldingClassAClean' (a vestigial class the model never predicts, so every
-    # tile would look like a defect and 100% would be "mined").
-    clean_id = next((i for i, c in enumerate(classes)
-                     if c == "class_clean" or c.lower() == "clean"), None)
+    if hasattr(ds, "file"):
+        ds.file.close()
+    clean_id = clean_class_index(classes)
     if clean_id is None:
         raise SystemExit(f"no exact class_clean in class space: {classes}")
 

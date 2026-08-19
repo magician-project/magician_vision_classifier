@@ -25,9 +25,8 @@ import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from ClassScheme import apply_class_scheme
-from Config import checkIfFileExists, load_hyperparameters
-from Datasets import _dataset_source_frames
+from Config import load_hyperparameters
+from Datasets import _dataset_source_frames, clean_class_index, load_training_dataset
 from LitClassifier import Classifier
 
 # The coverage carve-out. Resolved rather than hardcoded to a root path: the file now lives
@@ -40,15 +39,14 @@ COVERAGE = find_artifact('val_coverage_frames.json') or 'val_coverage_frames.jso
 
 
 def build_coverage_loader(config_json, coverage_path=COVERAGE):
-    """The coverage frames, taken from the TRAINING dump with the run's own class scheme."""
-    train_dir = config_json['training_dataset']
-    train_dir = train_dir[0] if isinstance(train_dir, list) else train_dir
-    h5 = f'{train_dir}/dataset.h5'
-    assert checkIfFileExists(h5), f'expected an h5 dataset at {h5}'
-    from DatasetConverter import HDF5Dataset
-    ds = HDF5Dataset(h5)
-    ds.metadata = None
-    apply_class_scheme(ds, config_json, label='coverage')
+    """The coverage frames, taken from the TRAINING dump with the run's own class scheme.
+
+    The load-and-apply-the-scheme prefix is Datasets.load_training_dataset -- the same
+    call the trainer and the scorers make. This is not the validation split (the coverage
+    set is a named carve-out, not a seeded split), but it must agree on CLASS ORDER with
+    the run being scored, and that is exactly what the shared loader guarantees.
+    """
+    ds = load_training_dataset(config_json, label='coverage')
 
     payload = json.load(open(coverage_path))
     frames = set(payload['frames'])
@@ -72,11 +70,8 @@ def main():
 
     ds, subset, payload = build_coverage_loader(cfg)
     class_names = list(ds.classes)
-    # Exact match -- see the note in score_checkpoints.py. Harmless here (cleanID only
-    # feeds the model rebuild), but the same idiom is fatal wherever defect_mass is
-    # computed, so it is fixed identically in both places.
-    cleanID = next((i for i, c in enumerate(class_names)
-                    if c.lower() in ('class_clean', 'clean')), None)
+    # Exact match, shared: a substring test also matches 'class_WeldingClassAClean'.
+    cleanID = clean_class_index(class_names)
     if cleanID is None:
         sys.exit(f'no clean class among {class_names}')
 

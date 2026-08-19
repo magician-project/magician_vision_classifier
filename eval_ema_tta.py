@@ -11,11 +11,10 @@ s1=10.19, s2=10.44.
 import json, glob, sys
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 
 from Config import load_hyperparameters
-from ClassScheme import apply_class_scheme, align_dataset_to_classes
-from DatasetConverter import HDF5Dataset
+from Datasets import (build_val_only, clean_class_index, load_training_dataset,
+                      val_dataloader)
 from LitClassifier import Classifier
 
 CFG = 'pol_pfc4_s42.json'
@@ -29,10 +28,12 @@ def views(x):
     yield torch.rot90(x, 3, dims=(-2,-1))[:, [2,3,0,1]]    # -90
 
 def build_model(cfg, state):
-    tr=cfg['training_dataset']; tr=tr[0] if isinstance(tr,list) else tr
-    ds=HDF5Dataset(f'{tr}/dataset.h5'); ds.metadata=None; apply_class_scheme(ds,cfg,label='ema')
-    classes=list(ds.classes); ds.file.close()
-    clean_id=next(i for i,c in enumerate(classes) if c=='class_clean')
+    # Shared class-space loader -- the trainer's own call, so these indices are the ones
+    # the checkpoints predict in.
+    ds=load_training_dataset(cfg, label='ema', verbose=False)
+    classes=list(ds.classes)
+    if hasattr(ds,'file'): ds.file.close()
+    clean_id=clean_class_index(classes)
     # Single source of truth (LitClassifier.Classifier.from_config). This block omitted
     # Max/Min/RangePolarization -- each of which adds an input channel, so those runs died
     # in the stem -- and the whole CustomCNN ladder. pretrained/seed_pretrained_stem stay
@@ -43,9 +44,14 @@ def build_model(cfg, state):
     return m, classes, clean_id
 
 def val_loader(cfg, classes):
-    v=HDF5Dataset(f"{cfg['validation_dataset']}/dataset.h5"); v.metadata=None
-    apply_class_scheme(v,cfg,label='val'); align_dataset_to_classes(v,classes)
-    return DataLoader(v,batch_size=512,shuffle=False,num_workers=8)
+    """The run's validation split, by import. This used to re-derive it: load the val h5,
+    apply the scheme, align onto the training class order. Same chain the trainer runs, so
+    it is now the same code -- see Datasets.build_val_only. Batch size and worker count now
+    come from the config instead of being hardcoded 512/8; neither changes what is scored,
+    since the loader does not shuffle and does not drop the last batch."""
+    split=build_val_only(cfg, verbose=False)
+    assert list(split.val.classes)==list(classes), 'val class order != training class order'
+    return val_dataloader(cfg, split)
 
 def pclean(model, loader, clean_id, dev, tta):
     model.eval().to(dev); ps=[]; ys=[]
