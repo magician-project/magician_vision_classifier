@@ -1359,15 +1359,13 @@ class ClassifierPnm:
         else:
             self.device = 'cpu'
         #--------------------------------------------------------------
-        self.base_channels = 32
-        if  'base_channels' in self.cfg['hparams']:
-          self.base_channels = self.cfg['hparams']['base_channels']
-        print("Base channels ", self.base_channels)
-        #--------------------------------------------------------------
-        self.final_dense_layer=512
-        if  'final_dense_layer' in self.cfg['hparams']:
-                  self.final_dense_layer = self.cfg['hparams']['final_dense_layer']
-        print("Final Dense Layer ", self.final_dense_layer)
+        # Logged, not stored. from_config reads both from hparams with these same
+        # defaults; keeping them as attributes would be dead state that reads like it
+        # configures the model -- which is how the hand-built kwargs drifted in the
+        # first place.
+        _hp = self.cfg['hparams']
+        print(f"Base channels {_hp.get('base_channels', 32)} / "
+              f"final dense layer {_hp.get('final_dense_layer', 512)}")
         #-----------------------------------------------------------------
         self.model = self.load_model()
         # Operating curve for this model, so the runtime can report what a gate
@@ -1439,7 +1437,7 @@ class ClassifierPnm:
         #   lr=0.1            inert at inference -- no optimizer is ever configured -- but
         #                     kept verbatim so this conversion changes nothing observable.
         # base_channels/final_dense_layer are NOT passed: from_config reads them from
-        # hparams with the same 32/512 defaults self.base_channels already uses.
+        # hparams with the same 32/512 defaults the old block applied by hand.
         model = Classifier.from_config(self.cfg,
                                        num_classes=len(self.classes),
                                        lr=0.1,
@@ -1593,15 +1591,9 @@ class ClassifierPnm:
             print("Failed reading config:", repr(e))
             return False
         #--------------------------------------------------------------
-        self.base_channels = 32
-        if  'base_channels' in self.cfg['hparams']:
-          self.base_channels = self.cfg['hparams']['base_channels']
-        print("Base channels ", self.base_channels)
-        #--------------------------------------------------------------
-        self.final_dense_layer=512
-        if  'final_dense_layer' in self.cfg['hparams']:
-                  self.final_dense_layer = self.cfg['hparams']['final_dense_layer']
-        print("Final Dense Layer ", self.final_dense_layer)
+        _hp = self.cfg['hparams']   # logged only -- see the note in __init__
+        print(f"Base channels {_hp.get('base_channels', 32)} / "
+              f"final dense layer {_hp.get('final_dense_layer', 512)}")
         #-----------------------------------------------------------------
         self.model_path = model_path
         print(f"Reloading model '{name}' from {directoryPath} ...")

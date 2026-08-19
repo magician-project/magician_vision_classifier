@@ -29,19 +29,16 @@ def views(x):
     yield torch.rot90(x, 3, dims=(-2,-1))[:, [2,3,0,1]]    # -90
 
 def build_model(cfg, state):
-    h=cfg['hparams']
     tr=cfg['training_dataset']; tr=tr[0] if isinstance(tr,list) else tr
     ds=HDF5Dataset(f'{tr}/dataset.h5'); ds.metadata=None; apply_class_scheme(ds,cfg,label='ema')
     classes=list(ds.classes); ds.file.close()
     clean_id=next(i for i,c in enumerate(classes) if c=='class_clean')
-    m=Classifier(model=cfg['model'],num_classes=len(classes),tile_size=h['tile_size'],
-        dropout_rate=h['dropout_rate'],base_channels=h.get('base_channels',32),
-        final_dense_layer=h.get('final_dense_layer',512),clean_class=clean_id,
-        penalize_false_clean=float(cfg.get('penalize_false_clean',0.0)),
-        AoLP=h.get('AoLP',False),DoLP=h.get('DoLP',False),
-        Unpolarized=bool(h.get('Unpolarized',h.get('unpolarized',False))),
-        monochrome=h.get('monochrome',False),pretrained=False,
-        seed_pretrained_stem=False,timm_stem_stride=h.get('timm_stem_stride',None))
+    # Single source of truth (LitClassifier.Classifier.from_config). This block omitted
+    # Max/Min/RangePolarization -- each of which adds an input channel, so those runs died
+    # in the stem -- and the whole CustomCNN ladder. pretrained/seed_pretrained_stem stay
+    # forced off: the state dict below overwrites everything, so a download buys nothing.
+    m=Classifier.from_config(cfg,num_classes=len(classes),clean_class=clean_id,
+                             pretrained=False,seed_pretrained_stem=False)
     m.load_state_dict(state)
     return m, classes, clean_id
 

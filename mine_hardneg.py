@@ -85,7 +85,6 @@ def frame_is_clean(png):
 def build_model(cfg, ckpt):
     """Mirror eval_coverage.py: class space from the training h5 + run's scheme,
     Classifier rebuilt with the run's channel flags, checkpoint loaded."""
-    h = cfg["hparams"]
     train_dir = cfg["training_dataset"]
     train_dir = train_dir[0] if isinstance(train_dir, list) else train_dir
     ds = HDF5Dataset(f"{train_dir}/dataset.h5")
@@ -101,21 +100,14 @@ def build_model(cfg, ckpt):
     if clean_id is None:
         raise SystemExit(f"no exact class_clean in class space: {classes}")
 
-    model = Classifier(
-        model=cfg["model"], num_classes=len(classes), tile_size=h["tile_size"],
-        dropout_rate=h["dropout_rate"], base_channels=h.get("base_channels", 32),
-        final_dense_layer=h.get("final_dense_layer", 512), clean_class=clean_id,
-        penalize_false_clean=float(cfg.get("penalize_false_clean", 0.0)),
-        AoLP=h.get("AoLP", False), DoLP=h.get("DoLP", False),
-        Unpolarized=bool(h.get("Unpolarized", h.get("unpolarized", False))),
-        MaxPolarization=h.get("MaxPolarization", False),
-        MinPolarization=h.get("MinPolarization", False),
-        RangePolarization=h.get("RangePolarization", False),
-        monochrome=h.get("monochrome", False),
-        pretrained=bool(h.get("pretrained", True)),
-        seed_pretrained_stem=bool(h.get("seed_pretrained_stem", True)),
-        timm_stem_stride=h.get("timm_stem_stride", None),
-    )
+    # Single source of truth (LitClassifier.Classifier.from_config). This block had all
+    # seven derived-channel flags and timm_stem_stride, but not the CustomCNN ladder
+    # (custom_channels/custom_res_blocks/custom_wavelet_pools/custom_wavelet_stem), so
+    # mining with a custom-CNN run died in load_state_dict on a conv1 shape mismatch.
+    # pretrained=False: strict load_state_dict below overwrites every parameter, so
+    # fetching ImageNet weights first is a download for nothing.
+    model = Classifier.from_config(cfg, num_classes=len(classes),
+                                   clean_class=clean_id, pretrained=False)
     model.load_state_dict(torch.load(ckpt, weights_only=False, map_location="cpu")["state_dict"])
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(dev).eval()
