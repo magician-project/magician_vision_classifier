@@ -24,3 +24,8 @@ fzv2atto_timm_convnextv2_atto	fzv2atto_timm_convnextv2_atto	259fc61ae980	b5b9cc6
 fzv2femto_timm_convnextv2_femto	fzv2femto_timm_convnextv2_femto	259fc61ae980	b5b9cc6	backfilled-precodechange
 fzv2pico_timm_convnextv2_pico	fzv2pico_timm_convnextv2_pico	259fc61ae980	b5b9cc6	backfilled-precodechange
 fzspnas_timm_spnasnet_100	fzspnas_timm_spnasnet_100	259fc61ae980	53f451b	2026-08-18T07:55:56+00:00
+fzcnxtiny_convnext_tiny	fzcnxtiny_convnext_tiny	259fc61ae980	53f451b	2026-08-18T11:24:47+00:00
+fzregy800_regnet_y_800mf	fzregy800_regnet_y_800mf	259fc61ae980	53f451b	2026-08-18T16:36:54+00:00
+fzlite0_timm_efficientnet_lite0	fzlite0_timm_efficientnet_lite0	259fc61ae980	53f451b	2026-08-18T20:48:51+00:00
+fzeffb0_efficientnet_b0	fzeffb0_efficientnet_b0	259fc61ae980	53f451b	2026-08-19T00:42:34+00:00
+fzv2nano_timm_convnextv2_nano	fzv2nano_timm_convnextv2_nano	259fc61ae980	53f451b	2026-08-19T05:19:33+00:00

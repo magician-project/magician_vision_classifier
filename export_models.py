@@ -39,6 +39,20 @@ ARCHIVE CONTENTS
 Sidecars are included when present and reported when absent -- a model without a
 `gate` or a threshold curve can still be packaged, but the caller is told.
 
+TIMING: THE TRAINER CANNOT PACKAGE A COMPLETE ARCHIVE ON ITS OWN
+---------------------------------------------------------------
+`_threshold_curve.json` is written by `score_checkpoints.py` and `_coverage.json` by
+`eval_coverage.py` -- both of which run AFTER the trainer exits. So the archive the trainer
+builds necessarily lacks them, and reports them as missing sidecars. That is not a bug in
+either place; it is the order of the pipeline.
+
+To get archives with the full sidecar set, re-export once the pipeline has finished:
+
+    python export_models.py --apply --force
+
+Re-exporting is cheap (the weights are stored uncompressed, not recompressed) and this is
+the single implementation either way, so the contents stay consistent.
+
 Usage:
     python export_models.py                       # list runs missing an archive
     python export_models.py --apply
