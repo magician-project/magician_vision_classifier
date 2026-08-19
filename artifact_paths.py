@@ -17,20 +17,41 @@ them afterwards, under an age guard so a running job's outputs are never moved m
 
 import glob
 import os
-from functools import lru_cache
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ARCHIVE = os.path.join(ROOT, 'experiments')
 
 
-@lru_cache(maxsize=1)
-def _index():
-    """name -> path, for everything under experiments/. Built once per process."""
+_INDEX = {'map': None}
+
+
+def _build_index():
     idx = {}
     for p in glob.glob(os.path.join(ARCHIVE, '**', '*'), recursive=True):
         if os.path.isfile(p):
             idx.setdefault(os.path.basename(p), p)
+    _INDEX['map'] = idx
     return idx
+
+
+def _index(allow_rebuild=True):
+    """name -> path, for everything under experiments/.
+
+    Cached for HITS, rebuilt on a MISS. This was an lru_cache, i.e. frozen at first use --
+    and the writers now create artifacts *during* a run. score_checkpoints.py wrote epoch
+    0's curve, read it back (index built here, epoch 0 present), wrote epoch 1's curve, and
+    then could not find it: a file plainly on disk resolved to None because it post-dated
+    the snapshot. A stale-cache miss is the worst kind of failure here, because callers
+    treat None as "this run has no curve yet" and silently drop it from a report.
+
+    A first attempt rate-limited the rebuild, which reproduced the same bug whenever the
+    write and the read were less than the limit apart -- which is exactly the case that
+    matters. So a miss always rebuilds; the walk is ~10 ms over experiments/ and only
+    happens when a lookup fails.
+    """
+    if _INDEX['map'] is None or allow_rebuild:
+        return _build_index()
+    return _INDEX['map']
 
 
 def _timm_slash_variants(name):
@@ -60,7 +81,12 @@ def find_artifact(name):
         p = os.path.join(ROOT, cand)
         if os.path.exists(p):
             return p
-    return _index().get(os.path.basename(name))
+    base = os.path.basename(name)
+    hit = _index(allow_rebuild=False).get(base)
+    if hit is not None and os.path.exists(hit):
+        return hit
+    # Miss, or a stale entry pointing at something since moved: rebuild and retry once.
+    return _index().get(base)
 
 
 def exists(name):
