@@ -94,3 +94,59 @@ parameter immediately afterwards, so fetching ImageNet weights first is a networ
 
 `load_for_eval()` was previously untested against a real file. It now round-trips a real
 `anc_convnext_pico` checkpoint end to end.
+
+### 2026-08-19 — the validation split and the KPI each become one definition
+
+Fingerprint `bdf296e227da` -> `bf82866e7d44`. Two protocol files changed (`Datasets.py`,
+`score_checkpoints.py`, `eval_coverage.py`, `trainMagicianVisionClassifierTorch.py`), and
+both changes are asserted-equivalent rather than believed-equivalent.
+
+**The validation split** was rebuilt by hand in the trainer and mirrored in
+`score_checkpoints.py` and `eval_ema_tta.py`, coupled by comments naming line numbers in
+another file — line numbers that were already stale. `eval_coverage.py` and
+`mine_hardneg.py` shared the class-space prefix of the same chain. It now lives in
+`Datasets.build_train_val` / `build_val_only` / `load_training_dataset`.
+
+One subtlety that had to be preserved exactly: the trainer seeds **after** any RAM preload
+and **before** the split, and the global RNG state that call leaves behind is what the model
+is initialised from. Moving it or making it conditional would change the weights a run
+starts with, not just which tiles are held out. It is now unconditional inside
+`build_train_val`, at the same point in the sequence.
+
+**The KPI** — miss@FA, the number every decision in PLAN.md turns on — had **eight**
+implementations, not the five first counted: `phase2_select.py`, `score_checkpoints.py`,
+`eval_domain_split.py` (twice), `eval_ema_tta.py`, and inline copies in `eval_coverage.py`,
+`evaluateDetection.py` and `detection_ensemble.py`. Seven reporting tools imported it from
+`phase2_select`, a one-off selection script that therefore could not be moved or deleted.
+All now call `Metrics.py`.
+
+They were not eight copies of one thing. They were **three estimators**:
+
+| form | rule | used by |
+|---|---|---|
+| curve | interpolate `detected` at target FA from a saved sweep | phase2_select, score_checkpoints |
+| quantile | threshold at the (1-fa) quantile of clean scores | eval_domain_split ×2, eval_coverage, evaluateDetection, detection_ensemble |
+| constrained max | best detection subject to false_alarm <= fa | eval_ema_tta |
+
+The two curve implementations agree **exactly** (229 real curves, 0.000000000000 pp). The
+quantile and constrained-maximum forms **do not**, and the gap is not academic:
+
+```
+distribution      fa   quantile     sweep   gap (pp)  realised FA
+continuous      0.05     64.750    64.750      0.000       0.0500
+2dp ties        0.05     65.325    66.950      1.625       0.0512  <-- over budget
+1dp ties        0.10     40.425    59.325     18.900       0.1593  <-- over budget
+```
+
+The last column is the finding. Under ties the **quantile threshold overshoots the
+false-alarm budget the KPI claims to match** — at 1dp ties it reports a miss rate at a
+nominal FA of 10% while actually firing on 15.9% of clean tiles. The constrained-maximum
+rule refuses to exceed the budget, which is why it reports a worse (honest) number. Softmax
+outputs are float32 and mostly continuous, where the gap is ~0.025 pp, but they saturate
+near 0 and 1 — exactly where ties live.
+
+Both estimators are kept, named differently, so the choice is visible at the call site
+instead of being an accident of which file the function was copied from. **No published
+number changes**: every converted site keeps the estimator it already used. Whether to
+unify on the constrained-maximum rule is a decision to make deliberately, with the table
+above in hand, and would require re-deriving affected figures.

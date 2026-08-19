@@ -29,7 +29,7 @@ import os
 from statistics import mean, stdev
 
 from artifact_paths import find_artifact
-from phase2_select import miss_at_fa
+from Metrics import miss_at_fa
 
 SEEDS = (42, 1337, 7)
 ARMS = ['base', 'dolp', 'mono', 'stride2']

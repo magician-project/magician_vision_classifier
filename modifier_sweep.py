@@ -25,7 +25,7 @@ import os
 import sys
 from statistics import mean, stdev
 
-from phase2_select import miss_at_fa
+from Metrics import miss_at_fa
 
 SEEDS = (42, 1337, 7)
 ARMS = ['base', 'nodolp', 'aolp', 'mmr', 'unpol', 'mono', 'stride2']

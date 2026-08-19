@@ -33,33 +33,15 @@ import json
 import os
 import sys
 
+from Metrics import miss_at_fa  # noqa: F401  (re-exported for older callers)
+
 RESULT_KEYS = ('confusion_matrix', 'gate', 'model_md5',
                'best_threshold_balanced', 'best_threshold_kpi', 'best_threshold_deployment')
 
 
-def miss_at_fa(curve_path, targets=(0.05, 0.10)):
-    """miss rate (%) at matched false alarm, linearly interpolated from the sweep."""
-    d = json.load(open(curve_path))
-    pts = (d.get('sweeps') or {}).get('defect_mass') or d['sweep']
-    fa = [p['false_alarm'] for p in pts]
-    det = [p['detected'] for p in pts]
-    order = sorted(range(len(fa)), key=lambda i: fa[i])
-    fa = [fa[i] for i in order]
-    det = [det[i] for i in order]
-
-    def interp(t):
-        if t <= fa[0]:
-            return det[0]
-        if t >= fa[-1]:
-            return det[-1]
-        for i in range(1, len(fa)):
-            if fa[i] >= t:
-                span = fa[i] - fa[i - 1]
-                w = 0.0 if span == 0 else (t - fa[i - 1]) / span
-                return det[i - 1] + w * (det[i] - det[i - 1])
-        return det[-1]
-
-    return {t: (1.0 - interp(t)) * 100.0 for t in targets}
+# miss_at_fa now lives in Metrics.py. It used to be DEFINED here, and
+# model_sweep_report.py and modifier_sweep.py imported the project's KPI from this
+# one-off selection script -- which meant this file could never be moved or deleted.
 
 
 def collect(prefixes=('tz', 'p1n', 'p1b', 'p2', 'p3')):

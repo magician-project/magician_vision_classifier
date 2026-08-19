@@ -28,6 +28,7 @@ import torch
 
 from Config import load_hyperparameters
 from Datasets import build_val_only, val_dataloader
+from Metrics import miss_at_fa
 from Evaluation import run_confusion_and_threshold_sweep
 from LitClassifier import Classifier
 
@@ -48,14 +49,7 @@ def build_val_loader(config_json):
     return split.dataset, val_dataloader(config_json, split)
 
 
-def miss_at_fa(curve_path, targets=(0.05, 0.10)):
-    import json
-    d = json.load(open(curve_path))
-    pts = (d.get('sweeps') or {}).get('defect_mass') or d['sweep']
-    fa = np.array([p['false_alarm'] for p in pts], float)
-    det = np.array([p['detected'] for p in pts], float)
-    o = np.argsort(fa); fa, det = fa[o], det[o]
-    return {t: (1.0 - float(np.interp(t, fa, det))) * 100.0 for t in targets}
+# The KPI lives in Metrics.py -- this file used to carry its own np.interp copy.
 
 
 def main():

@@ -32,7 +32,7 @@ import sys
 from statistics import mean
 
 from artifact_paths import find_artifact
-from phase2_select import miss_at_fa
+from Metrics import miss_at_fa
 
 TARGET_HZ, GPU_SCALE = 23.0, 1.6
 COV_SD, FAC_SD = 0.43, 1.01          # anchor-arm seed sd, n=3, 2026-08-12

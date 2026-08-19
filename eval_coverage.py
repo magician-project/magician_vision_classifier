@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader, Subset
 
 from Config import load_hyperparameters
 from Datasets import _dataset_source_frames, clean_class_index, load_training_dataset
+from Metrics import detection_at_fa, fa_threshold
 from LitClassifier import Classifier
 
 # The coverage carve-out. Resolved rather than hardcoded to a root path: the file now lives
@@ -53,7 +54,7 @@ def build_coverage_loader(config_json, coverage_path=COVERAGE):
     srcs = np.array(_dataset_source_frames(ds))
     idx = np.where(np.isin(srcs, list(frames)))[0].tolist()
     if not idx:
-        sys.exit(f'{coverage_path} matched no frames in {h5}')
+        sys.exit(f'{coverage_path} matched no frames in {config_json["training_dataset"]}')
     print(f'[coverage] {len(idx):,} tiles from {len(frames):,} held-out frames')
     return ds, Subset(ds, idx), payload
 
@@ -143,14 +144,16 @@ def main():
     # and the two numbers can differ enormously on classes that look alike. The threshold
     # is calibrated on the coverage set's OWN clean tiles so the false-alarm rate is
     # matched here, exactly as miss@FA5 matches it on the factory val.
-    clean_mass = np.sort(mass[truth == cleanID])
+    # Shared KPI (Metrics). This block used to compute the matched-FA threshold and the
+    # per-class detection inline -- a sixth copy of the project's headline number.
+    is_clean = truth == cleanID
     det_at = {}
     for fa in (0.05, 0.10):
-        if len(clean_mass) == 0:
+        if not is_clean.any():
             det_at[fa] = None
             continue
-        thr = float(np.quantile(clean_mass, 1.0 - fa))
-        det_at[fa] = (thr, {i: float((mass[truth == i] >= thr).mean() * 100.0)
+        thr = fa_threshold(mass, is_clean, fa)
+        det_at[fa] = (thr, {i: detection_at_fa(mass, is_clean, truth == i, fa)
                             for i in range(n) if support[i] and i != cleanID})
     print(f'[coverage] FA-matched thresholds from {len(clean_mass):,} coverage clean tiles: '
           + ', '.join(f'FA{int(f*100)} -> {det_at[f][0]:.4f}' for f in (0.05, 0.10)))

@@ -6,6 +6,7 @@ the subset; detector score = 1 - mean P(clean). Also splits by domain (FORTH vs
 Altinay = the Camera V2 pilot target) using the exact seed42 held-out order."""
 import sys, json, numpy as np
 from sklearn.metrics import roc_auc_score
+from Metrics import miss_at_fa_from_scores
 
 NPZ = sys.argv[1] if len(sys.argv) > 1 else None
 META = NPZ.replace(".npz", ".json")
@@ -40,10 +41,10 @@ assert len(va) == len(y)
 
 def metrics(score, mask):
     au = roc_auc_score(isdef[mask].astype(int), score[mask])
+    # Shared KPI (Metrics.miss_at_fa_from_scores); fa is a fraction, not a percentage.
     def miss(fa):
-        thr = np.quantile(score[mask & ~isdef], 1 - fa/100.0)
-        return 100.0*(~(score[mask & isdef] >= thr)).mean()
-    return au, miss(5), miss(10)
+        return miss_at_fa_from_scores(score, mask & ~isdef, mask & isdef, fa)
+    return au, miss(0.05), miss(0.10)
 
 def ens_score(idx):                          # idx: tuple of model indices
     return 1.0 - pclean[list(idx)].mean(axis=0)

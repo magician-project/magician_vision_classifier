@@ -31,7 +31,7 @@ import re
 from statistics import mean
 
 from artifact_paths import find_artifact
-from phase2_select import miss_at_fa
+from Metrics import miss_at_fa
 
 # tag -> (model, note); mirrors model_sweep.CANDIDATES
 from model_sweep import CANDIDATES, REPARAM

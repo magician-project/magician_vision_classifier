@@ -29,6 +29,7 @@ The no-argument path is unchanged and still reproduces the 13-class mix_* number
 import json, os, sys, numpy as np, torch
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import roc_auc_score
+from Metrics import miss_at_fa_from_scores
 from DatasetConverter import HDF5Dataset
 from trainMagicianVisionClassifierTorch import (
     merge_dataset_classes, drop_dataset_classes, resolve_auto_drops,
@@ -117,12 +118,12 @@ def main_models(pths):
         s = _score(clf, Subset(ds, va_idx.tolist()), CLEAN)
         del clf; torch.cuda.empty_cache()
 
+        # Shared KPI (Metrics.miss_at_fa_from_scores). `fa` is a FRACTION here; this
+        # block took 5/10 and divided by 100 internally while every other caller passed
+        # 0.05/0.10 -- two conventions for one argument, which is a factor-of-20 waiting
+        # to happen.
         def miss_at_fa(mask, fa):
-            clean = mask & ~isdef
-            if clean.sum() == 0 or (mask & isdef).sum() == 0:
-                return float("nan")
-            thr = np.quantile(s[clean], 1 - fa / 100.0)
-            return 100.0 * (~(s >= thr)[mask & isdef]).mean()
+            return miss_at_fa_from_scores(s, mask & ~isdef, mask & isdef, fa)
 
         name = os.path.basename(pth)
         print(f"\n=== {name}  ({len(classes)} classes, mono="
@@ -136,7 +137,7 @@ def main_models(pths):
                 continue
             nd = int(isdef[m].sum())
             au = roc_auc_score(isdef[m].astype(int), s[m]) if 0 < nd < int(m.sum()) else float("nan")
-            r[n] = (au, miss_at_fa(m, 5), miss_at_fa(m, 10), int(m.sum()), nd)
+            r[n] = (au, miss_at_fa(m, 0.05), miss_at_fa(m, 0.10), int(m.sum()), nd)
             print(f"    {n:28} {int(m.sum()):8d} {nd:7d} {au:8.4f} "
                   f"{r[n][1]:8.1f} {r[n][2]:8.1f}")
         rows[name] = r
@@ -165,12 +166,11 @@ def main():
 
     val = Subset(ds, va_idx.tolist())
 
+    # Shared KPI (Metrics.miss_at_fa_from_scores) -- see the note above; `fa` is a
+    # fraction. This copy also had no empty-slice guard, so a domain with no clean tiles
+    # raised instead of reporting nan.
     def miss_at_fa(s, mask, fa):
-        clean = mask & ~isdef
-        thr = np.quantile(s[clean], 1 - fa / 100.0)
-        fire = s >= thr
-        dfk = mask & isdef
-        return 100.0 * (~fire[dfk]).mean()
+        return miss_at_fa_from_scores(s, mask & ~isdef, mask & isdef, fa)
 
     print(f"\n{'backbone':20}| {'FORTH (non-Altinay)':^28}| {'Altinay (target)':^28}")
     print(f"{'':20}| {'AUROC':>7} {'miss@5':>7} {'miss@10':>7} | "
@@ -192,7 +192,7 @@ def main():
         r = {}
         for name, m in (("forth", dom == "forth"), ("altinay", dom == "altinay")):
             au = roc_auc_score(isdef[m].astype(int), s[m])
-            r[name] = (au, miss_at_fa(s, m, 5), miss_at_fa(s, m, 10))
+            r[name] = (au, miss_at_fa(s, m, 0.05), miss_at_fa(s, m, 0.10))
         rows[bb] = r
         f, a = r["forth"], r["altinay"]
         print(f"{bb:20}| {f[0]:7.4f} {f[1]:7.1f} {f[2]:7.1f} | "

@@ -59,6 +59,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from sklearn.metrics import roc_auc_score
+from Metrics import fa_threshold
 
 from calculateOptimalEnsemble import _instantiate_classifier, _load_weights, _load_dataset
 from trainMagicianVisionClassifierTorch import metadata_collate_fn
@@ -175,9 +176,12 @@ def main():
             print("WARNING: --split-frames requested but no frame metadata; "
                   "evaluating on the full set.")
 
+    # Shared KPI (Metrics.fa_threshold). Only the THRESHOLD is shared here: this tool
+    # deliberately picks it on one frame-disjoint half and reports on the other, so the
+    # miss rate below is computed against `rep_mask`, not against the tiles that set the
+    # threshold. `budget` stays a percentage at this call site because it is a CLI arg.
     def thr_for_fp(mask, budget):
-        cm = (~isdef) & mask
-        return np.quantile(s[cm], 1 - budget / 100.0)
+        return fa_threshold(s, (~isdef) & mask, budget / 100.0)
 
     auroc = roc_auc_score(isdef[rep_mask].astype(int), s[rep_mask])
     print(f"\nDefect-vs-clean AUROC (report set): {auroc:.4f}")

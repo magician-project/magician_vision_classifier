@@ -15,6 +15,7 @@ import torch
 from Config import load_hyperparameters
 from Datasets import (build_val_only, clean_class_index, load_training_dataset,
                       val_dataloader)
+from Metrics import miss_at_fa_sweep
 from LitClassifier import Classifier
 
 CFG = 'pol_pfc4_s42.json'
@@ -70,13 +71,12 @@ def pclean(model, loader, clean_id, dev, tta):
     return np.concatenate(ps), np.concatenate(ys)
 
 def miss_at(pcl, y, clean_id, fa):
-    mass=1.0-pcl; is_clean=(y==clean_id); is_def=~is_clean
-    # sweep thresholds; miss = 1 - max(detected) s.t. false_alarm <= fa
-    best=0.0
-    for t in np.unique(mass):
-        fa_r=(mass[is_clean]>=t).mean(); det=(mass[is_def]>=t).mean()
-        if fa_r<=fa and det>best: best=det
-    return 100*(1-best)
+    """Shared KPI (Metrics.miss_at_fa_sweep). NOTE this script uses the CONSTRAINED-
+    MAXIMUM estimator -- best detection subject to false_alarm <= fa -- not the (1-fa)
+    quantile the other tools use. Kept as-is so this conversion is a no-op; the two agree
+    on smooth score distributions and diverge on ties. See Metrics.py."""
+    mass=1.0-pcl; is_clean=(y==clean_id)
+    return miss_at_fa_sweep(mass, is_clean, ~is_clean, fa)
 
 def main():
     cfg=load_hyperparameters(CFG)
