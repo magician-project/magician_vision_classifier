@@ -189,6 +189,10 @@ def main():
     ap.add_argument('--dry-run', action='store_true', default=True)
     ap.add_argument('--min-age-hours', type=float, default=6.0,
                     help='never move a file younger than this (protects a running queue)')
+    ap.add_argument('--run', action='append',
+                    help='only file artifacts whose run family matches (repeatable). Use '
+                         'with --min-age-hours 0 to tidy one finished run without '
+                         'touching anything else.')
     args = ap.parse_args()
     apply = args.apply
 
@@ -220,6 +224,9 @@ def main():
             skipped[f'younger than {args.min_age_hours} h (in-flight run)'] += 1
             continue
         run = run_name(f, backbones)
+        if args.run and run not in args.run:
+            skipped['other runs (--run filter)'] += 1
+            continue
         plan[os.path.join(DEST, campaign(run), run)].append(f)
 
     # The timm-slash directories, renamed to the sanitised form on the way out.
@@ -232,6 +239,9 @@ def main():
             skipped['run config (an INPUT -- export + restart-skip read these)'] += 1
             continue
         run = run_name(dst, backbones)
+        if args.run and run not in args.run:
+            skipped['other runs (--run filter)'] += 1
+            continue
         dest = os.path.join(DEST, campaign(run), run)
         plan[dest].append(src)
         renames[src] = dst
