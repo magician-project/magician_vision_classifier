@@ -22,6 +22,7 @@ import sys
 
 import numpy as np
 import torch
+from artifact_paths import out_path   # writers emit into experiments/<campaign>/<run>/
 
 
 class _SkipSweep(Exception):
@@ -55,7 +56,7 @@ def run_confusion_and_threshold_sweep(classifier, trainer, val_loader, dataset,
 
     try:
         print("Removing previous confusion matrix data..")
-        for stale in glob.glob(f"{model_name}_confusion.json") + glob.glob(f"{model_name}*.png"):
+        for stale in glob.glob(out_path(model_name, "_confusion.json")) + glob.glob(out_path(model_name) + "*.png"):
             try:
                 os.remove(stale)
             except OSError:
@@ -107,10 +108,10 @@ def run_confusion_and_threshold_sweep(classifier, trainer, val_loader, dataset,
             "labels": dataset.classes,
             "matrix": confusion_matrix.tolist(),
         }
-        with open(f"{model_name}_confusion.json", "w") as f:
+        with open(out_path(model_name, "_confusion.json"), "w") as f:
             json.dump(confusion_json, f, indent=2)
         subprocess.run(
-            [sys.executable, "plotTool.py", f"{model_name}_confusion.json"], check=False
+            [sys.executable, "plotTool.py", out_path(model_name, "_confusion.json")], check=False
         )
 
         # Threshold sweep -> operating curve + the gate the live path will use.
@@ -198,10 +199,10 @@ def run_confusion_and_threshold_sweep(classifier, trainer, val_loader, dataset,
             "best_balanced": best_bal,
             "best_kpi": best_kpi,
         }
-        with open(f"{model_name}_threshold_curve.json", "w") as f:
+        with open(out_path(model_name, "_threshold_curve.json"), "w") as f:
             json.dump(curve_json, f, indent=2)
         subprocess.run(
-            [sys.executable, "plotTool.py", f"{model_name}_threshold_curve.json"], check=False
+            [sys.executable, "plotTool.py", out_path(model_name, "_threshold_curve.json")], check=False
         )
     except _SkipSweep:
         pass   # no clean class; confusion matrix already written above
@@ -221,7 +222,7 @@ def run_confusion_and_threshold_sweep(classifier, trainer, val_loader, dataset,
         # instead of looking like an intentional absence.
         config_json["gate_error"] = repr(e)
         config_json["gate_traceback"] = traceback.format_exc()
-        with open(f"{model_name}_confusion.json", "w") as f:
+        with open(out_path(model_name, "_confusion.json"), "w") as f:
             json.dump({"error": repr(e), "traceback": traceback.format_exc()}, f, indent=2)
 
 

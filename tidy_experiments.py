@@ -39,6 +39,8 @@ Usage:
 """
 
 import argparse
+import glob
+import json
 import os
 import re
 import shutil
@@ -76,10 +78,83 @@ CAMPAIGNS = (
     (re.compile(r'^ftl?$'),                 'legacy_finetune'),
     (re.compile(r'^(matrix|wavelet|ensemble|smoke|perf|tile)'), 'legacy_misc'),
     (re.compile(r'^(crossval|allclass|binary|mix|sv|merged)'), 'legacy_forth_altinay'),
+    # The live campaigns, so the current work is not filed under 'unsorted'.
+    (re.compile(r'^fz'),                    'zoo_sweep_full'),
+    (re.compile(r'^pfc'),                   'pfc_variance'),
+    (re.compile(r'^ms'),                    'model_sweep'),
 )
 
 
-def run_name(fname):
+def is_run_config(path):
+    """True for a training config -- an INPUT, never an artifact.
+
+    Configs and artifacts are both bare `.json` in the root, and telling them apart by
+    name does not work: `fzv2nano_timm_convnextv2_nano.json` is a config while
+    `fzv2nano_timm_convnextv2_nano_coverage.json` is an artifact. So look inside.
+
+    Getting this wrong is expensive rather than untidy. `export_models.discover()` globs
+    the root for configs, and the sweep's restart skip-check decides what NOT to re-train
+    by looking for them -- filing the configs away would have made a resumed sweep
+    re-train every finished model.
+    """
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+    except Exception:
+        return False
+    return isinstance(d, dict) and 'hparams' in d and 'model' in d
+
+
+def timm_slash_dirs():
+    """The `fz*_timm/` directories the slash bug created, and what is inside them.
+
+    A model configured as `timm/convnextv2_nano` makes the writers compose
+    `fzv2nano_timm/convnextv2_nano_coverage.json` -- a directory separator in the middle
+    of what was meant to be one filename. Moving those files as-is would be worse than
+    leaving them: find_artifact indexes experiments/ by BASENAME, first-wins, so two runs
+    sharing a backbone would collide and one would become unreachable. So they are
+    renamed to the sanitised form on the way out, which is also the name the archives in
+    models/ already use.
+    """
+    out = []
+    for d in sorted(glob.glob('*_timm')):
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            src = os.path.join(d, f)
+            if os.path.isfile(src):
+                out.append((src, f'{d}_{f}'))     # fzv2nano_timm/ + x -> fzv2nano_timm_x
+    return out
+
+
+def backbone_to_run():
+    """backbone name -> run prefix, for the plots the slash bug left unprefixed.
+
+    Some plots for a `timm/<backbone>` run were written as `convnextv2_atto_*.png` with no
+    run prefix at all, so grouping them by leading token files them under a BACKBONE --
+    `experiments/unsorted/convnextv2/` -- which is not a run and tells you nothing.
+
+    The configs recover the mapping: a config whose model is `timm/convnextv2_atto` and
+    whose name is `fzv2atto` says those plots belong to `fzv2atto`. Only unambiguous
+    backbones are mapped; if two runs share one, the plots stay put rather than being
+    filed under a guess.
+    """
+    owners = defaultdict(set)
+    for c in glob.glob('*.json'):
+        if not is_run_config(c):
+            continue
+        try:
+            with open(c) as fh:
+                cfg = json.load(fh)
+        except Exception:
+            continue
+        model = str(cfg.get('model', ''))
+        if model.startswith('timm/') and cfg.get('name'):
+            owners[model.split('/', 1)[1]].add(cfg['name'])
+    return {bb: next(iter(runs)) for bb, runs in owners.items() if len(runs) == 1}
+
+
+def run_name(fname, backbones=None):
     """Recover the run FAMILY from an artifact filename.
 
     The leading token, rather than a suffix-and-model-stripping scheme. The first attempt
@@ -93,6 +168,11 @@ def run_name(fname):
         stem = stem[:-5]
     if stem.startswith('epochcov_'):      # per-epoch coverage, written by epoch_cov.sh
         stem = stem[len('epochcov_'):]
+    # Unprefixed timm plots: longest backbone match wins, so convnextv2_atto is not
+    # shadowed by a hypothetical convnextv2.
+    for bb in sorted(backbones or (), key=len, reverse=True):
+        if stem.startswith(bb):
+            return backbones[bb]
     return stem.split('_')[0]
 
 
@@ -116,6 +196,7 @@ def main():
     tracked = set(subprocess.run(['git', 'ls-files'], capture_output=True, text=True,
                                  check=True).stdout.split('\n'))
     cutoff = time.time() - args.min_age_hours * 3600
+    backbones = backbone_to_run()
 
     plan = defaultdict(list)
     skipped = defaultdict(int)
@@ -132,11 +213,28 @@ def main():
         if ext in KEEP_EXT or ext not in ARTIFACT_EXT:
             skipped['source/docs/unrecognised'] += 1
             continue
+        if ext == '.json' and is_run_config(f):
+            skipped['run config (an INPUT -- export + restart-skip read these)'] += 1
+            continue
         if os.path.getmtime(f) > cutoff:
             skipped[f'younger than {args.min_age_hours} h (in-flight run)'] += 1
             continue
-        run = run_name(f)
+        run = run_name(f, backbones)
         plan[os.path.join(DEST, campaign(run), run)].append(f)
+
+    # The timm-slash directories, renamed to the sanitised form on the way out.
+    renames = {}
+    for src, dst in timm_slash_dirs():
+        if os.path.getmtime(src) > cutoff:
+            skipped[f'younger than {args.min_age_hours} h (in-flight run)'] += 1
+            continue
+        if dst.endswith('.json') and is_run_config(src):
+            skipped['run config (an INPUT -- export + restart-skip read these)'] += 1
+            continue
+        run = run_name(dst, backbones)
+        dest = os.path.join(DEST, campaign(run), run)
+        plan[dest].append(src)
+        renames[src] = dst
 
     total = sum(len(v) for v in plan.values())
     nbytes = sum(os.path.getsize(f) for v in plan.values() for f in v)
@@ -147,7 +245,7 @@ def main():
         if apply:
             os.makedirs(dest, exist_ok=True)
             for f in files:
-                shutil.move(f, os.path.join(dest, f))
+                shutil.move(f, os.path.join(dest, renames.get(f, os.path.basename(f))))
 
     print(f'\n{"MOVED" if apply else "WOULD MOVE"} {total} files, {nbytes / 1e9:.2f} GB '
           f'into {len(plan)} directories')

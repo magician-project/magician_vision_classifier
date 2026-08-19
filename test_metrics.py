@@ -108,6 +108,50 @@ def old_evaluate_detection_thr(s, isdef, mask, budget):
     return np.quantile(s[(~isdef) & mask], 1 - budget / 100.0)
 
 
+def old_eval_coverage(mass, truth, clean_id, n, support, fa):
+    """eval_coverage.py's INLINE copy, transcribed before removal.
+
+    This one is here because it was the copy that was NOT transcribed the first time, and
+    converting it is what broke a live coverage run -- the tests covered Metrics.py in
+    isolation but never compared it against the block it replaced.
+    """
+    clean_mass = np.sort(mass[truth == clean_id])
+    if len(clean_mass) == 0:
+        return None
+    thr = float(np.quantile(clean_mass, 1.0 - fa))
+    return thr, {i: float((mass[truth == i] >= thr).mean() * 100.0)
+                 for i in range(n) if support[i] and i != clean_id}
+
+
+def test_eval_coverage_form():
+    """Coverage numbers before and after the refactor must be the same number.
+
+    31 models were scored with the inline block and everything after fzv2nano with
+    Metrics. If these disagreed at all, the sweep would stop being one comparable table.
+    """
+    rng = np.random.default_rng(7)
+    n_classes, clean_id = 6, 5
+    for label, spread in (('separable', 6.0), ('overlapping', 1.4), ('saturated', 0.0)):
+        truth = rng.integers(0, n_classes, 20000)
+        mass = np.clip(rng.normal(0.5, 0.2, len(truth))
+                       + np.where(truth == clean_id, -spread * 0.05, spread * 0.05), 0, 1)
+        if label == 'saturated':
+            mass = np.round(mass, 1)
+        support = np.array([(truth == i).sum() for i in range(n_classes)])
+        for fa in (0.05, 0.10):
+            ref = old_eval_coverage(mass, truth, clean_id, n_classes, support, fa)
+            is_clean = truth == clean_id
+            got_thr = fa_threshold(mass, is_clean, fa)
+            got = {i: detection_at_fa(mass, is_clean, truth == i, fa)
+                   for i in range(n_classes) if support[i] and i != clean_id}
+            check(abs(ref[0] - got_thr) < 1e-12,
+                  f'{label} fa={fa}: threshold {got_thr} != inline {ref[0]}')
+            for i, v in ref[1].items():
+                check(abs(v - got[i]) < 1e-12,
+                      f'{label} fa={fa} class {i}: detection {got[i]} != inline {v}')
+        print(f'  [4] eval_coverage form: {label:12s} exact match to the inline block')
+
+
 def test_score_form():
     rng = np.random.default_rng(0)
     cases = {
@@ -182,6 +226,7 @@ def main():
     print('Metrics.py equivalence test\n')
     test_curve_form()
     test_score_form()
+    test_eval_coverage_form()
     test_estimators_differ()
     print()
     if failures:

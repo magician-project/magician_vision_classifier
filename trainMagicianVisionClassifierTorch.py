@@ -42,6 +42,7 @@ from Datasets import (
     CombinedDataset, BalancedBatchSampler,
 )
 from Evaluation import run_confusion_and_threshold_sweep
+from artifact_paths import out_path
 from ModelZoo import (
     build_backbone,
     CustomCNN, WaveletPool, BasicResBlock,
@@ -493,7 +494,9 @@ def main():
     #Save the model
     #------------------------------------------------------------------
     print("Saving the model")
-    trainer.save_checkpoint('%s.pth' % model_name)
+    # Emitted into experiments/<campaign>/<run>/ rather than the cwd, and the model
+    # name is sanitised, so a `timm/x` run no longer creates a stray directory.
+    trainer.save_checkpoint(out_path(model_name, '.pth'))
 
     # Evaluate dumped tiles (if directory exists)
     #------------------------------------------------------------------
@@ -512,7 +515,7 @@ def main():
                                       config_json, model_name, cleanClassID,
                                       tile_size=tile_size, epochs=epochs)
 
-    pth_path = '%s.pth' % model_name
+    pth_path = out_path(model_name, '.pth')
     md5 = hashlib.md5()
     with open(pth_path, 'rb') as f:
         for chunk in iter(lambda: f.read(8192), b''):
@@ -522,7 +525,7 @@ def main():
     #Save the JSON
     #------------------------------------------------------------------
     print("Saving the JSON")
-    with open('%s.json' % model_name, 'w') as f:
+    with open(out_path(model_name, '.json'), 'w') as f:
        json.dump(config_json, f, indent=2)
 
 

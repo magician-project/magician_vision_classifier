@@ -35,7 +35,7 @@ from LitClassifier import Classifier
 # coverage numbers computed on different holdout sets are not comparable), and the repo root
 # is being cleared of loose .json. find_artifact checks the root first, so a local copy still
 # wins if one is present.
-from artifact_paths import find_artifact          # noqa: E402
+from artifact_paths import find_artifact, out_path   # noqa: E402
 COVERAGE = find_artifact('val_coverage_frames.json') or 'val_coverage_frames.json'
 
 
@@ -199,7 +199,7 @@ def main():
           '\nmodel is blind. Compare ACROSS MODELS; a factory gain with a TIER_A detection'
           '\ndrop is a regression.')
 
-    out = f"{cfg['name']}_{cfg['model']}_coverage.json"
+    out = out_path(f"{cfg['name']}_{cfg['model']}", '_coverage.json')
     json.dump({'checkpoint': os.path.basename(ckpt),
                'fa_thresholds': {f'FA{int(f*100)}': (det_at[f][0] if det_at[f] else None)
                                  for f in (0.05, 0.10)},

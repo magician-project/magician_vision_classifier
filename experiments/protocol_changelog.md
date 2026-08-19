@@ -150,3 +150,37 @@ instead of being an accident of which file the function was copied from. **No pu
 number changes**: every converted site keeps the estimator it already used. Whether to
 unify on the constrained-maximum rule is a decision to make deliberately, with the table
 above in hand, and would require re-deriving affected figures.
+
+### 2026-08-19 — artifacts are written where they belong
+
+Fingerprint `bf82866e7d44` -> `a29ffda5d70c`. The writers now emit into
+`experiments/<campaign>/<run>/` instead of the repo root, via `artifact_paths.out_path()`.
+No computation changed — only where the results land.
+
+The root held **1017 entries**; it now holds 174. 933 files / 2.86 GB were filed into 48
+campaign directories by `tidy_experiments.py`, and future runs skip that step entirely.
+
+Three things this had to get right, each of which would have been expensive:
+
+* **Configs are inputs, not artifacts.** 56 run configs sat in the root looking exactly
+  like artifacts (`fzv2nano_timm_convnextv2_nano.json` is a config;
+  `..._coverage.json` is not). `export_models.discover()` globs them, and the sweep's
+  restart skip-check decides what NOT to re-train from them — filing them away would have
+  made a resumed sweep re-train every finished model. `is_run_config()` reads the file
+  rather than guessing from the name.
+* **The `timm/` slash is fixed at the source.** `out_path` sanitises, so a `timm/x` run no
+  longer creates a stray `fzx_timm/` directory. The 48 that already existed were renamed
+  on the way out — moving them verbatim would have collided in `find_artifact`'s
+  basename index, where first-wins would have made one of any two runs sharing a backbone
+  unreachable.
+* **`plotTool.py` wrote to the cwd.** It took `os.path.basename()` of its input, so the
+  plots for a run whose JSON had moved were still written to the root, re-scattering what
+  the move existed to fix.
+
+`export_models` checks the run directory first and falls back to the root, so the two
+layouts coexist and older runs still export. Verified by rebuilding `fzcnxtiny` — whose
+artifacts had already moved — into a complete 10-member archive.
+
+**Residual risk, stated plainly:** the writer change takes effect for the 6 models still
+queued, and a path fault would surface only after ~5 h of training. `out_path` was
+therefore exercised against all six real run names before this was left in place.

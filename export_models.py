@@ -165,24 +165,46 @@ def _verify_archive(zip_path, expected, problems):
 
 
 # --------------------------------------------------------------------------- collect
+def _locate(model_name, suffix):
+    """Where a run's `{model_name}{suffix}` actually is.
+
+    Two layouts coexist: runs finished before the writers were made path-aware left their
+    artifacts loose in the repo root, and everything after emits into
+    experiments/<campaign>/<run>/. The run directory is checked FIRST so a re-exported run
+    picks up its filed copy, with the root as the legacy fallback.
+    """
+    from artifact_paths import out_path
+    filed = out_path(model_name, suffix, create=False)
+    if os.path.exists(filed):
+        return filed
+    legacy = f'{model_name}{suffix}'
+    return legacy if os.path.exists(legacy) else None
+
+
 def collect_members(model_name, include_tensorboard=True):
     """[(arcname, srcpath)] for everything that belongs in this run's archive."""
     run = sanitise(model_name)
     out, missing = [], []
-    pth = f'{model_name}.pth'
+    pth = _locate(model_name, '.pth') or f'{model_name}.pth'
     if os.path.exists(pth):
         out.append((f'{run}.pth', pth))
     for suffix, required in SIDECARS:
-        p = f'{model_name}{suffix}'
+        p = _locate(model_name, suffix) or f'{model_name}{suffix}'
         if os.path.exists(p):
             out.append((f'{run}{suffix}', p))
         elif required:
             missing.append(p)
         else:
             missing.append(p)
-    base = os.path.basename(model_name)
-    for p in sorted(glob.glob(f'{model_name}*.png')):
-        out.append((run + os.path.basename(p)[len(base):], p))
+    from artifact_paths import out_path
+    plot_globs = sorted(glob.glob(f'{model_name}*.png')) + \
+        sorted(glob.glob(out_path(model_name, '', create=False) + '*.png'))
+    for p in plot_globs:
+        stem = os.path.basename(p)
+        for pref in (os.path.basename(model_name), sanitise(model_name)):
+            if stem.startswith(pref):
+                out.append((run + stem[len(pref):], p))
+                break
     if include_tensorboard:
         for p in sorted(glob.glob(f'tensorboard/{model_name}/**/*', recursive=True)):
             if os.path.isfile(p):
@@ -206,13 +228,13 @@ def export_run(cfg, store=STORE, include_tensorboard=True, verify_weights=True,
     run = sanitise(model_name)
 
     problems, warns = [], []
-    pth = f'{model_name}.pth'
-    if not os.path.exists(pth):
-        problems.append(f'no weights at {pth}')
+    pth = _locate(model_name, '.pth')
+    if pth is None:
+        problems.append(f'no weights at {model_name}.pth (root or run dir)')
     else:
         _check_weights(pth, problems, warns, deep=verify_weights)
-    cfg_path = f'{model_name}.json'
-    if os.path.exists(cfg_path):
+    cfg_path = _locate(model_name, '.json')
+    if cfg_path and os.path.exists(cfg_path):
         _check_config(cfg_path, problems, warns)
     else:
         problems.append(f'no config at {cfg_path}')
@@ -259,7 +281,9 @@ def already_exported():
 
 def discover():
     runs = []
-    for cfg_path in sorted(glob.glob('*.json')):
+    # Root for live configs, plus the filed copies each run writes beside its weights.
+    for cfg_path in sorted(glob.glob('*.json')) + sorted(
+            glob.glob(os.path.join('experiments', '*', '*', '*.json'))):
         try:
             with open(cfg_path) as fh:
                 cfg = json.load(fh)

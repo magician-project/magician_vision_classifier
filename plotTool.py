@@ -130,7 +130,10 @@ def main():
             with open(filepath, 'r') as f:
                 data = json.load(f)
             title = data['title']
-            path   = os.path.splitext(os.path.basename(filepath))[0]
+            # Beside the input, not in the cwd. basename() here meant the plots for a
+            # run whose JSON lives in experiments/<campaign>/<run>/ were still written to
+            # the repo root, re-scattering exactly what moving them was meant to fix.
+            path   = os.path.splitext(filepath)[0]
             print(f"Processing '{filepath}' -> {path} / '{title}'")
             if 'sweep' in data:
                 plot_threshold_curve(path, title, data['sweep'],

@@ -65,3 +65,69 @@ def find_artifact(name):
 
 def exists(name):
     return find_artifact(name) is not None
+
+
+# ---------------------------------------------------------------------------------
+# WRITER side: where a run's artifacts should be created in the first place.
+# ---------------------------------------------------------------------------------
+# find_artifact above is the reader half -- it exists because the writers all emitted
+# into the cwd and the root grew to 1,017 entries. tidy_experiments.py then filed them
+# away afterwards. This is the writers' half: emit into the run's directory to begin
+# with, so there is nothing to tidy later.
+#
+# The campaign mapping lives HERE, not in tidy_experiments.py, so the script that files
+# artifacts away and the writers that create them cannot disagree about where a run
+# belongs. tidy_experiments imports these.
+
+import re as _re
+
+CAMPAIGNS = (
+    (_re.compile(r'^s26'),                   'aug26_screens'),
+    (_re.compile(r'^(ancs2|anc|a26)'),       'aug26_fulltrain'),
+    (_re.compile(r'^mx'),                    'legacy_modifier_sweep'),
+    (_re.compile(r'^tz'),                    'bench_backbones_tile48'),
+    (_re.compile(r'^(p1b|p1n|p2|p3|phase)'), 'legacy_phase_sweeps'),
+    (_re.compile(r'^ftl?$'),                 'legacy_finetune'),
+    (_re.compile(r'^(matrix|wavelet|ensemble|smoke|perf|tile)'), 'legacy_misc'),
+    (_re.compile(r'^(crossval|allclass|binary|mix|sv|merged)'), 'legacy_forth_altinay'),
+    (_re.compile(r'^fz'),                    'zoo_sweep_full'),
+    (_re.compile(r'^pfc'),                   'pfc_variance'),
+    (_re.compile(r'^ms'),                    'model_sweep'),
+)
+
+
+def campaign(run):
+    for pat, camp in CAMPAIGNS:
+        if pat.match(run):
+            return camp
+    return 'unsorted'
+
+
+def sanitise(model_name):
+    """`timm/tinynet_e` -> `timm_tinynet_e`. Same rule as export_models.sanitise.
+
+    Applied to every emitted filename, which is what stops the writers from creating
+    `fztinye_timm/tinynet_e_coverage.json` -- a directory separator in the middle of what
+    was meant to be one name. That bug put 48 stray directories in the root and made two
+    runs sharing a backbone collide in the reader index.
+    """
+    return _re.sub(r'[^A-Za-z0-9._+-]', '_', model_name)
+
+
+def run_output_dir(model_name, create=True):
+    """The directory a run's artifacts belong in: experiments/<campaign>/<run>/."""
+    run = sanitise(model_name).split('_')[0]
+    d = os.path.join(ARCHIVE, campaign(run), run)
+    if create:
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def out_path(model_name, suffix='', create=True):
+    """Full path to write `{sanitised model_name}{suffix}` for this run.
+
+    out_path('fztinye_timm/tinynet_e', '_coverage.json')
+        -> experiments/zoo_sweep_full/fztinye/fztinye_timm_tinynet_e_coverage.json
+    """
+    return os.path.join(run_output_dir(model_name, create),
+                        sanitise(model_name) + suffix)
