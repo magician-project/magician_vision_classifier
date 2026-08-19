@@ -298,6 +298,10 @@ TIMM_BACKBONES = {
     'convnext_atto', 'convnext_femto', 'convnext_pico', 'convnext_nano',
     # modern edge-latency family
     'ghostnet_100', 'lcnet_050', 'mobilenetv4_conv_small', 'fastvit_t8', 'edgenext_xx_small',
+    # 48px-verified 2026-08-10 (dev box, build+forward at 4x48x48): ConvNeXt V2 = v1+GRN,
+    # drop-in same sizes; plus the tiny tier (small-is-better bet on this data).
+    'convnextv2_atto', 'convnextv2_femto', 'convnextv2_pico', 'convnextv2_nano',
+    'tinynet_c', 'tinynet_d', 'tinynet_e', 'efficientvit_b0', 'lcnet_100',
 }
 
 # These train multi-branch and MUST be reparameterized for deployment, via
