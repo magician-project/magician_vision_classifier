@@ -1,6 +1,6 @@
 #!/bin/bash
 
-WATTS="200"
+WATTS="180"
 
 echo "Setting GPU to $WATTS W" 
 
