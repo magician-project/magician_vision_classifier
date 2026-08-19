@@ -29,6 +29,7 @@ import torch
 from Config import load_hyperparameters
 from Datasets import build_val_only, val_dataloader
 from Metrics import miss_at_fa
+from artifact_paths import find_artifact
 from Evaluation import run_confusion_and_threshold_sweep
 from LitClassifier import Classifier
 
@@ -107,7 +108,17 @@ def main():
                                           cleanClassID,
                                           tile_size=h['tile_size'],
                                           epochs=h.get('training_epochs'))
-        curve = f"{name}_{config_json['model']}_threshold_curve.json"
+        # Resolve rather than assume the cwd: Evaluation.py now writes into
+        # experiments/<campaign>/<run>/ via artifact_paths.out_path, so building the path
+        # by hand here would look for the curve where it is no longer written. This is the
+        # same fault that broke eval_coverage -- a reader left pointing at the old layout
+        # after the writer moved.
+        curve_name = f"{name}_{config_json['model']}_threshold_curve.json"
+        curve = find_artifact(curve_name)
+        if curve is None:
+            raise FileNotFoundError(
+                f'{curve_name} was not written where expected (checked the repo root and '
+                f'experiments/); run_confusion_and_threshold_sweep may have failed')
         r = miss_at_fa(curve)
         vl = re.search(r'val_loss=([0-9]+\.[0-9]+)', tag)
         va = re.search(r'val_detect_auroc=([0-9]+\.[0-9]+)', tag)

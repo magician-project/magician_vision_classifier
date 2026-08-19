@@ -33,7 +33,8 @@ import json
 import os
 import sys
 
-from Metrics import miss_at_fa  # noqa: F401  (re-exported for older callers)
+from Metrics import miss_at_fa  # noqa: F401  (re-exported: older callers import it here)
+from artifact_paths import find_artifact
 
 RESULT_KEYS = ('confusion_matrix', 'gate', 'model_md5',
                'best_threshold_balanced', 'best_threshold_kpi', 'best_threshold_deployment')
@@ -54,9 +55,10 @@ def collect(prefixes=('tz', 'p1n', 'p1b', 'p2', 'p3')):
                 continue
             cfg = json.load(open(cfg_path))
             model = cfg['model']
-            curve = f"{cfg['name']}_{model}_threshold_curve.json"
-            if not os.path.exists(curve):
-                print(f'  (skip {cfg_path}: no {curve} yet)')
+            curve_name = f"{cfg['name']}_{model}_threshold_curve.json"
+            curve = find_artifact(curve_name)
+            if curve is None:
+                print(f'  (skip {cfg_path}: no {curve_name} yet)')
                 continue
             r = miss_at_fa(curve)
             out.append({

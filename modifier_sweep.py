@@ -26,6 +26,7 @@ import sys
 from statistics import mean, stdev
 
 from Metrics import miss_at_fa
+from artifact_paths import find_artifact
 
 SEEDS = (42, 1337, 7)
 ARMS = ['base', 'nodolp', 'aolp', 'mmr', 'unpol', 'mono', 'stride2']
@@ -43,8 +44,10 @@ REUSE = {('base', 42): 'tz', ('nodolp', 42): 'p1n'}
 
 def curve_for(arm, seed):
     name = REUSE.get((arm, seed), f'mx{arm}{seed}')
-    p = f'{name}_convnext_pico_threshold_curve.json'
-    return p if os.path.exists(p) else None
+    # find_artifact, not a bare cwd path: the writers emit into
+    # experiments/<campaign>/<run>/ now, so a hand-built root path silently reports
+    # 'no curve' for a run that has one.
+    return find_artifact(f'{name}_convnext_pico_threshold_curve.json')
 
 
 def main():

@@ -19,6 +19,7 @@ import os
 import sys
 
 from Metrics import miss_at_fa
+from artifact_paths import find_artifact
 
 
 def main():
@@ -32,9 +33,10 @@ def main():
         if base.endswith(('_confusion', '_threshold_curve')) or not os.path.exists(cfg_path):
             continue
         cfg = json.load(open(cfg_path))
-        curve = f"{cfg['name']}_{cfg['model']}_threshold_curve.json"
-        if not os.path.exists(curve):
-            print(f'  (skip {cfg_path}: no {curve} yet)')
+        curve_name = f"{cfg['name']}_{cfg['model']}_threshold_curve.json"
+        curve = find_artifact(curve_name)
+        if curve is None:
+            print(f'  (skip {cfg_path}: no {curve_name} yet)')
             continue
         r = miss_at_fa(curve)
         rows.append((cfg['hparams']['seed'], cfg['name'], r[0.05], r[0.10]))
