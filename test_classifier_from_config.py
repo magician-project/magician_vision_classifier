@@ -109,7 +109,10 @@ def from_config_kwargs(cfg, num_classes, clean_class):
 
 def test_equivalence():
     configs = sorted(set(glob.glob('*.json') + glob.glob('configs/*.json') +
-                         glob.glob('experiments/configs_*/*.json')))
+                         glob.glob('experiments/configs_*/*.json') +
+                         # run configs are filed beside their weights now; without this the
+                         # corpus silently shrank from 167 to 135 when they moved.
+                         glob.glob('experiments/**/*.json', recursive=True)))
     n = 0
     for path in configs:
         try:
