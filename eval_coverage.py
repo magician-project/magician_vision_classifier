@@ -155,8 +155,9 @@ def main():
         thr = fa_threshold(mass, is_clean, fa)
         det_at[fa] = (thr, {i: detection_at_fa(mass, is_clean, truth == i, fa)
                             for i in range(n) if support[i] and i != cleanID})
-    print(f'[coverage] FA-matched thresholds from {len(clean_mass):,} coverage clean tiles: '
-          + ', '.join(f'FA{int(f*100)} -> {det_at[f][0]:.4f}' for f in (0.05, 0.10)))
+    print(f'[coverage] FA-matched thresholds from {int(is_clean.sum()):,} coverage clean '
+          f'tiles: ' + ', '.join(f'FA{int(f*100)} -> {det_at[f][0]:.4f}'
+                                 for f in (0.05, 0.10)))
 
     tiers = {k: v['tier'] for k, v in payload['classes'].items()}
     print(f"\n{'class':30s} {'tier':7s} {'support':>9s} {'det@FA5':>8s} {'det@FA10':>9s} "
