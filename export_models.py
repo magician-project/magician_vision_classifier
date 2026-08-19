@@ -128,7 +128,11 @@ def _check_weights(path, problems, warnings_, deep=True):
         return
     try:
         import torch
-        obj = torch.load(path, map_location='cpu')
+        # weights_only=False: torch 2.6+ defaults it to True, which refuses the
+        # AttributeDict save_hyperparameters() stores. Refusing to unpickle would make
+        # this validator reject exactly the archives it is meant to bless. Safe here --
+        # the file was written by our own trainer moments ago, on this box.
+        obj = torch.load(path, map_location='cpu', weights_only=False)
     except Exception as exc:
         problems.append(f'{path} does not load as a torch checkpoint: {exc}')
         return

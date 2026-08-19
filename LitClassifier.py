@@ -503,18 +503,11 @@ class Classifier(pl.LightningModule):
 
     @classmethod
     def config_to_kwargs(cls, cfg, *, num_classes, clean_class=0, lr=None, **overrides):
-        """The pure config -> constructor-kwargs translation. THE single definition.
+        """Build the constructor kwargs from a training config dict. THE single definition.
 
-        Separate from from_config() so it can be tested without building a model, and so
-        the defaults are read from the real __init__ signature rather than from whatever
-        happens to be bound to `cls.__init__` at call time.
-        """
-        return cls._config_to_kwargs(cfg, num_classes=num_classes,
-                                     clean_class=clean_class, lr=lr, **overrides)
-
-    @classmethod
-    def _config_to_kwargs(cls, cfg, *, num_classes, clean_class=0, lr=None, **overrides):
-        """Build the constructor kwargs from a training config dict.
+        Public and separate from from_config() only so the translation can be tested
+        without building a model -- test_classifier_from_config.py compares this against a
+        verbatim transcription of the trainer's old block on every real config.
 
         `num_classes` is required and `clean_class` is caller-supplied because both come
         from the resolved label space, not from the config -- the config's `classes` list
@@ -581,9 +574,9 @@ class Classifier(pl.LightningModule):
         come from the resolved label space, not the config -- the config's `classes`
         list is written back by the trainer AFTER a run and is absent beforehand.
         """
-        return cls(**cls._config_to_kwargs(cfg, num_classes=num_classes,
-                                           clean_class=clean_class, lr=lr,
-                                           **overrides))
+        return cls(**cls.config_to_kwargs(cfg, num_classes=num_classes,
+                                          clean_class=clean_class, lr=lr,
+                                          **overrides))
 
     @classmethod
     def load_for_eval(cls, checkpoint_path, cfg=None, *, num_classes=None,
@@ -601,7 +594,20 @@ class Classifier(pl.LightningModule):
         disappointing number.
         """
         import torch
-        ckpt = torch.load(checkpoint_path, map_location=map_location)
+        # Never fetch ImageNet weights on an eval rebuild: the state dict below overwrites
+        # every parameter, so a download (which needs network access and fails on an
+        # offline deployment box) buys nothing. An explicit pretrained= in overrides wins.
+        overrides.setdefault('pretrained', False)
+        # weights_only=False is REQUIRED, and specifically for the checkpoints this method
+        # exists to serve. Torch 2.6+ defaults it to True, which unpickles only tensors and
+        # primitives. Old checkpoints load fine under that default -- they carry no
+        # hyper_parameters at all -- but save_hyperparameters() stores an AttributeDict, an
+        # arbitrary class, and weights_only=True refuses it outright:
+        #     UnpicklingError: Weights only load failed
+        # So the default would work everywhere except on the hparams-carrying checkpoints,
+        # i.e. it would pass every test against the existing zoo and fail on the first run
+        # trained after this change. Verified against a real checkpoint on torch 2.8.0.
+        ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
         stored = ckpt.get('hyper_parameters') if isinstance(ckpt, dict) else None
         if stored:
             kwargs = dict(stored)

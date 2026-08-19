@@ -60,3 +60,37 @@ the wrong thing.
 Checkpoints written before it have none; `Classifier.load_for_eval()` falls back to a config
 and **raises if neither source has them**, rather than silently rebuilding from `__init__`
 defaults — which would be the same class of bug in new clothes.
+
+### Follow-up (2026-08-19) — three defects in the refactor itself, no fingerprint change
+
+An audit of the conversion found three things. Fingerprint stays `bdf296e227da`: none of the
+five files touched here is in `PROTOCOL_FILES`, and the sweep is unaffected.
+
+1. **`classifierPnm.py` was still hand-building kwargs.** It is the live/offline inference
+   path behind the ROS node and the ensemble — the one place where getting the architecture
+   wrong reaches a customer rather than a spreadsheet. It had already been audited and
+   corrected once (its comment records being burned by `allclass_customwide`), and it was
+   *still* missing `timm_stem_stride` and `custom_wavelet_stem`, both architecture-changing.
+   Six real configs set `timm_stem_stride=2`; those models rebuilt at stride 4 here. Now
+   converted, and verified against all 167 configs: no key the old block set changes value,
+   and the two missing knobs start being honoured.
+
+2. **`torch.load` without `weights_only=False` (5 sites).** Torch 2.6+ defaults it to True.
+   The failure mode is nastier than it first looks: existing checkpoints load *fine* under
+   the default, because they carry no `hyper_parameters` at all. It is precisely the
+   checkpoints written by the new `save_hyperparameters()` that break — Lightning stores an
+   `AttributeDict`, an arbitrary class, and `weights_only=True` refuses it outright. So the
+   bug would pass every test against the existing zoo and fail on the first run trained
+   after this change. Confirmed on torch 2.8.0 against a real checkpoint.
+
+3. **`config_to_kwargs` / `_config_to_kwargs` were the same function.** The split was a
+   leftover: it existed because `inspect.signature(cls.__init__)` broke under a patched
+   `__init__`, which the `__func__` fix already solved. Two names for one translation, in
+   the module whose purpose is to have one. Collapsed.
+
+Also: `load_for_eval()` now forces `pretrained=False`. The state dict overwrites every
+parameter immediately afterwards, so fetching ImageNet weights first is a network round-trip
+— one that fails outright on an offline deployment box — in exchange for nothing.
+
+`load_for_eval()` was previously untested against a real file. It now round-trips a real
+`anc_convnext_pico` checkpoint end to end.

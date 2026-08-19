@@ -222,7 +222,9 @@ def get_state_dict_from_checkpoint(checkpoint_path: str, device: str):
     Handles both plain state_dicts and Lightning-style dicts with a
     'state_dict' key.
     """
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    # weights_only=False: torch 2.6+ defaults it to True, which refuses the AttributeDict
+    # that save_hyperparameters() stores under 'hyper_parameters'. See LitClassifier.
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         return ckpt["state_dict"]
     return ckpt

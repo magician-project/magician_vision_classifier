@@ -42,7 +42,9 @@ def _get_clean_class_id(class_names):
 
 
 def _load_state_dict(checkpoint_path: str, device: str):
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    # weights_only=False: torch 2.6+ defaults it to True, which refuses the AttributeDict
+    # that save_hyperparameters() stores under 'hyper_parameters'. See LitClassifier.
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         return ckpt["state_dict"]
     return ckpt

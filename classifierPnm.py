@@ -1420,42 +1420,34 @@ class ClassifierPnm:
         return elapsed_ms
 
     def load_model(self):
-        # Derived polarization channels must match training or conv1 shapes differ
-        hp = self.cfg.get('hparams', {})
-        derived = dict(
-                       AoLP=bool(hp.get('AoLP', False)),
-                       DoLP=bool(hp.get('DoLP', False)),
-                       Unpolarized=bool(hp.get('Unpolarized', hp.get('unpolarized', False))),
-                       MaxPolarization=bool(hp.get('MaxPolarization', False)),
-                       MinPolarization=bool(hp.get('MinPolarization', False)),
-                       RangePolarization=bool(hp.get('RangePolarization', False)),
-                       monochrome=bool(hp.get('monochrome', False)),
-                      )
-        # CustomCNN architecture knobs must match training too, for the same reason
-        # as the derived channels above: without them a wide-early model like
-        # allclass_customwide ([128,96,64,64]) is rebuilt with the default channel
-        # ladder and load_state_dict dies on conv1 (128 vs 48).
-        model = Classifier(
-                           model=self.cfg['model'],
-                           lr=0.1,
-                           num_classes=len(self.classes),
-                           tile_size=self.cfg['hparams']['tile_size'],
-                           base_channels = self.base_channels,
-                           final_dense_layer = self.final_dense_layer,
-                           custom_early_convs   = int(hp.get('custom_early_convs', 0)),
-                           custom_channels      = hp.get('custom_channels', None),
-                           custom_res_blocks    = hp.get('custom_res_blocks', None),
-                           custom_wavelet_pools = hp.get('custom_wavelet_pools', None),
-                           # Inference only ever loads a checkpoint over this architecture,
-                           # so pulling ImageNet weights first is wasted work: a torchvision
-                           # download (which needs network access, and fails on an offline
-                           # deployment box) for weights discarded by the load_state_dict
-                           # below. Random init is overwritten just the same.
-                           pretrained = False,
-                           **derived
-                          )
+        # Single source of truth (LitClassifier.Classifier.from_config). This block used to
+        # enumerate the knobs by hand: the seven derived-channel flags and the CustomCNN
+        # ladder, the latter added after allclass_customwide ([128,96,64,64]) was rebuilt at
+        # the default width and load_state_dict died on conv1 (128 vs 48).
+        #
+        # It was still missing two, and both are architecture-changing rather than loud:
+        #   timm_stem_stride    -- the stride-2 variants rebuild at stride 4 here
+        #   custom_wavelet_stem -- ditto for the wavelet-stem CustomCNNs
+        # Neither is hypothetical; the stride-2 arm is a live experiment. That is the whole
+        # argument for one translation instead of eleven: this call site was audited,
+        # corrected once, commented -- and was still two knobs short.
+        #
+        # Two deliberate overrides:
+        #   pretrained=False  inference always loads a checkpoint over this architecture, so
+        #                     fetching ImageNet weights is a network round-trip (which fails
+        #                     on an offline deployment box) for weights we discard.
+        #   lr=0.1            inert at inference -- no optimizer is ever configured -- but
+        #                     kept verbatim so this conversion changes nothing observable.
+        # base_channels/final_dense_layer are NOT passed: from_config reads them from
+        # hparams with the same 32/512 defaults self.base_channels already uses.
+        model = Classifier.from_config(self.cfg,
+                                       num_classes=len(self.classes),
+                                       lr=0.1,
+                                       pretrained=False)
 
-        checkpoint = torch.load(self.model_path, map_location=self.device)
+        # weights_only=False: torch 2.6+ defaults it to True, which refuses the
+        # AttributeDict that save_hyperparameters() stores. See LitClassifier.load_for_eval.
+        checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
         state_dict = checkpoint.get('state_dict', checkpoint)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
