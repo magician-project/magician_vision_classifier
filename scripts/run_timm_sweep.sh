@@ -32,7 +32,7 @@ for m in "${MODELS[@]}"; do
     done
     log="$LOGDIR/tz_${m}_$(TZ=UTC date +%Y%m%d_%H%M).log"
     echo "=== $(TZ=UTC date -Is) launching $m -> $log"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u trainMagicianVisionClassifierTorch.py "$cfg" > "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$cfg" > "$log" 2>&1
     rc=$?
     echo "=== $(TZ=UTC date -Is) $m exited rc=$rc"
     [ $rc -ne 0 ] && echo "!! $m FAILED (rc=$rc) -- continuing with the rest"

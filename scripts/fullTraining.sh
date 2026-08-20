@@ -7,7 +7,7 @@ cd ..
 
 source venv/bin/activate
 
-python3 trainClassifierTorch.py configs/stage1.json
-python3 trainClassifierTorch.py configs/smallmodel.json 
-python3 trainClassifierTorch.py configs/bigmodel.json 
+python3 -m mvc.train configs/stage1.json
+python3 -m mvc.train configs/smallmodel.json 
+python3 -m mvc.train configs/bigmodel.json 
 

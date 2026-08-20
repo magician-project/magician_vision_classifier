@@ -41,21 +41,21 @@ for run in "${RUNS[@]}"; do
 
     log="$LOGDIR/${run}_$(date +%Y%m%d_%H%M).log"
     echo "=== $(date -Is) [$run] train -> $log"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u trainMagicianVisionClassifierTorch.py "$CFG" > "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$CFG" > "$log" 2>&1
     rc=$?
     echo "=== $(date -Is) [$run] train rc=$rc"
     [ $rc -eq 0 ] || { echo "!!! $run FAILED, continuing"; continue; }
 
     echo "=== $(date -Is) [$run] score_checkpoints"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u score_checkpoints.py "$CFG" >> "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$CFG" >> "$log" 2>&1
     echo "=== $(date -Is) [$run] score rc=$?"
 
     echo "=== $(date -Is) [$run] eval_coverage"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u eval_coverage.py "$CFG" >> "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$CFG" >> "$log" 2>&1
     echo "=== $(date -Is) [$run] coverage rc=$?"
 
     echo "--- [$run] factory (pfc=0.5 anchor: 9.24 s42 / 7.41 s1337, sd 1.29) ---"
     grep -aA 8 'epoch   val_loss' "$log" | tail -10
 done
 
-echo "############ $(date -Is) PFC VARIANCE TEST COMPLETE -- run: python pfc_variance_report.py"
+echo "############ $(date -Is) PFC VARIANCE TEST COMPLETE -- run: python -m analysis.sweeps.pfc_variance_report"

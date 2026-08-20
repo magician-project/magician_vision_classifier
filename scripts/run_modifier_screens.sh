@@ -15,7 +15,7 @@ for cfg in mix_r0w_custom.json mix_r0dolp_custom.json; do
     name="${cfg%_custom.json}"
     log="$LOGDIR/${name}_$(TZ=UTC date +%Y%m%d_%H%M).log"
     echo "=== $(TZ=UTC date -Is) launching $cfg on GPU $GPU -> $log"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u trainMagicianVisionClassifierTorch.py "$cfg" > "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$cfg" > "$log" 2>&1
     rc=$?
     echo "=== $(TZ=UTC date -Is) $cfg exited rc=$rc"
     if [ $rc -ne 0 ]; then

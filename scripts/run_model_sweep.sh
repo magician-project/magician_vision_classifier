@@ -72,18 +72,18 @@ for entry in "${RUNS[@]}"; do
 
     log="$LOGDIR/${run}_$(date +%Y%m%d_%H%M).log"
     echo "=== $(date -Is) [$run] $model train -> $log"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u trainMagicianVisionClassifierTorch.py "$CFG" > "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$CFG" > "$log" 2>&1
     rc=$?
     echo "=== $(date -Is) [$run] train rc=$rc"
     # One bad backbone must not take the queue down with it.
     [ $rc -eq 0 ] || { echo "!!! $run FAILED, continuing to next candidate"; continue; }
 
     echo "=== $(date -Is) [$run] score_checkpoints"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u score_checkpoints.py "$CFG" >> "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$CFG" >> "$log" 2>&1
     echo "=== $(date -Is) [$run] score rc=$?"
 
     echo "=== $(date -Is) [$run] eval_coverage"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u eval_coverage.py "$CFG" >> "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$CFG" >> "$log" 2>&1
     echo "=== $(date -Is) [$run] coverage rc=$?"
 
     echo "--- [$run] factory (incumbent convnext_pico: 9.24 s42 / 7.41 s1337 miss@FA5) ---"
@@ -92,4 +92,4 @@ for entry in "${RUNS[@]}"; do
     grep -aA 4 'TIER_A (honest' "$log" | tail -5
 done
 
-echo "############ $(date -Is) MODEL SWEEP STAGE 1 COMPLETE -- run: python model_sweep_report.py"
+echo "############ $(date -Is) MODEL SWEEP STAGE 1 COMPLETE -- run: python -m analysis.sweeps.model_sweep_report"

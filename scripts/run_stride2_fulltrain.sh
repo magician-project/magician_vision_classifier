@@ -34,7 +34,7 @@ done
 
 log="$LOGDIR/ancs2_$(date +%Y%m%d_%H%M).log"
 echo "=== $(date -Is) stride2 full train -> $log"
-CUDA_VISIBLE_DEVICES="$GPU" python -u trainMagicianVisionClassifierTorch.py "$CFG" > "$log" 2>&1
+CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$CFG" > "$log" 2>&1
 rc=$?
 echo "=== $(date -Is) train exited rc=$rc"
 [ $rc -eq 0 ] || exit $rc
@@ -42,11 +42,11 @@ echo "=== $(date -Is) train exited rc=$rc"
 # Per-epoch scoring: val_detect_auroc picked the true best epoch on the anchor while
 # val_loss would have cost +1.67, so the epoch choice has to be made on the KPI itself.
 echo "=== $(date -Is) scoring all checkpoints on the factory val"
-CUDA_VISIBLE_DEVICES="$GPU" python -u score_checkpoints.py "$CFG" >> "$log" 2>&1
+CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$CFG" >> "$log" 2>&1
 echo "=== $(date -Is) score exited rc=$?"
 
 echo "=== $(date -Is) coverage (picks the monitored-best checkpoint)"
-CUDA_VISIBLE_DEVICES="$GPU" python -u eval_coverage.py "$CFG" >> "$log" 2>&1
+CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$CFG" >> "$log" 2>&1
 echo "=== $(date -Is) coverage exited rc=$?"
 
 echo "############ $(date -Is) STRIDE2 FULL TRAIN COMPLETE"

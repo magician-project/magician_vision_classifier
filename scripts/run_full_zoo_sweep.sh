@@ -111,17 +111,17 @@ for CFG in "${CFGS[@]}"; do
 
     log="$LOGDIR/${run}_$(date +%Y%m%d_%H%M).log"
     echo "=== $(date -Is) [$run] train -> $log"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u trainMagicianVisionClassifierTorch.py "$CFG" > "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$CFG" > "$log" 2>&1
     rc=$?
     echo "=== $(date -Is) [$run] train rc=$rc"
     [ $rc -eq 0 ] || { echo "!!! $run FAILED, continuing to next model"; continue; }
 
     echo "=== $(date -Is) [$run] score_checkpoints"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u score_checkpoints.py "$CFG" >> "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$CFG" >> "$log" 2>&1
     echo "=== $(date -Is) [$run] score rc=$?"
 
     echo "=== $(date -Is) [$run] eval_coverage"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u eval_coverage.py "$CFG" >> "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$CFG" >> "$log" 2>&1
     echo "=== $(date -Is) [$run] coverage rc=$?"
 
     echo "--- [$run] (incumbent convnext_pico: 9.24 miss@FA5, TIER_A 73.59) ---"
@@ -129,4 +129,4 @@ for CFG in "${CFGS[@]}"; do
     grep -aA 3 'TIER_A (honest' "$log" | tail -4
 done
 
-echo "############ $(date -Is) FULL ZOO SWEEP COMPLETE -- run: python full_zoo_report.py"
+echo "############ $(date -Is) FULL ZOO SWEEP COMPLETE -- run: python -m analysis.sweeps.full_zoo_report"
