@@ -28,6 +28,7 @@ there is no ROS to receive them -- so depths come from --laser-depths instead.
 """
 
 from mvc.inference.classifier_pnm import *   # noqa: F401,F403 -- re-export the classifier core
+from mvc.core.shared_memory import SharedMemoryManager
 from mvc.paths import repo_root
 
 import os

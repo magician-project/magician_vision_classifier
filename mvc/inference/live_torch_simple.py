@@ -11,6 +11,7 @@ here so existing `from liveClassifierTorch import ...` imports keep working.
 """
 
 from mvc.inference.classifier_pnm import *   # noqa: F401,F403 -- re-export the classifier core
+from mvc.core.shared_memory import SharedMemoryManager
 
 if __name__ == "__main__":
     #model_path    = sys.argv[1]

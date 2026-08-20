@@ -149,7 +149,7 @@ ln -s SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so .
 
 `SharedMemoryVideoBuffers/server --nokb &` starts the reference server, used to test the buffer without a camera.
 
-The live runners (`mvc/inference/live_torch*.py`) look for the library in the **current working directory**, so launch them from the repository root — every wrapper in `scripts/` does that for you.
+The runtime resolves `libSharedMemoryVideoBuffers.so` against the **repository root** (`loadLibrary` in `mvc/core/shared_memory.py`), so the runners work from any working directory.
 
 ---
 
@@ -698,7 +698,7 @@ python3 -m analysis.plots.plot_tensorboard_comparison [--ckpts-dir DIR] [--out-d
 
 The classifier receives frames from the camera grabber via a zero-copy shared memory mechanism implemented in `libSharedMemoryVideoBuffers.so`. This library uses POSIX shared memory (`mmap`) to transfer video frames without serialization, enabling sub-millisecond frame delivery.
 
-The C library is maintained upstream in the [SharedMemoryVideoBuffers](https://github.com/AmmarkoV/SharedMemoryVideoBuffers) repository, kept in `SharedMemoryVideoBuffers/` (a clone — not tracked by this repository). `scripts/updateSharedMemoryMechanism.sh` pulls the latest upstream, rebuilds, and (re)links `libSharedMemoryVideoBuffers.so` into the repository root, where the runtime loads it from. The Python bindings in `mvc/` started as copies of the upstream `src/python/` examples but are owned by this repository now; they are the only place that declares the library's ABI, and they are what the runners import.
+The C library is maintained upstream in the [SharedMemoryVideoBuffers](https://github.com/AmmarkoV/SharedMemoryVideoBuffers) repository, kept in `SharedMemoryVideoBuffers/` (a clone — not tracked by this repository). `scripts/updateSharedMemoryMechanism.sh` pulls the latest upstream, rebuilds, and (re)links `libSharedMemoryVideoBuffers.so` into the repository root, where the runtime loads it from. The Python bindings in `mvc/` are thin re-exports of the upstream `src/python/` modules, imported from the clone at runtime — the clone is the single source of truth, and the only local change is `loadLibrary`, which resolves the library against the repo root and fails loudly instead of upstream's `make`-then-`sys.exit(0)`.
 
 ### Components
 
@@ -707,8 +707,8 @@ The C library is maintained upstream in the [SharedMemoryVideoBuffers](https://g
 | `libSharedMemoryVideoBuffers.so` | Compiled C library for shared memory buffers (build artifact at the repo root) |
 | `SharedMemoryVideoBuffers/` | Upstream clone: C library source + reference binaries (`server`, `client`, `publisher`) |
 | `scripts/updateSharedMemoryMechanism.sh` | Syncs the upstream clone, rebuilds the library, relinks it at the repo root |
-| `mvc/core/shared_memory.py` | Python ctypes bindings to the shared memory library |
-| `mvc/inference/shared_memory_server.py` | Standalone shared memory server for testing |
+| `mvc/core/shared_memory.py` | Thin re-export of the upstream `SharedMemoryManager` (adds repo-root `.so` resolution) |
+| `mvc/inference/shared_memory_server.py` | Thin re-export of the upstream `SharedMemoryServer` (test tool) |
 | `video_frames.shm` | Shared memory frame descriptor file |
 | `shared_memory_context.shm` | Shared memory context descriptor file |
 
@@ -772,6 +772,7 @@ magician_vision_classifier/
   ├── liveClassifierTorch.py                  -> mvc/inference/live_torch.py
   ├── classifierPnm.py                        -> mvc/inference/classifier_pnm.py
   ├── readData.py                             -> mvc/core/read_data.py
+  ├── SharedMemoryManager.py                  -> mvc/core/shared_memory.py
   │
   │   ROS2 package + infrastructure
   ├── CMakeLists.txt                          ROS2 package build configuration

@@ -29,7 +29,6 @@ import torch
 from mvc.core.lit_classifier import Classifier   # its real home; the trainer only re-exports it
 #from numba import njit #Test
 from mvc.core.read_data import readPolarPNMToRGBALive#,readPolarPNMToRGBAResized
-from mvc.core.shared_memory import SharedMemoryManager
 from mvc.paths import repo_root
 from torch.nn import functional as F
 #--------------------------------------------------------------------------

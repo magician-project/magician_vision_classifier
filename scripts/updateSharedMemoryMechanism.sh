@@ -23,9 +23,11 @@ fi
 
 if [ -f SharedMemoryVideoBuffers/README.md ]
 then
-  cp SharedMemoryVideoBuffers/src/python/SharedMemoryServer.py ./
-  cp SharedMemoryVideoBuffers/src/python/SharedMemoryManager.py ./
-  ln -s SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so
+  # The Python bindings are imported from the clone itself (mvc/core/shared_memory.py)
+  # -- nothing to copy. Just make the built library reachable from both resolution
+  # points: the repo root (loadLibrary) and next to the upstream Python (Server).
+  ln -sfn SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so
+  ln -sfn ../../libSharedMemoryVideoBuffers.so SharedMemoryVideoBuffers/src/python/libSharedMemoryVideoBuffers.so
 else
   echo "Failed updating shared memory code"
 fi
