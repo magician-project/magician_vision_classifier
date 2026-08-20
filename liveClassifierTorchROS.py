@@ -25,7 +25,6 @@ from torch.nn import functional as F
 # knobs, laser geometry, marker maths and the detection contract have ONE definition.
 from liveClassifierTorch import (
     ClassifierPnm,
-    RECOMMENDED_CONFIG_FILE, FALLBACK_PRESET, load_recommended_configuration,
     ENSEMBLE_STAGE1, ENSEMBLE_MEMBERS,
     LASER_XY_PIXELS, LASER_IDW_POWER, idw_depth,
     MARKER_SCAN_DURATION_S, ARUCO_DICT_NAME, DEFAULT_MARKER_LENGTH_M,
@@ -79,8 +78,8 @@ def unix_ns_to_ros_time(ns):
 # Deployment presets
 # ========================================================
 # Which model to run and at what operating point comes from recommended_configuration.json
-# (RECOMMENDED_CONFIG_FILE / load_recommended_configuration, imported above from
-# liveClassifierTorch). That file is COMMITTED TO GIT, so a deployment site picks up new
+# (RECOMMENDED_CONFIG_FILE / load_recommended_configuration, imported below from
+# classifierPnm). That file is COMMITTED TO GIT, so a deployment site picks up new
 # models and thresholds with a plain `git pull` -- deliberately NOT environment variables,
 # which are awkward to change on-site.
 #

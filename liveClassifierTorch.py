@@ -54,51 +54,11 @@ import torch
 #
 # The FIRST entry is the startup default; pass `--config NAME` to select another.
 # The model's .pth/.json are auto-fetched on first run (ModelDownload.ensure_model).
-RECOMMENDED_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       "recommended_configuration.json")
-
-# Fallback used only if recommended_configuration.json is missing or unreadable, so the
-# runtime still starts on a sane model rather than dying at the first import.
-FALLBACK_PRESET = {
-    "name": "fallback",
-    "model": "mix_convnext_tiny",
-    "gate": {"mode": "defect_mass", "threshold": 0.90, "assign_best_defect_class": True},
-    "runtime": {"step": 18, "target_fps": 23.0, "erosion_kernel": 1, "min_votes": 2,
-                "majority_voting": True, "frame_limiter": True, "two_stage": False},
-}
-
-
-def load_recommended_configuration(name=None, path=RECOMMENDED_CONFIG_FILE):
-    """Return one preset dict from recommended_configuration.json.
-
-    name=None -> the first entry (the committed default). Otherwise the entry whose
-    "name" matches. Falls back to FALLBACK_PRESET, never raises, because failing to
-    read a preferences file must not stop the runtime from running.
-    """
-    try:
-        with open(path, "r") as f:
-            doc = json.load(f)
-        presets = doc.get("configurations") or []
-        if not presets:
-            raise ValueError("no 'configurations' entries")
-        if name is None:
-            chosen = presets[0]
-        else:
-            matches = [p for p in presets if p.get("name") == name]
-            if not matches:
-                available = [p.get("name") for p in presets]
-                raise ValueError(f"preset {name!r} not found; available: {available}")
-            chosen = matches[0]
-        # Merge over the fallback so a partial preset cannot leave a key undefined.
-        merged = dict(FALLBACK_PRESET)
-        merged.update(chosen)
-        merged["gate"] = {**FALLBACK_PRESET["gate"], **(chosen.get("gate") or {})}
-        merged["runtime"] = {**FALLBACK_PRESET["runtime"], **(chosen.get("runtime") or {})}
-        return merged
-    except Exception as e:
-        print(f"[config] could not use {path} ({e!r}) — falling back to "
-              f"{FALLBACK_PRESET['model']}")
-        return dict(FALLBACK_PRESET)
+#
+# RECOMMENDED_CONFIG_FILE, FALLBACK_PRESET and load_recommended_configuration come from
+# classifierPnm through the star import above, so the ROS node, wxAnnotator and this
+# runner share ONE definition. Only `--list-configs` needs the raw preset list, which no
+# other consumer wants, so that helper stays here.
 
 
 def list_recommended_configurations(path=RECOMMENDED_CONFIG_FILE):
