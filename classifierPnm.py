@@ -26,7 +26,7 @@ import cv2
 import numpy as np
 import pytorch_lightning as pl
 import torch
-from trainMagicianVisionClassifierTorch import Classifier
+from LitClassifier import Classifier   # its real home; the trainer only re-exports it
 #from numba import njit #Test
 from readData import readPolarPNMToRGBALive#,readPolarPNMToRGBAResized
 from SharedMemoryManager import SharedMemoryManager
