@@ -43,15 +43,39 @@ mkdir -p "$LOGDIR"
 MANIFEST=experiments/zoo_sweep_manifest.tsv
 
 # Files whose contents define the training protocol. A change to any of these makes runs
-# before and after incomparable.
-PROTOCOL_FILES="ModelZoo.py trainMagicianVisionClassifierTorch.py Datasets.py score_checkpoints.py eval_coverage.py"
+# before and after incomparable. Paths are repo-root-relative; the `cd` above guarantees
+# that is the cwd.
+PROTOCOL_FILES="mvc/core/model_zoo.py mvc/train.py mvc/core/datasets.py mvc/core/lit_classifier.py analysis/eval/score_checkpoints.py analysis/eval/eval_coverage.py"
+
+# A MISSING protocol file must be fatal, not silent. These paths were the pre-refactor root
+# filenames until the layout move, and `md5sum missing 2>/dev/null | md5sum` is perfectly
+# happy to hash nothing: the fingerprint silently becomes d41d8cd98f00, the md5 of empty
+# input, for every run. The mechanism would still print a fingerprint and still compare it
+# against the manifest -- it just would no longer detect anything, which is the one failure
+# this whole mechanism exists to prevent.
+#
+# This check is deliberately NOT inside code_fingerprint(): that is called as `$(...)`, and
+# an `exit` inside a command substitution only leaves the subshell -- the sweep would print
+# the error and then carry on with an empty fingerprint. It must be its own statement.
+require_protocol_files() {
+    local missing=""
+    for f in $PROTOCOL_FILES; do
+        [ -f "$f" ] || missing="$missing $f"
+    done
+    [ -z "$missing" ] && return 0
+    echo "PROTOCOL FILE(S) NOT FOUND:$missing" >&2
+    echo "The protocol fingerprint cannot be computed, so this sweep would produce runs" >&2
+    echo "that cannot be compared against the existing map. Fix the paths." >&2
+    exit 1
+}
 
 code_fingerprint() {
     # shellcheck disable=SC2086
-    md5sum $PROTOCOL_FILES 2>/dev/null | md5sum | cut -c1-12
+    md5sum $PROTOCOL_FILES | md5sum | cut -c1-12
 }
 git_rev() { git rev-parse --short HEAD 2>/dev/null || echo nogit; }
 
+require_protocol_files
 FP="$(code_fingerprint)"
 REV="$(git_rev)"
 echo "=== $(date -Is) protocol fingerprint $FP (git $REV)"
@@ -73,13 +97,34 @@ gpu_wait
 # rather than hardcoded so the two cannot drift apart.
 mapfile -t CFGS < <(python3 - <<'PY'
 import json
-from full_zoo_sweep import TAGS, BENCH
-hz = {r['model']: r.get('hz_step16', 0.0) for r in json.load(open(BENCH))['rows']}
+import sys
+
+# Both of these were pre-refactor spellings and both fail SILENTLY here. `mapfile` is
+# happy with empty input, so an ImportError or a FileNotFoundError in this heredoc does
+# not stop the sweep -- it reports "queue: 0 models", skips the loop, and exits 0 having
+# trained nothing. Hence the explicit stderr + non-zero exit below.
+try:
+    from analysis.sweeps.full_zoo_sweep import TAGS, BENCH
+    from mvc.core.artifact_paths import find_artifact
+except Exception as exc:                                    # noqa: BLE001
+    print(f'queue generator import failed: {exc}', file=sys.stderr)
+    raise SystemExit(1)
+
+bench = find_artifact(BENCH)
+if not bench:
+    print(f'{BENCH} not found: the queue is ordered by benched throughput and cannot '
+          f'be built without it', file=sys.stderr)
+    raise SystemExit(1)
+
+hz = {r['model']: r.get('hz_step16', 0.0) for r in json.load(open(bench))['rows']}
 for m in sorted(TAGS, key=lambda m: -hz.get(m, 0.0)):
     print(f'fz{TAGS[m]}_{m.replace("/", "_")}.json')
 PY
 )
 echo "=== $(date -Is) queue: ${#CFGS[@]} models"
+# An empty queue means the generator failed; training nothing and exiting 0 looks like a
+# completed sweep in the log.
+[ "${#CFGS[@]}" -gt 0 ] || { echo "!!! queue is empty -- generator failed, aborting"; exit 1; }
 
 # A run is complete iff a coverage table exists. Two spellings, because a `timm/` model
 # name puts a directory separator in the middle of the artifact path (see note 1 above).

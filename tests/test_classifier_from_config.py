@@ -30,6 +30,13 @@ import sys
 
 import torch
 
+# Runnable both as `python -m tests.test_classifier_from_config` and as
+# `python tests/test_classifier_from_config.py`. Run directly, sys.path[0] is tests/ rather
+# than the repo root, so `mvc` is not importable -- and this file has a __main__ block, so
+# direct invocation is a supported entry point.
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from mvc.core.lit_classifier import Classifier
 
 FAMILIES = {

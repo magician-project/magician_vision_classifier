@@ -29,6 +29,12 @@ import sys
 
 import numpy as np
 
+# Runnable both as `python -m tests.test_dataset_split` and as
+# `python tests/test_dataset_split.py`. Run directly, sys.path[0] is tests/ rather than the
+# repo root, so `mvc` is not importable -- and this file has a __main__ block, so direct
+# invocation is a supported entry point.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from mvc.core.config import load_hyperparameters
 
 failures = []

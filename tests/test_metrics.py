@@ -23,6 +23,12 @@ import sys
 
 import numpy as np
 
+# Runnable both as `python -m tests.test_metrics` and as `python tests/test_metrics.py`.
+# Run directly, sys.path[0] is tests/ rather than the repo root, so `mvc` is not importable
+# -- and this file has a __main__ block, so direct invocation is a supported entry point.
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from mvc.core.metrics import (detection_at_fa, fa_threshold, miss_at_fa, miss_at_fa_from_scores,
                      miss_at_fa_sweep)
 

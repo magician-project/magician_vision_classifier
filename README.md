@@ -362,7 +362,7 @@ This is the **same runtime as the ROS node**, minus ROS: same presets and auto-d
 
 Keys mirror the services one-to-one: `v` visualization, `p` pause, `2` two-stage, `m` majority voting, `f` frame limiter, `a` autosave, `d`/`c` remember defect/clean, `s` snapshot, `k` scan markers, `t`/`T` gate threshold, `0` follow the model's own gate, `[`/`]` step, `e`/`E` erosion kernel, `n`/`N` min votes, `,`/`.` target FPS, `r` hot-swap model, `q` quit.
 
-The inference core itself — tiling, heatmaps, majority voting, erosion, gating and model scanning — lives in `mvc/inference/classifier_pnm.py`. `mvc/inference/live_torch.py` re-exports it, and it additionally owns everything non-ROS (presets, laser/marker geometry, detection bookkeeping, the frame loop). `mvc/inference/live_torch_ros.py` imports those from it rather than keeping a second copy, so the two runners cannot drift apart again. Root-level shims `liveClassifierTorch.py` / `classifierPnm.py` keep the old `from liveClassifierTorch import ...` import names working for external consumers (the annotator).
+The inference core itself — tiling, heatmaps, majority voting, erosion, gating and model scanning — lives in `mvc/inference/classifier_pnm.py`. `mvc/inference/live_torch.py` re-exports it, and it additionally owns everything non-ROS (presets, laser/marker geometry, detection bookkeeping, the frame loop). `mvc/inference/live_torch_ros.py` imports those from it rather than keeping a second copy, so the two runners cannot drift apart again. The old top-level names (`liveClassifierTorch`, `classifierPnm`, `readData`, `SharedMemoryManager`) are gone and no compatibility shims are kept for them: downstream consumers such as the annotator import the `mvc.*` paths directly.
 
 ### ROS2 Mode
 
@@ -767,12 +767,6 @@ magician_vision_classifier/
   │   Tests — run from the repo root: python -m unittest discover tests
   ├── tests/                                  test_metrics, test_dataset_split,
   |                                            test_classifier_from_config
-  │
-  │   Root shims — re-exports so external consumers (the annotator) keep working
-  ├── liveClassifierTorch.py                  -> mvc/inference/live_torch.py
-  ├── classifierPnm.py                        -> mvc/inference/classifier_pnm.py
-  ├── readData.py                             -> mvc/core/read_data.py
-  ├── SharedMemoryManager.py                  -> mvc/core/shared_memory.py
   │
   │   ROS2 package + infrastructure
   ├── CMakeLists.txt                          ROS2 package build configuration
