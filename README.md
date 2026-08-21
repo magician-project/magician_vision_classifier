@@ -793,6 +793,7 @@ magician_vision_classifier/
   ├── docker/                                 Container build files
   ├── legacy/                                 Retired code, kept for reference only (see legacy/README.md)
 ```
+<!--
 
 ### If you move files again
 
@@ -811,6 +812,8 @@ Two places hold file paths that no tool can infer, and both fail quietly when th
 
 Grep for old module names in `scripts/*.sh` after any move: the shell scripts invoke
 modules by path (`python -m mvc.train`) and are not covered by Python's import checking.
+
+-->
 
 ### Legacy
 
