@@ -125,6 +125,7 @@ def main():
         print("Usage: python confusion_matrix_plotter.py <file1.json> [<file2.json> ...]")
         sys.exit(1)
 
+    failed = 0
     for filepath in sys.argv[1:]:
         try:
             with open(filepath, 'r') as f:
@@ -141,7 +142,16 @@ def main():
             else:
                 plot_confusion_matrices(path, title, data['labels'], data['matrix'])
         except Exception as e:
-            print(f"Error processing '{filepath}': {e}")
+            # Report AND remember. This used to print and exit 0, so a caller checking the
+            # return code -- Evaluation._write_plots does -- could not tell a rendered plot
+            # from a failed one.
+            print(f"Error processing '{filepath}': {e}", file=sys.stderr)
+            failed += 1
+
+    if failed:
+        print(f"{failed} of {len(sys.argv) - 1} file(s) failed to plot", file=sys.stderr)
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
