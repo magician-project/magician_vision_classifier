@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,10 @@ th    { background: #eaeef2; border: 1px solid #b6bcc2; padding: 3px 4px;
         text-align: left; font-size: 7.4pt; }
 td    { border: 1px solid #d2d6da; padding: 3px 4px; vertical-align: top; }
 td:first-child { white-space: nowrap; }         /* model names must not wrap mid-token */
+/* See _break_before_long_tables(): long tables are forced onto a fresh page because
+   wkhtmltopdf honours `page-break-inside: avoid` on a <tr> unreliably deep into a
+   document, and a halved row looks like a data error to a reader. */
+div.pagebreak { page-break-before: always; }
 
 img { max-width: 100%; }
 /* Confusion matrices are dense; give them the full text width or the labels are unreadable. */
@@ -64,6 +69,38 @@ a  { color: #2b6ea8; text-decoration: none; }
 hr { border: none; border-top: 1px solid #e2e2e2; margin: 14px 0; }
 em { color: #444; }
 """
+
+
+LONG_TABLE_ROWS = 25          # beyond this a table gets a page of its own
+
+
+def _break_before_long_tables(body):
+    """Start any table longer than LONG_TABLE_ROWS on a fresh page.
+
+    wkhtmltopdf (QtWebKit) honours `page-break-inside: avoid` on a <tr> most of the time,
+    but not reliably once a table lands deep in a long document: the 47-row appendix here
+    had row 34 drawn half at the foot of one page and half at the head of the next, which
+    reads as a data error rather than a layout wobble. None of the obvious levers moved it
+    (`border-collapse: separate`, `--disable-smart-shrinking`, `--dpi`, footer spacing);
+    only starting the table at the top of a page did.
+
+    So: long tables get their own page. The break goes before the table's HEADING when one
+    sits immediately above it, otherwise before the table itself, so a heading is never
+    orphaned at the bottom of the previous page.
+    """
+    out, pos = [], 0
+    for m in re.finditer(r'<table>.*?</table>', body, flags=re.S):
+        if m.group(0).count('<tr>') <= LONG_TABLE_ROWS:
+            continue
+        # walk back over any intro prose to the heading that introduces this table
+        head = body.rfind('<h', 0, m.start())
+        anchor = head if head != -1 and body.count('<table>', head, m.start()) == 0 \
+            and m.start() - head < 600 else m.start()
+        out.append(body[pos:anchor])
+        out.append('<div class="pagebreak"></div>')
+        pos = anchor
+    out.append(body[pos:])
+    return ''.join(out)
 
 
 def render(src, out):
@@ -76,6 +113,7 @@ def render(src, out):
         md = md.replace(a, b)
     body = markdown.markdown(md, extensions=['tables', 'fenced_code', 'sane_lists',
                                              'attr_list'])
+    body = _break_before_long_tables(body)
     html = (f'<html><head><meta charset="utf-8"><base href="file://{base}/">'
             f'<style>{CSS}</style></head><body>{body}</body></html>')
 
