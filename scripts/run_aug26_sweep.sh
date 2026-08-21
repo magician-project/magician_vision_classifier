@@ -34,7 +34,7 @@ wait_for_gpu() {
     done
 }
 
-python aug26_sweep.py || exit 1
+python -m analysis.sweeps.aug26_sweep || exit 1
 
 # Seed-major: every arm gets a second seed before any gets a third, so an early stop still
 # leaves paired comparisons rather than one arm at 3 seeds and the rest at 1. stride2 last
@@ -52,7 +52,7 @@ for seed in 42 1337 7; do
     wait_for_gpu
     log="$LOGDIR/${name}_$(date +%Y%m%d_%H%M).log"
     echo "=== $(date -Is) [${arm}/${seed}] training -> $log"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u trainMagicianVisionClassifierTorch.py "$cfg" > "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$cfg" > "$log" 2>&1
     rc=$?
     echo "=== $(date -Is) [${arm}/${seed}] train exited rc=$rc"
     [ $rc -eq 0 ] || { echo "=== training failed, not scoring"; continue; }
@@ -60,12 +60,12 @@ for seed in 42 1337 7; do
     # Coverage only. The trainer already writes the factory threshold curve for its own
     # checkpoint, and these screens keep save_top_k=1, so there is no epoch sweep to do.
     echo "=== $(date -Is) [${arm}/${seed}] coverage"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u eval_coverage.py "$cfg" >> "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$cfg" >> "$log" 2>&1
     echo "=== $(date -Is) [${arm}/${seed}] coverage exited rc=$?"
   done
   echo "############ after seed $seed:"
-  python aug26_sweep_report.py 2>&1 | tail -40
+  python -m analysis.sweeps.aug26_sweep_report 2>&1 | tail -40
 done
 
 echo "############ $(date -Is) AUG26 SWEEP COMPLETE"
-python aug26_sweep_report.py 2>&1 | tee "$LOGDIR/aug26_sweep_$(date +%Y%m%d_%H%M).txt"
+python -m analysis.sweeps.aug26_sweep_report 2>&1 | tee "$LOGDIR/aug26_sweep_$(date +%Y%m%d_%H%M).txt"

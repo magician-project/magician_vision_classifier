@@ -12,7 +12,7 @@
 # --extract puts {name}.pth + {name}.json where ClassifierPnm.model_scan() finds
 # them (DEST, default = classifier repo root), so wxAnnotator lists them locally
 # without going through the in-app download. (For a single model you can also just
-# run:  python3 ModelDownload.py <name> --dest DEST )
+# run:  python3 -m mvc.inference.model_download <name> --dest DEST )
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"

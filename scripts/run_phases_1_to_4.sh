@@ -44,7 +44,7 @@ run_cfg() {   # run_cfg <config.json> <phase-tag>
     wait_for_gpu
     local log="$LOGDIR/${tag}_$(date +%Y%m%d_%H%M).log"
     echo "=== $(date -Is) [$tag] launching $cfg -> $log"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u trainMagicianVisionClassifierTorch.py "$cfg" > "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$cfg" > "$log" 2>&1
     local rc=$?
     echo "=== $(date -Is) [$tag] $cfg exited rc=$rc"
     [ $rc -ne 0 ] && echo "!! $cfg FAILED (rc=$rc) -- continuing"
@@ -60,11 +60,11 @@ run_cfg p1b_convnext_nano.json p1b_nano
 run_cfg p1b_convnext_pico.json p1b_pico
 
 echo "############ PHASE 1 results"
-python phase2_select.py --dry-run 2>&1 | tee "$LOGDIR/phase1_summary_$(date +%Y%m%d_%H%M).txt"
+python -m analysis.datasets.phase2_select --dry-run 2>&1 | tee "$LOGDIR/phase1_summary_$(date +%Y%m%d_%H%M).txt"
 
 echo "############ PHASE 2: full train of the Phase-1 winner"
 wait_for_gpu
-python phase2_select.py | tee "$LOGDIR/phase2_pick_$(date +%Y%m%d_%H%M).txt"
+python -m analysis.datasets.phase2_select | tee "$LOGDIR/phase2_pick_$(date +%Y%m%d_%H%M).txt"
 P2_CFG="$(ls -1t p2_*.json 2>/dev/null | head -1)"
 if [ -z "${P2_CFG:-}" ]; then
     echo "!! phase2_select.py wrote no config -- skipping Phase 2"
@@ -74,7 +74,7 @@ else
     # picked one 0.75 miss@FA5 worse, so rank all 3 epochs on the KPI directly.
     echo "=== $(date -Is) [p2] scoring every retained epoch"
     wait_for_gpu
-    CUDA_VISIBLE_DEVICES="$GPU" python -u score_checkpoints.py "$P2_CFG" \
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$P2_CFG" \
         > "$LOGDIR/p2_score_checkpoints_$(date +%Y%m%d_%H%M).log" 2>&1
     echo "=== $(date -Is) [p2] scoring exited rc=$?"
 fi
@@ -86,9 +86,9 @@ run_cfg p3_convnext_tiny.json   p3_convnext_tiny
 
 echo "############ PHASE 4: clean inference benchmark (idle GPU, real geometry)"
 wait_for_gpu
-CUDA_VISIBLE_DEVICES="$GPU" python -u scripts/bench_inference.py \
+CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.sweeps.bench_inference \
     2>&1 | tee "$LOGDIR/phase4_bench_$(date +%Y%m%d_%H%M).log"
 
 echo "############ $(date -Is) PHASES 1-4 COMPLETE"
 echo "screens:"
-python phase2_select.py --dry-run 2>&1 | tail -30
+python -m analysis.datasets.phase2_select --dry-run 2>&1 | tail -30

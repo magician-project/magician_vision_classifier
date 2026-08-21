@@ -77,7 +77,7 @@ locate_model_dir() {
 # --- 1. package the named models, via THE packager ---------------------------
 for name in "$@"; do
     echo "exporting $name via export_models.py"
-    if ! ( cd "$REPO_DIR" && python export_models.py --apply --force --run "$name" ); then
+    if ! ( cd "$REPO_DIR" && python -m mvc.export --apply --force --run "$name" ); then
         echo "SKIP $name: export_models.py could not package it" >&2
         continue
     fi

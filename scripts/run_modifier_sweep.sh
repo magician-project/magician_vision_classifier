@@ -57,12 +57,12 @@ for seed in 42 1337 7; do
     wait_for_gpu
     log="$LOGDIR/mx${arm}${seed}_$(date +%Y%m%d_%H%M).log"
     echo "=== $(date -Is) [${arm}/${seed}] launching $cfg -> $log"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u trainMagicianVisionClassifierTorch.py "$cfg" > "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$cfg" > "$log" 2>&1
     echo "=== $(date -Is) [${arm}/${seed}] exited rc=$?"
   done
   echo "############ after seed $seed:"
-  python modifier_sweep.py 2>&1 | tail -22
+  python -m analysis.sweeps.modifier_sweep 2>&1 | tail -22
 done
 
 echo "############ $(date -Is) MODIFIER SWEEP COMPLETE"
-python modifier_sweep.py 2>&1 | tee "$LOGDIR/modifier_sweep_$(date +%Y%m%d_%H%M).txt"
+python -m analysis.sweeps.modifier_sweep 2>&1 | tee "$LOGDIR/modifier_sweep_$(date +%Y%m%d_%H%M).txt"

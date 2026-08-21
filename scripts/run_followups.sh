@@ -43,20 +43,20 @@ run_cfg() {   # run_cfg <config.json> <tag>
     wait_for_gpu
     local log="$LOGDIR/${tag}_$(date +%Y%m%d_%H%M).log"
     echo "=== $(date -Is) [$tag] launching $cfg -> $log"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u trainMagicianVisionClassifierTorch.py "$cfg" > "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$cfg" > "$log" 2>&1
     echo "=== $(date -Is) [$tag] $cfg exited rc=$?"
 }
 score() {     # score <config.json> <tag>
     wait_for_gpu
     echo "=== $(date -Is) [$2] scoring every retained epoch"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u score_checkpoints.py "$1" \
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$1" \
         > "$LOGDIR/${2}_score_$(date +%Y%m%d_%H%M).log" 2>&1
     echo "=== $(date -Is) [$2] scoring exited rc=$?"
 }
 
 echo "############ A. SEED VARIANCE — the noise floor (4 samples incl. tz seed 42 = 8.92)"
 for s in 1337 7 2024; do run_cfg "sv${s}_convnext_atto.json" "sv${s}"; done
-python seed_variance.py 2>&1 | tee "$LOGDIR/seed_variance_$(date +%Y%m%d_%H%M).txt"
+python -m analysis.sweeps.seed_variance 2>&1 | tee "$LOGDIR/seed_variance_$(date +%Y%m%d_%H%M).txt"
 
 echo "############ B. efficientnet_b0 FULL TRAIN (4 epochs)"
 run_cfg ft_efficientnet_b0.json ft_effnet
@@ -67,4 +67,4 @@ run_cfg ft_convnext_pico_long.json ftl_pico
 score   ft_convnext_pico_long.json ftl_pico
 
 echo "############ $(date -Is) FOLLOW-UPS COMPLETE"
-python phase2_select.py --dry-run 2>&1 | tail -30
+python -m analysis.datasets.phase2_select --dry-run 2>&1 | tail -30

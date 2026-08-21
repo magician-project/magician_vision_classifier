@@ -11,7 +11,7 @@ source src/magician_vision_classifier/venv/bin/activate
 source install/setup.bash 
 
 cd src/magician_vision_classifier
-python3 liveClassifierTorchROS.py 
+python3 -m mvc.inference.live_torch_ros 
 
 
 exit 0

@@ -11,7 +11,7 @@
 #  2. Independently of (1), refuse to start while ANY trainer is alive. Two runs on
 #     one GPU would also mean 2x73GB of RAM cache.
 set -u
-TRAIN_PID=5571          # verified: python -u trainMagicianVisionClassifierTorch.py mix_r0dolpf_custom.json
+TRAIN_PID=5571          # verified: python -u -m mvc.train mix_r0dolpf_custom.json
 
 running_trainers() {
     ps -eo pid,cmd --no-headers | awk '$2=="python" && $3=="-u" && $4 ~ /^train.*MagicianVisionClassifierTorch\.py$/ {print $1}'
@@ -30,7 +30,7 @@ for cfg in mix_r0da_custom.json mix_r0dws_custom.json; do
     name="${cfg%_custom.json}"
     log=/storage/ammarkov/logs/${name}_$(TZ=UTC date +%Y%m%d_%H%M).log
     echo "=== $(TZ=UTC date -Is) launching $cfg -> $log"
-    CUDA_VISIBLE_DEVICES=2 python -u trainMagicianVisionClassifierTorch.py "$cfg" > "$log" 2>&1
+    CUDA_VISIBLE_DEVICES=2 python -u -m mvc.train "$cfg" > "$log" 2>&1
     echo "=== $(TZ=UTC date -Is) $cfg exited rc=$?"
 done
 echo "=== $(TZ=UTC date -Is) all queued screens done"

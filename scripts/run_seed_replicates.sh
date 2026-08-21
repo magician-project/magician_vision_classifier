@@ -49,7 +49,7 @@ for run in "${RUNS[@]}"; do
 
     log="$LOGDIR/${run}_$(date +%Y%m%d_%H%M).log"
     echo "=== $(date -Is) [$run] train -> $log"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u trainMagicianVisionClassifierTorch.py "$CFG" > "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$CFG" > "$log" 2>&1
     rc=$?
     echo "=== $(date -Is) [$run] train rc=$rc"
     [ $rc -eq 0 ] || { echo "!!! $run failed, continuing to next run"; continue; }
@@ -57,11 +57,11 @@ for run in "${RUNS[@]}"; do
     # Per-epoch, because the epoch choice has to be made on the KPI itself: on the anchor,
     # val_detect_auroc picked the true best epoch while val_loss would have cost +1.67.
     echo "=== $(date -Is) [$run] score_checkpoints"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u score_checkpoints.py "$CFG" >> "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$CFG" >> "$log" 2>&1
     echo "=== $(date -Is) [$run] score rc=$?"
 
     echo "=== $(date -Is) [$run] eval_coverage (monitored-best checkpoint)"
-    CUDA_VISIBLE_DEVICES="$GPU" python -u eval_coverage.py "$CFG" >> "$log" 2>&1
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$CFG" >> "$log" 2>&1
     echo "=== $(date -Is) [$run] coverage rc=$?"
 
     echo "--- [$run] factory, per epoch (seed-42 reference: anc 9.24 / ancs2 7.15 miss@FA5) ---"
@@ -70,4 +70,4 @@ for run in "${RUNS[@]}"; do
     grep -aA 4 'TIER_A (honest' "$log" | tail -5
 done
 
-echo "############ $(date -Is) SEED REPLICATES COMPLETE -- run: python seed_replicates_report.py"
+echo "############ $(date -Is) SEED REPLICATES COMPLETE -- run: python -m analysis.sweeps.seed_replicates_report"

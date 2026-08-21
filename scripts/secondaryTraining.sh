@@ -17,7 +17,7 @@ for MODEL in mobilenet_v3_large regnet_y_800mf convnext_tiny; do  # efficientnet
         continue
     fi
     echo "=== ${MODEL} start $(date) ==="
-    python3 trainMagicianVisionClassifierTorch.py "$CFG" "$MODEL" || echo "${MODEL} FAILED exit $?"
+    python3 -m mvc.train "$CFG" "$MODEL" || echo "${MODEL} FAILED exit $?"
     echo "=== ${MODEL} done $(date) ==="
 done
 echo "=== BACKBONE SWEEP COMPLETE $(date) ==="
