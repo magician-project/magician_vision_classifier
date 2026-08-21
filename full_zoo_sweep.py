@@ -74,7 +74,16 @@ def main():
     assert base['dataloader'].get('exclude_frames'), 'anchor lost its coverage carve-out'
     assert len(base['classes']) == 10, 'anchor is not on the 10-class scheme'
 
-    hz = {r['model']: r for r in json.load(open(BENCH))['rows']}
+    # Resolved, not opened by bare name: the tidy moved this file to
+    # experiments/configs_frozen/ and a raw open() here fails at the cwd. That failure is
+    # SILENT where it matters -- run_full_zoo_sweep.sh fills its queue from this module via
+    # `mapfile < <(python3 ...)`, and mapfile succeeds with empty input, so a resume would
+    # report "queue: 0 models" and exit 0 having trained nothing.
+    bench = find_artifact(BENCH)
+    if not bench:
+        raise SystemExit(f'{BENCH} not found: the queue is ordered by benched throughput '
+                         f'and cannot be built without it')
+    hz = {r['model']: r for r in json.load(open(bench))['rows']}
     models = sorted(TAGS, key=lambda m: -hz.get(m, {}).get('hz_step16', 0))
 
     total = 0.0

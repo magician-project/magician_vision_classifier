@@ -31,3 +31,7 @@ fzeffb0_efficientnet_b0	fzeffb0_efficientnet_b0	259fc61ae980	53f451b	2026-08-19T
 fzv2nano_timm_convnextv2_nano	fzv2nano_timm_convnextv2_nano	259fc61ae980	53f451b	2026-08-19T05:19:33+00:00
 fzr18fine_resnet18_fine	fzr18fine_resnet18_fine	259fc61ae980	53f451b	2026-08-19T13:22:56+00:00
 fzr18hi_resnet18_hires	fzr18hi_resnet18_hires	259fc61ae980	53f451b	2026-08-19T18:46:16+00:00
+fzdense121_densenet121	fzdense121_densenet121	259fc61ae980	53f451b	2026-08-20T01:15:49+00:00
+fzrx50_resnext50	fzrx50_resnext50	259fc61ae980	53f451b	2026-08-20T08:40:28+00:00
+fzeffv2s_efficientnet_v2_s	fzeffv2s_efficientnet_v2_s	259fc61ae980	53f451b	2026-08-20T16:31:06+00:00
+fzswin_swin_v2_t	fzswin_swin_v2_t	259fc61ae980	53f451b	2026-08-21T03:51:38+00:00
