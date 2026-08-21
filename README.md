@@ -765,6 +765,7 @@ magician_vision_classifier/
   ├── analysis/integrator_3d.py               OpenGL 3D visualization of detections
   │
   │   Tests — run from the repo root: python -m unittest discover tests
+  │   (each file is also runnable on its own: python -m tests.test_metrics)
   ├── tests/                                  test_metrics, test_dataset_split,
   |                                            test_classifier_from_config
   │
@@ -772,7 +773,8 @@ magician_vision_classifier/
   ├── CMakeLists.txt                          ROS2 package build configuration
   ├── package.xml                             ROS2 package manifest
   ├── requirements.txt                        Python dependencies
-  ├── last.pth                                Latest model checkpoint (symlink, updated after training)
+  ├── .gitignore                              What counts as a regenerable output vs. a result
+  ├── last.pth                                Latest model checkpoint (symlink, created by training)
   ├── recommended_configuration.json          Deployment presets
   ├── configs/                                Training configuration files
   ├── experiments/                            Filed run artifacts (configs, weights, curves)
@@ -787,8 +789,28 @@ magician_vision_classifier/
   ├── SharedMemoryVideoBuffers/               Shared memory C library source (upstream clone, untracked)
   ├── models/                                 Trained model archives
   ├── sounds/                                 Audio feedback files
+  ├── doc/                                    Design notes and figures
+  ├── docker/                                 Container build files
   ├── legacy/                                 Retired code, kept for reference only (see legacy/README.md)
 ```
+
+### If you move files again
+
+Two places hold file paths that no tool can infer, and both fail quietly when they go stale:
+
+* **`mvc/paths.py`** is the only module that knows where the repo root is. Everything
+  root-anchored (`configs/`, `models/`, `experiments/`, `recommended_configuration.json`)
+  resolves through `repo_root()`, so a layout change is one edit rather than a dozen.
+* **`PROTOCOL_FILES` in `scripts/run_full_zoo_sweep.sh`** is a hand-maintained list of the
+  sources that define the training protocol; their combined hash is recorded per run in
+  `experiments/zoo_sweep_manifest.tsv` so that a mid-campaign code change cannot silently
+  make early and late runs incomparable. If a path in that list stops existing, `md5sum`
+  hashes nothing and the fingerprint degenerates to a constant — it keeps printing and
+  keeps comparing, it just stops detecting anything. The script now refuses to start
+  rather than let that happen, but the list still has to be updated by hand.
+
+Grep for old module names in `scripts/*.sh` after any move: the shell scripts invoke
+modules by path (`python -m mvc.train`) and are not covered by Python's import checking.
 
 ### Legacy
 
