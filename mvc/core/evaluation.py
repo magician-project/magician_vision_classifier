@@ -23,11 +23,36 @@ import sys
 import numpy as np
 import torch
 from mvc.core.artifact_paths import out_path   # writers emit into experiments/<campaign>/<run>/
+from mvc.paths import repo_root
 
 
 class _SkipSweep(Exception):
     """Raised when there is no clean class, so defect_mass is undefined."""
     pass
+
+
+def _write_plots(json_path):
+    """Render the plots for an artifact JSON, and SAY SO if it cannot.
+
+    This used to be `subprocess.run([sys.executable, "plotTool.py", ...], check=False)`.
+    The layout move turned `plotTool.py` into `analysis/plots/plot_tool.py`, so the call
+    found nothing -- and `check=False` meant every run since then wrote its confusion and
+    threshold JSONs and silently produced no PNGs at all. Nothing failed, nothing logged,
+    the plots simply stopped existing.
+
+    Invoked as `-m` from the repo root so it does not depend on the cwd, and a non-zero
+    exit is reported with the `!!!` prefix the sweep drivers already grep for. It is a
+    warning rather than a raise on purpose: the JSON is the artifact of record and the
+    plots are derived from it, so losing a plot must be loud but must not throw away a
+    finished evaluation.
+    """
+    r = subprocess.run([sys.executable, "-m", "analysis.plots.plot_tool", json_path],
+                       cwd=repo_root(), capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"!!! plotting failed for {json_path} (rc={r.returncode}); the JSON is "
+              f"written, the PNGs are not", file=sys.stderr)
+        if r.stderr:
+            print(r.stderr.strip()[-500:], file=sys.stderr)
 
 
 def run_confusion_and_threshold_sweep(classifier, trainer, val_loader, dataset,
@@ -110,9 +135,7 @@ def run_confusion_and_threshold_sweep(classifier, trainer, val_loader, dataset,
         }
         with open(out_path(model_name, "_confusion.json"), "w") as f:
             json.dump(confusion_json, f, indent=2)
-        subprocess.run(
-            [sys.executable, "plotTool.py", out_path(model_name, "_confusion.json")], check=False
-        )
+        _write_plots(out_path(model_name, "_confusion.json"))
 
         # Threshold sweep -> operating curve + the gate the live path will use.
         # Swept for BOTH gates (liveClassifierTorch.gate_tiles implements them):
@@ -201,9 +224,7 @@ def run_confusion_and_threshold_sweep(classifier, trainer, val_loader, dataset,
         }
         with open(out_path(model_name, "_threshold_curve.json"), "w") as f:
             json.dump(curve_json, f, indent=2)
-        subprocess.run(
-            [sys.executable, "plotTool.py", out_path(model_name, "_threshold_curve.json")], check=False
-        )
+        _write_plots(out_path(model_name, "_threshold_curve.json"))
     except _SkipSweep:
         pass   # no clean class; confusion matrix already written above
     except Exception as e:
