@@ -126,14 +126,18 @@ echo "=== $(date -Is) queue: ${#CFGS[@]} models"
 # completed sweep in the log.
 [ "${#CFGS[@]}" -gt 0 ] || { echo "!!! queue is empty -- generator failed, aborting"; exit 1; }
 
-# A run is complete iff a coverage table exists. Two spellings, because a `timm/` model
-# name puts a directory separator in the middle of the artifact path (see note 1 above).
+# A run is complete iff a coverage table exists. `tidy_experiments.py` files finished
+# artifacts under experiments/<campaign>/<run>/, so a plain root-only `-f` check goes
+# blind on anything already tidied and would retrain it on a resumed queue. find_artifact
+# checks the root first, then experiments/, and already handles the `timm/`
+# slash-in-model-name spelling (see note 1 above) -- so one call covers both.
 coverage_exists() {
     local run="$1"
-    [ -f "${run}_coverage.json" ] && return 0
-    local slashed="${run/_timm_/_timm/}"
-    [ -f "${slashed}_coverage.json" ] && return 0
-    return 1
+    python3 -c "
+from mvc.core.artifact_paths import exists
+import sys
+sys.exit(0 if exists(sys.argv[1] + '_coverage.json') else 1)
+" "$run"
 }
 
 for CFG in "${CFGS[@]}"; do

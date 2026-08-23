@@ -1,40 +1,28 @@
 #!/usr/bin/env python3
-"""Generate the full-budget seed replicates for the anchor and the stride-2 arm.
+"""Generate the seed replicates for the seed-sweep experiment (Experiment B).
 
-WHY THIS RUNS BEFORE ANY FURTHER ARCHITECTURE WORK
---------------------------------------------------
-Every full-budget number in this campaign is n=1. The anchor is one seed, the stride-2 run
-is one seed, and the 9.24 -> 7.15 miss@FA5 gap between them is a single paired difference.
-The 30k screen cannot arbitrate it: its Aug26 noise floor is sd 1.83 miss@FA5 (pooled
-within-arm, 4 arms x 3 seeds, PLAN.md), against a legacy 0.43 -- a dead instrument at that
-budget. So the only way to know whether -2.09 is a result or a coin flip is to pay for the
-seeds at full budget.
+See EXPERIMENT-seed-sweep-and-step-curve.md Sec.5 for the full context. Every one of the
+47-model campaign's coverage deltas is n=1, and the campaign's base rate for single-seed
+findings surviving replication is 0-for-4. This generates seed 1337 and seed 7 replicates
+(seed 42 already exists) for the four challengers the step curve (Experiment A, run
+2026-08-21) did not rule out, so each gets n=3 before the campaign calls a winner:
 
-Three answers come out of this one queue:
+    convnext_tiny      +3.51 coverage -- the recommendation itself
+    efficientnet_b0    +1.22
+    regnet_y_800mf     +0.80 -- marginal by design, the arm this sweep exists to settle
+    convnext_femto     -1.21 -- the density-arm control
 
-  1. STRIDE-2, ESTABLISHED OR WITHDRAWN, at n=3 paired. Same seeds on both arms, so the
-     comparison is paired and the seed-to-seed component cancels.
-  2. THE FULL-BUDGET NOISE FLOOR. Currently unknown at any budget except 30k. Every claim
-     of the form "X beats Y at full budget" in this campaign is unfalsifiable without it.
-  3. THE PER-CLASS COVERAGE NOISE, which is what actually gates shipping. Stride-2 posted
-     -1.37 detection on PositiveDentClassB -- its sole per-class regression -- and the ship
-     rule is per-class-on-detection. Without a per-class sd at full budget there is no way
-     to say whether -1.37 trips it or is indistinguishable from zero.
+The incumbent `convnext_pico` already has n=3 (anc, anc1337, anc7 -- the source of the
+campaign's coverage sd 0.43) and is not regenerated here.
 
-BUDGET: 2 EPOCHS, NOT THE FULL 6/3
-----------------------------------
-Both existing full trains peak at epoch 1 on every metric and fall hard at epoch 2 (anchor
-9.24 -> 11.53, stride-2 7.15 -> 14.43). Two epochs therefore covers the operating point that
-both n=1 runs actually selected, with checkpoint_monitor=val_detect_auroc choosing between
-epoch 0 and epoch 1 exactly as it did for seed 42. Paying for epochs 2-5 would buy only
-worse checkpoints at ~14 h of extra GPU time. This does mean the comparison is
-best-of-2-epochs, and if a replicate seed were to peak at epoch 2 it would be missed -- but
-both existing runs collapse there rather than peak, in the same direction, so the risk is
-small and the same for both arms.
+BUDGET: 2 EPOCHS
+-----------------
+Matches the whole 47-model campaign, and matches what all four parent configs already ran
+at (seed 42, epochs=2) -- see the "Config paths matter" table in the handoff for why these
+specific parent paths and not same-named copies elsewhere in the repo.
 
-Everything except `seed`, the epoch budget and the output names is copied verbatim from the
-two parent configs, so the stride-2 arm still differs from the anchor in the stem stride
-ALONE (DoLP stays on in both -- the anchor is a 5-channel run).
+Everything except `seed` and the output/checkpoint names is copied verbatim from each
+parent config, so a replicate differs from its own seed-42 run in the seed alone.
 
 Usage:  python seed_replicates.py [--dry-run]
 """
@@ -45,13 +33,20 @@ import json
 from mvc.core.artifact_paths import find_artifact
 import sys
 
-# (parent config, name prefix) -- the two arms being replicated.
+# (parent config, name prefix) -- the four challengers being replicated. Full relative
+# paths, not bare basenames: `tiny`/`effb0`/`regy800` all have a same-named but WRONG copy
+# under experiments/configs_runs/ (classes=0, no `classes` list) elsewhere in the repo, and
+# find_artifact resolves an exact existing path immediately without touching that ambiguous
+# basename index -- so the exact path is what keeps this from silently grabbing the wrong
+# file. Verified 2026-08-21: all four resolve, all carry classes=10, seed=42, epochs=2.
 PARENTS = (
-    ('anc_convnext_pico.json',   'anc'),
-    ('ancs2_convnext_pico.json', 'ancs2'),
+    ('experiments/zoo_sweep_full/fzcnxtiny/fzcnxtiny_convnext_tiny.json', 'fzcnxtiny'),
+    ('experiments/zoo_sweep_full/fzeffb0/fzeffb0_efficientnet_b0.json',   'fzeffb0'),
+    ('experiments/zoo_sweep_full/fzregy800/fzregy800_regnet_y_800mf.json', 'fzregy800'),
+    ('configs/msfemto_convnext_femto.json',                                'msfemto'),
 )
-SEEDS = (1337, 7)        # seed 42 already exists at full budget for both arms
-EPOCHS = 2               # see the budget note above
+SEEDS = (1337, 7)        # seed 42 already exists at full budget for all four
+EPOCHS = 2               # matches what all four parents already ran at
 SAVE_TOP_K = 2           # keep both epochs so per-epoch scoring stays possible
 
 # Result keys the trainer writes back into the config after a run. Copying them into a

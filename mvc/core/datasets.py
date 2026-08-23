@@ -202,6 +202,35 @@ def exclude_frames_indices(dataset, exclude_frames):
     return keep
 
 
+def tile_split_indices(dataset, frozen_path):
+    """(train_idx, val_idx) from a frozen RANDOM tile-level split (build_tile_split_val.py).
+
+    Positional, not name-based: unlike frame_disjoint_split's frozen_val_frames, a tile has
+    no identity independent of its row position in the training h5, so this trusts row order
+    matching what the split was built against and refuses outright if the dataset size has
+    changed since -- a silent mismatch here would score against the WRONG tiles, not just
+    fewer of them, which a frame-name lookup would at least degrade gracefully on.
+
+    This split leaks sibling tiles ON PURPOSE (see build_tile_split_val.py) -- it is an
+    in-distribution fit check, not a generalisation measurement.
+    """
+    import json as _json
+    with open(frozen_path) as fh:
+        payload = _json.load(fh)
+    n_total = payload['n_total']
+    if len(dataset) != n_total:
+        raise ValueError(
+            f"{frozen_path}: frozen against {n_total:,} tiles, dataset has {len(dataset):,} "
+            f"-- the dump changed since this split was built; refusing to score against the "
+            f"wrong tiles.")
+    val_idx = list(payload['val_indices'])
+    val_set = set(val_idx)
+    train_idx = [i for i in range(n_total) if i not in val_set]
+    print(f"[tile_split_indices] {frozen_path}: {len(val_idx):,} val / {len(train_idx):,} "
+          f"train tiles (random, tile-level -- leakage expected)")
+    return train_idx, val_idx
+
+
 def frame_disjoint_split(dataset, val_split, seed, frozen_val_frames=None):
     """Split a dataset into (train_idx, val_idx) SAMPLE-index lists by FRAME, not
     by tile — whole source frames go entirely to train or entirely to val, so
@@ -836,6 +865,22 @@ def build_train_val(config_json, *, transform=None, val_only=False, preload_ram=
               f"{config_json['dataloader'].get('seed')}; using hparams.seed to match "
               f"the trainer's split.")
     _seed_everything(seed)
+
+    frozen_tile_split = config_json['dataloader'].get('frozen_tile_split') or None
+    if frozen_tile_split:
+        if config_json.get('validation_dataset') or config_json['dataloader'].get('frame_disjoint_split'):
+            raise ValueError(
+                "dataloader.frozen_tile_split is mutually exclusive with validation_dataset "
+                "and dataloader.frame_disjoint_split -- combining them would make the held-"
+                "out set ambiguous. This is a random, leaky, tile-level split by design; see "
+                "build_tile_split_val.py.")
+        if verbose:
+            print("dataloader.frozen_tile_split set -> RANDOM TILE-LEVEL split "
+                  "(leakage expected; in-distribution fit check, not generalisation)")
+        from torch.utils.data import Subset
+        tr_idx, va_idx = tile_split_indices(dataset, frozen_tile_split)
+        return Split(dataset, None if val_only else Subset(dataset, tr_idx),
+                     Subset(dataset, va_idx), list(dataset.classes), ram_preloaded)
 
     val_dir = config_json.get('validation_dataset')
     if val_dir:
