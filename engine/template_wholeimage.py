@@ -1,9 +1,11 @@
-"""Multiverse engine — template for a third-party classifier design.
+"""Whole-image engine template — starting point for a third-party classifier design.
 
-This is a RUNNABLE SKELETON: as shipped it runs end-to-end with
-``python3 -m mvc.inference.live_torch --model multiverse``, powered by the tiny
-placeholder network below.  Replace the placeholder with the real design by
-following the numbered comments.
+Copy this file to ``engine/<your_name>.py``, rename the classes below to match
+your engine, and adapt the numbered comments.  Then
+``python3 -m mvc.inference.live_torch --model <your_name>`` runs it (with a
+config at ``engine/<your_name>.json``).  As shipped it runs end-to-end powered
+by the tiny placeholder network below — replace the placeholder with the real
+design by following the numbered comments.
 
 The plug-in contract lives in ``mvc/inference/engine_base.py`` — in short:
   * ``build_classifier(cfg_path)`` is the entry point the loader imports.
@@ -11,7 +13,7 @@ The plug-in contract lives in ``mvc/inference/engine_base.py`` — in short:
     logits (N, num_classes)  [tile input mode].
   * ``run_whole_image(frame)`` classifies the entire frame and returns
     (points, classes, confidences)  [whole-image input mode].
-  * The input mode is switched in ``engine/multiverse.json`` under
+  * The input mode is switched in ``engine/<your_name>.json`` under
     ``"input": {"mode": "tiles" | "whole_image", "tile_size": X, "step": Z}``.
 """
 
@@ -24,17 +26,17 @@ from mvc.inference.engine_base import EngineClassifier
 
 
 # --------------------------------------------------------------------------
-# STEP 1 (REPLACE ME): the multiverse network itself.
+# STEP 1 (REPLACE ME): the network itself.
 # --------------------------------------------------------------------------
-# Replace this class with the real multiverse architecture.  Its forward MUST
-# satisfy the tile-model contract: uint8 (N, 4, tile_size, tile_size) in,
-# logits (N, num_classes) out.  classifier_pnm feeds uint8 tiles by design, so
+# Replace this class with the real architecture.  Its forward MUST satisfy the
+# tile-model contract: uint8 (N, 4, tile_size, tile_size) in, logits
+# (N, num_classes) out.  classifier_pnm feeds uint8 tiles by design, so
 # dequantise inside forward (x.float() / 255.0) — keep that even when you
 # replace the body.  num_classes and the tile size come from the engine's
 # .json config; read them (and any arch hyperparameters) from the config
 # inside load_model() below, not from hardcoded values.
 # --------------------------------------------------------------------------
-class _MultiversePlaceholder(nn.Module):
+class _WholeImagePlaceholder(nn.Module):
     """Tiny stand-in network so the engine runs before the real design lands.
     (Two stages + pooling to show where a deeper architecture goes.)"""
 
@@ -53,20 +55,20 @@ class _MultiversePlaceholder(nn.Module):
         return self.out(x)
 
 
-class MultiverseEngine(EngineClassifier):
-    """Multiverse plug-in.  All runtime plumbing (config loading, tiling,
-    gating, heatmap, responses, live_* interface) is inherited from
-    EngineClassifier — only the two hooks below are multiverse-specific."""
+class WholeImageEngine(EngineClassifier):
+    """Whole-image plug-in template.  All runtime plumbing (config loading,
+    tiling, gating, heatmap, responses, live_* interface) is inherited from
+    EngineClassifier — only the two hooks below are design-specific."""
 
     def load_model(self):
-        """HOOK — implement the real multiverse network here.
+        """HOOK — implement the real network here.
 
         Instantiate your architecture and load its weights.  Everything this
         engine needs at build time is in ``self.cfg``; engine-specific settings
-        belong under the ``"multiverse"`` key of engine/multiverse.json, e.g.::
+        belong under the ``"<your_name>"`` key of engine/<your_name>.json, e.g.::
 
-            cfg = self.cfg.get("multiverse", {})
-            weights = cfg.get("model_weights")          # e.g. "engine/multiverse_weights.pt"
+            cfg = self.cfg.get("<your_name>", {})
+            weights = cfg.get("model_weights")          # e.g. "engine/<your_name>_weights.pt"
             model = _YourRealNetwork(num_classes=len(self.classes), ...)
             if weights:
                 model.load_state_dict(torch.load(weights, map_location=self.device,
@@ -76,13 +78,13 @@ class MultiverseEngine(EngineClassifier):
         logits (N, len(self.classes)) for tile mode (see STEP 1 above); the
         base class moves it to self.device and calls .eval() itself.
         """
-        # TODO(multiverse): replace with the real network + weights (see above).
-        return _MultiversePlaceholder(len(self.classes))
+        # TODO(<your_name>): replace with the real network + weights (see above).
+        return _WholeImagePlaceholder(len(self.classes))
 
     def run_whole_image(self, frame):
-        """HOOK — implement the real multiverse whole-image design here.
+        """HOOK — implement the real whole-image design here.
 
-        Only called when engine/multiverse.json sets ``"input": {"mode":
+        Only called when engine/<your_name>.json sets ``"input": {"mode":
         "whole_image"}``.  ``frame`` is the raw numpy HxWx4 uint8 RGBA frame
         from shared memory (runs under torch.inference_mode()).  Return::
 
@@ -100,13 +102,13 @@ class MultiverseEngine(EngineClassifier):
         fully convolutional, so it accepts any spatial size), and — if the top
         class is not the clean class — reports a single detection at the frame
         centre.  If the real design needs a fixed input size, set
-        ``"resize": [W, H]`` under ``"input"`` in engine/multiverse.json (read
+        ``"resize": [W, H]`` under ``"input"`` in engine/<your_name>.json (read
         as ``self.whole_image_resize``).  Replace this with the real design
         (e.g. a detector or segmenter returning per-defect points/boxes).  For
         detections you want to suppress, simply omit them from the lists — the
         gate is a tile-mode concept and does not apply here.
         """
-        # TODO(multiverse): replace with the real whole-image design (see above).
+        # TODO(<your_name>): replace with the real whole-image design (see above).
         orig_h, orig_w = frame.shape[:2]
 
         # Optional fixed input size for designs that need one; absent/None
@@ -129,5 +131,6 @@ class MultiverseEngine(EngineClassifier):
 def build_classifier(cfg_path):
     """Entry point the loader (mvc.inference.engine_base.build_engine) imports
     by name — KEEP this name and signature.  ``cfg_path`` is the engine's .json
-    config (default engine/multiverse.json; override with --model-config)."""
-    return MultiverseEngine(cfg_path, name="multiverse")
+    config (default engine/<your_name>.json; override with --model-config).
+    Replace the name string below with your plug-in's name."""
+    return WholeImageEngine(cfg_path, name="<your_name>")
