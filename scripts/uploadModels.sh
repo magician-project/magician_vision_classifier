@@ -46,8 +46,11 @@ SSH_PORT="${SSH_PORT:-2222}"
 SERVER="${SERVER:-ammar@ammar.gr}"
 SERVER_DIR="${SERVER_DIR:-/home/ammar/public_html/magician/models/CameraV2Models/}"
 ALLOWLIST="${ALLOWLIST:-$SCRIPT_DIR/upload_allowlist.txt}"
-ALLOW_ALL="${ALLOW_ALL:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+
+#Hardcoded to allow all uploads..
+#ALLOW_ALL="${ALLOW_ALL:-0}"
+ALLOW_ALL=1
 
 mkdir -p "$STORE"
 ts="$(date +%Y%m%d_%H%M%S)"
