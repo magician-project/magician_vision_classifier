@@ -1,0 +1,22 @@
+{
+    "engine": "yongatek",
+    "classes": [
+        "class_clean",
+        "class_bubble",
+        "class_smoke"
+    ],
+    "input": {
+        "mode": "tiles",
+        "tile_size": 48,
+        "step": 16
+    },
+    "gate": {
+        "mode": "defect_mass",
+        "threshold": 0.655,
+        "assign_best_defect_class": true
+    },
+    "yongatek": {
+        "_comment": "Engine-specific settings \u2014 weights path, arch params, anything the engine needs. Read from self.cfg in load_model().",
+        "model_weights": "engine/yongatek_weights.pt"
+    }
+}

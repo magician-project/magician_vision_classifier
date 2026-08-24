@@ -1149,7 +1149,11 @@ def parse_arguments(argv=None):
                         help="preset name from recommended_configuration.json (default: first entry)")
     parser.add_argument("--list-configs", action="store_true", help="list the presets and exit")
     parser.add_argument("--model", default=None,
-                        help="override the preset's model name (auto-downloaded if missing)")
+                        help="override the preset's model name (auto-downloaded if missing; "
+                             "an engine/<name>.py plug-in runs when the name matches)")
+    parser.add_argument("--model-config", default=None,
+                        help="path to the engine plug-in's .json config "
+                             "(default engine/<model>.json; only used when --model is an engine)")
     parser.add_argument("--stream", default="stream1", help="shared memory stream name")
     parser.add_argument("--descriptor", default="video_frames.shm", help="shared memory descriptor file")
 
@@ -1234,21 +1238,35 @@ def main(argv=None):
     runtime.apply_preset(preset)
     runtime.apply_cli_overrides(args)
 
-    # Fetch the model if it is not already here, then load it. ensure_model is a no-op
-    # when model_scan() already sees a valid {name}.pth + {name}.json pair.
-    from mvc.inference.model_download import ensure_model
-    if not ensure_model(model_name, PATH):
-        runtime.logger.error(
-            f"Could not obtain model '{model_name}'. Check network access to the model "
-            f"server, or place {model_name}.pth + {model_name}.json in {PATH}. "
-            f"Edit recommended_configuration.json to use a different preset.")
-        runtime.close()
-        return 1
+    # An engine plug-in (engine/<name>.py, a third-party classifier design) has no
+    # .pth on the model server, so it skips ensure_model and is built from its own
+    # .json config (default engine/<name>.json, override with --model-config).
+    from mvc.inference.engine_base import is_engine_name, build_engine
+    if is_engine_name(model_name):
+        try:
+            single_classifier = build_engine(model_name, cfg_path=args.model_config)
+        except Exception as e:
+            runtime.logger.error(f"Could not build engine '{model_name}': {e}")
+            runtime.close()
+            return 1
+    else:
+        if args.model_config:
+            runtime.logger.warning("--model-config ignored — only engine plug-ins take a config path")
+        # Fetch the model if it is not already here, then load it. ensure_model is a no-op
+        # when model_scan() already sees a valid {name}.pth + {name}.json pair.
+        from mvc.inference.model_download import ensure_model
+        if not ensure_model(model_name, PATH):
+            runtime.logger.error(
+                f"Could not obtain model '{model_name}'. Check network access to the model "
+                f"server, or place {model_name}.pth + {model_name}.json in {PATH}. "
+                f"Edit recommended_configuration.json to use a different preset.")
+            runtime.close()
+            return 1
 
-    single_classifier = ClassifierPnm(
-        model_path=os.path.join(PATH, f"{model_name}.pth"),
-        cfg_path=os.path.join(PATH, f"{model_name}.json"),
-    )
+        single_classifier = ClassifierPnm(
+            model_path=os.path.join(PATH, f"{model_name}.pth"),
+            cfg_path=os.path.join(PATH, f"{model_name}.json"),
+        )
     # The preset's gate wins over the model json's own calibration, since the preset is
     # the deployment decision. Mode too -- a threshold means nothing without its mode.
     # An explicit --model is a deliberate departure from the preset, so that model keeps
