@@ -85,9 +85,29 @@ def download_zip(zip_name, dest_dir, base_url=BASE_URL):
     return local
 
 
+def _regenerate_plots(directory, stem):
+    """Render {stem}*.png locally from the sidecar JSONs just extracted, for an
+    archive that did not carry them -- e.g. one built before mvc.export started
+    bundling plots, or a run whose plots failed to render at training time (see
+    mvc.export._find_plots / mvc.core.evaluation._write_plots, the same renderer
+    used here)."""
+    from mvc.core.evaluation import _write_plots
+    for suffix in ("_confusion.json", "_threshold_curve.json"):
+        p = os.path.join(directory, stem + suffix)
+        if os.path.isfile(p):
+            _write_plots(p)
+
+
 def extract_model(zip_path, directory, include_plots=False):
-    """Extract the model files next to the other models; returns extracted names."""
+    """Extract the model files next to the other models; returns extracted names.
+
+    When include_plots is set and the archive itself carries no {model}*.png (an
+    older export, or a run whose plots never rendered), they are regenerated
+    locally from the extracted JSON sidecars instead of shipping a report-less
+    model.
+    """
     extracted = []
+    pth_stem = None
     with zipfile.ZipFile(zip_path) as z:
         for info in z.infolist():
             name = os.path.basename(info.filename)
@@ -97,6 +117,12 @@ def extract_model(zip_path, directory, include_plots=False):
                 info.filename = name  # flatten any leading paths
                 z.extract(info, directory)
                 extracted.append(name)
+            if name.endswith(".pth"):
+                pth_stem = name[:-len(".pth")]
+
+    if include_plots and pth_stem and not any(n.endswith(".png") for n in extracted):
+        _regenerate_plots(os.path.abspath(directory), pth_stem)
+
     return extracted
 
 
@@ -117,17 +143,20 @@ def download_model(model_or_zip, directory=SCRIPT_DIR, include_plots=False, base
     return extracted
 
 
-def ensure_model(model_name, directory=SCRIPT_DIR, base_url=BASE_URL):
+def ensure_model(model_name, directory=SCRIPT_DIR, base_url=BASE_URL, include_plots=True):
     """
     Glue to ClassifierPnm: if model_scan() already sees a valid {model_name}
     pth/json pair in `directory`, do nothing; otherwise fetch it from the server.
+    include_plots defaults to True here (unlike download_model/the CLI) because
+    callers of ensure_model want a fully usable local copy -- e.g. the web/GUI
+    annotator's report pages, which read the confusion/threshold PNGs.
     Returns True if the model is available locally afterwards.
     """
     from mvc.inference.classifier_pnm import ClassifierPnm  # lazy: keeps --list usable without torch
     if model_name in ClassifierPnm.model_scan(directory):
         print(f"{model_name} already present in {directory}")
         return True
-    download_model(model_name, directory, base_url=base_url)
+    download_model(model_name, directory, include_plots=include_plots, base_url=base_url)
     return model_name in ClassifierPnm.model_scan(directory)
 
 
