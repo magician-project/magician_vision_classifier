@@ -549,7 +549,7 @@ def main():
         zip_path = export_run(config_json)
         print(f"Saved everything as {zip_path}")
         print('To upload ALL models copy/paste:')
-        print("  scripts/uploadModels.sh")
+        print("  ALLOW_ALL=1 scripts/uploadModels.sh")
         print('To upload just this one copy/paste:')
         print(f"  scp -P 2222 {zip_path} ammar@ammar.gr:"
               "/home/ammar/public_html/magician/models/CameraV2Models/")

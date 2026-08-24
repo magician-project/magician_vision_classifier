@@ -186,6 +186,28 @@ def _locate(model_name, suffix):
     return find_artifact(os.path.basename(f'{model_name}{suffix}'))
 
 
+def _find_plots(model_name):
+    """Every `{model_name}*.png` belonging to this run, wherever it lives.
+
+    Unlike the SIDECARS (one fixed suffix each, so _locate() can check root vs. filed
+    exactly), a run can have several plots (`_confusion_raw.png`,
+    `_threshold_curve_curve.png`, ...) under a prefix that only the trainer knows in
+    full, so this is a prefix glob rather than a single-file lookup. It has to search
+    both layouts _locate() does: loose in the cwd -- where the trainer's own
+    export_run() call finds them, before tidy_experiments.py has run -- and anywhere
+    under experiments/, since a tidied run is not necessarily at the one path
+    out_path() would compute for it (e.g. `experiments/all/old/`, filed by hand before
+    the campaign scheme existed). Searching the whole tree, not one guessed directory,
+    is what makes this reliable after tidying.
+    """
+    found = {}
+    for stem in (os.path.basename(model_name), sanitise(model_name)):
+        for p in (glob.glob(f'{stem}*.png') +
+                  glob.glob(os.path.join('experiments', '**', f'{stem}*.png'), recursive=True)):
+            found.setdefault(os.path.basename(p), p)
+    return sorted(found.values())
+
+
 def collect_members(model_name, include_tensorboard=True):
     """[(arcname, srcpath)] for everything that belongs in this run's archive."""
     run = sanitise(model_name)
@@ -201,10 +223,10 @@ def collect_members(model_name, include_tensorboard=True):
             missing.append(p)
         else:
             missing.append(p)
-    from mvc.core.artifact_paths import out_path
-    plot_globs = sorted(glob.glob(f'{model_name}*.png')) + \
-        sorted(glob.glob(out_path(model_name, '', create=False) + '*.png'))
-    for p in plot_globs:
+    plots = _find_plots(model_name)
+    if not plots:
+        missing.append(f'{model_name}*.png (no plots found under . or experiments/)')
+    for p in plots:
         stem = os.path.basename(p)
         for pref in (os.path.basename(model_name), sanitise(model_name)):
             if stem.startswith(pref):
