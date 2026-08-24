@@ -2,9 +2,11 @@
   "engine": "yongatek",
   "classes": ["class_clean", "class_bubble", "class_smoke"],
   "input": {
-    "mode": "tiles",
+    "mode": "whole_image",
     "tile_size": 48,
-    "step": 16
+    "step": 16,
+    "resize": null,
+    "_comment_resize": "whole_image mode only: [W, H] fixed input size for designs that need one; null = the model receives the entire frame at full camera resolution"
   },
   "gate": {
     "mode": "defect_mass",

@@ -35,28 +35,24 @@ from mvc.inference.engine_base import EngineClassifier
 # inside load_model() below, not from hardcoded values.
 # --------------------------------------------------------------------------
 class _YongatekPlaceholder(nn.Module):
-    """Tiny stand-in network so the engine runs before the real design lands.
-    (Two stages + pooling to show where a deeper architecture goes.)"""
+    """Tiny stand-in network so the engine runs before the real design lands."""
 
     def __init__(self, num_classes, channels=4):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, 8, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool2d(2)
-        self.out = nn.Linear(16, num_classes)
+        self.conv = nn.Conv2d(channels, 8, kernel_size=3, padding=1)
+        self.out = nn.Linear(8, num_classes)
 
     def forward(self, x):
         x = x.float() / 255.0
-        x = F.relu(self.conv1(x))
-        x = self.pool(F.relu(self.conv2(x)))
+        x = F.relu(self.conv(x))
         x = F.adaptive_avg_pool2d(x, (1, 1)).flatten(1)
         return self.out(x)
 
 
 class YongatekEngine(EngineClassifier):
-    """Yongatek plug-in.  All runtime plumbing (config loading, tiling,
-    gating, heatmap, responses, live_* interface) is inherited from
-    EngineClassifier — only the two hooks below are yongatek-specific."""
+    """Yongatek plug-in.  All runtime plumbing (config loading, tiling, gating,
+    heatmap, responses, live_* interface) is inherited from EngineClassifier —
+    only the two hooks below are yongatek-specific."""
 
     def load_model(self):
         """HOOK — implement the real yongatek network here.
@@ -66,7 +62,7 @@ class YongatekEngine(EngineClassifier):
         belong under the ``"yongatek"`` key of engine/yongatek.json, e.g.::
 
             cfg = self.cfg.get("yongatek", {})
-            weights = cfg.get("model_weights")          # e.g. "engine/yongatek_weights.pt"
+            weights = cfg.get("model_weights")            # e.g. "engine/yongatek_weights.pt"
             model = _YourRealNetwork(num_classes=len(self.classes), ...)
             if weights:
                 model.load_state_dict(torch.load(weights, map_location=self.device,
@@ -100,9 +96,9 @@ class YongatekEngine(EngineClassifier):
         fully convolutional, so it accepts any spatial size), and — if the top
         class is not the clean class — reports a single detection at the frame
         centre.  If the real design needs a fixed input size, set
-        ``"resize": [W, H]`` under ``"input"`` in engine/yongatek.json (read
-        as ``self.whole_image_resize``).  Replace this with the real design
-        (e.g. a detector or segmenter returning per-defect points/boxes).  For
+        ``"resize": [W, H]`` under ``"input"`` in engine/yongatek.json (read as
+        ``self.whole_image_resize``).  Replace this with the real design (e.g.
+        a detector or segmenter returning per-defect points/boxes).  For
         detections you want to suppress, simply omit them from the lists — the
         gate is a tile-mode concept and does not apply here.
         """

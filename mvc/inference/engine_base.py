@@ -23,7 +23,11 @@ The engine reads its own configuration file (path passed to ``build_classifier``
       "input": {
         "mode": "tiles",          # "tiles" (XxY tile_size grid, Z step) or "whole_image"
         "tile_size": 48,          # tile mode: square tile edge in px
-        "step": 16                # tile mode: tile grid stride in px
+        "step": 16,               # tile mode: tile grid stride in px
+        "resize": null            # whole_image mode only, optional: fixed input size
+                                  #   [W, H] for designs that need one; absent/None means
+                                  #   the model receives the ENTIRE frame at full camera
+                                  #   resolution (e.g. 1024x1224x4 uint8 RGBA).
       },
       "gate": {                   # optional; same semantics as a built-in model's gate
         "mode": "defect_mass",    #   "defect_mass" | "max_prob" | "off"
@@ -144,6 +148,16 @@ class EngineClassifier:
         self.tile_size = int(input_cfg.get("tile_size",
                                            self.cfg.get("hparams", {}).get("tile_size", 64)))
         self.step = int(input_cfg.get("step", step))
+        # Whole-image mode only: fixed input size [W, H] for designs that need one.
+        # Absent/None = the model receives the entire frame at full resolution.
+        self.whole_image_resize = input_cfg.get("resize")
+        if self.whole_image_resize is not None:
+            try:
+                self.whole_image_resize = (int(self.whole_image_resize[0]),
+                                           int(self.whole_image_resize[1]))
+            except (TypeError, ValueError, IndexError) as e:
+                raise ValueError(f"Engine config {cfg_path}: input.resize must be "
+                                 f"[W, H] in pixels, got {input_cfg.get('resize')!r}") from e
 
         # Tile decision gate — same semantics as ClassifierPnm.__init__ (see its
         # "gate" comment in classifier_pnm.py). 0.0 leaves the gate OFF (plain argmax).
@@ -176,13 +190,17 @@ class EngineClassifier:
         raise NotImplementedError(f"{type(self).__name__} must implement load_model()")
 
     def run_whole_image(self, frame):
-        """HOOK (optional).  Whole-image input mode.  `frame` is the raw numpy
-        HxWx4 uint8 RGBA frame from shared memory.  Return
+        """HOOK (optional).  Whole-image input mode.  `frame` is the ENTIRE
+        camera frame at full resolution — a raw numpy HxWx4 uint8 RGBA array
+        from shared memory (e.g. 1024x1224x4).  Return
             (points, classes, confidences)
-        where points = list of (x, y) pixel coordinates of detection centres,
-        classes = class-name strings from self.classes, confidences = floats
-        (one entry per detection).  Base default: no detections (safe for
-        engines that only implement tile mode)."""
+        where points = list of (x, y) pixel coordinates of detection centres
+        IN THE ORIGINAL FRAME'S COORDINATES, classes = class-name strings from
+        self.classes, confidences = floats (one entry per detection).  If the
+        design needs a fixed input size, resize internally (or use the config's
+        ``input.resize``) and scale your points back to the original frame.
+        Base default: no detections (safe for engines that only implement tile
+        mode)."""
         return [], [], []
 
     # ------------------------------------------------------- runtime plumbing
