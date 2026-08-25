@@ -1,0 +1,20 @@
+{
+  "engine": "yongatek",
+  "classes": ["class_clean", "class_bubble", "class_smoke"],
+  "input": {
+    "mode": "whole_image",
+    "tile_size": 48,
+    "step": 16,
+    "resize": null,
+    "_comment_resize": "whole_image mode only: [W, H] fixed input size for designs that need one; null = the model receives the entire frame at full camera resolution"
+  },
+  "gate": {
+    "mode": "defect_mass",
+    "threshold": 0.655,
+    "assign_best_defect_class": true
+  },
+  "yongatek": {
+    "_comment": "Engine-specific settings — weights path, arch params, anything the engine needs. Read from self.cfg in load_model().",
+    "model_weights": "engine/yongatek_weights.pt"
+  }
+}

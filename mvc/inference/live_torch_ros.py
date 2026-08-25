@@ -885,25 +885,46 @@ def main():
         i = sys.argv.index("--config")
         if i + 1 < len(sys.argv):
             preset_name = sys.argv[i + 1]
+    # Engine plug-ins (engine/<name>.py) take a config path; default
+    # engine/<model>.json next to the plug-in, override with --model-config.
+    model_config_path = None
+    if "--model-config" in sys.argv:
+        i = sys.argv.index("--model-config")
+        if i + 1 < len(sys.argv):
+            model_config_path = sys.argv[i + 1]
     preset = load_recommended_configuration(preset_name)
     model_name = preset["model"]
     ros_node.apply_preset(preset)
 
-    # Fetch the model if it is not already here, then load it. ensure_model is a no-op
-    # when model_scan() already sees a valid {name}.pth + {name}.json pair.
-    from mvc.inference.model_download import ensure_model
-    if not ensure_model(model_name, PATH):
-        ros_node.get_logger().error(
-            f"Could not obtain model '{model_name}'. Check network access to the model "
-            f"server, or place {model_name}.pth + {model_name}.json in {PATH}. "
-            f"Edit recommended_configuration.json to use a different preset.")
-        rclpy.shutdown()
-        return
+    # An engine plug-in (engine/<name>.py, a third-party classifier design) has no
+    # .pth on the model server, so it skips ensure_model and is built from its own
+    # .json config (default engine/<name>.json, override with --model-config).
+    from mvc.inference.engine_base import is_engine_name, build_engine
+    if is_engine_name(model_name):
+        try:
+            single_classifier = build_engine(model_name, cfg_path=model_config_path)
+        except Exception as e:
+            ros_node.get_logger().error(f"Could not build engine '{model_name}': {e}")
+            rclpy.shutdown()
+            return
+    else:
+        if model_config_path:
+            ros_node.get_logger().warning("--model-config ignored — only engine plug-ins take a config path")
+        # Fetch the model if it is not already here, then load it. ensure_model is a no-op
+        # when model_scan() already sees a valid {name}.pth + {name}.json pair.
+        from mvc.inference.model_download import ensure_model
+        if not ensure_model(model_name, PATH):
+            ros_node.get_logger().error(
+                f"Could not obtain model '{model_name}'. Check network access to the model "
+                f"server, or place {model_name}.pth + {model_name}.json in {PATH}. "
+                f"Edit recommended_configuration.json to use a different preset.")
+            rclpy.shutdown()
+            return
 
-    single_classifier = ClassifierPnm(
-        model_path=os.path.join(PATH, f"{model_name}.pth"),
-        cfg_path=os.path.join(PATH, f"{model_name}.json"),
-    )
+        single_classifier = ClassifierPnm(
+            model_path=os.path.join(PATH, f"{model_name}.pth"),
+            cfg_path=os.path.join(PATH, f"{model_name}.json"),
+        )
     # The preset's gate wins over the model json's own calibration, since the preset is
     # the deployment decision. Mode too -- a threshold means nothing without its mode.
     single_classifier.gateMode = preset["gate"].get("mode", single_classifier.gateMode)

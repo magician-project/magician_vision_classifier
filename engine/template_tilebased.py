@@ -1,0 +1,132 @@
+"""Tile-based engine template — starting point for a third-party classifier design.
+
+Copy this file to ``engine/<your_name>.py``, rename the classes below to match
+your engine, and adapt the numbered comments.  Then
+``python3 -m mvc.inference.live_torch --model <your_name>`` runs it (with a
+config at ``engine/<your_name>.json``).  As shipped it runs end-to-end powered
+by the tiny placeholder network below — replace the placeholder with the real
+design by following the numbered comments.
+
+The plug-in contract lives in ``mvc/inference/engine_base.py`` — in short:
+  * ``build_classifier(cfg_path)`` is the entry point the loader imports.
+  * ``load_model()`` returns a module mapping uint8 (N, 4, tile, tile) tiles to
+    logits (N, num_classes)  [tile input mode].
+  * ``run_whole_image(frame)`` classifies the entire frame and returns
+    (points, classes, confidences)  [whole-image input mode].
+  * The input mode is switched in ``engine/<your_name>.json`` under
+    ``"input": {"mode": "tiles" | "whole_image", "tile_size": X, "step": Z}``.
+"""
+
+import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from mvc.inference.engine_base import EngineClassifier
+
+
+# --------------------------------------------------------------------------
+# STEP 1 (REPLACE ME): the network itself.
+# --------------------------------------------------------------------------
+# Replace this class with the real architecture.  Its forward MUST satisfy the
+# tile-model contract: uint8 (N, 4, tile_size, tile_size) in, logits
+# (N, num_classes) out.  classifier_pnm feeds uint8 tiles by design, so
+# dequantise inside forward (x.float() / 255.0) — keep that even when you
+# replace the body.  num_classes and the tile size come from the engine's
+# .json config; read them (and any arch hyperparameters) from the config
+# inside load_model() below, not from hardcoded values.
+# --------------------------------------------------------------------------
+class _TilebasedPlaceholder(nn.Module):
+    """Tiny stand-in network so the engine runs before the real design lands."""
+
+    def __init__(self, num_classes, channels=4):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, 8, kernel_size=3, padding=1)
+        self.out = nn.Linear(8, num_classes)
+
+    def forward(self, x):
+        x = x.float() / 255.0
+        x = F.relu(self.conv(x))
+        x = F.adaptive_avg_pool2d(x, (1, 1)).flatten(1)
+        return self.out(x)
+
+
+class TilebasedEngine(EngineClassifier):
+    """Tile-based plug-in template.  All runtime plumbing (config loading,
+    tiling, gating, heatmap, responses, live_* interface) is inherited from
+    EngineClassifier — only the two hooks below are design-specific."""
+
+    def load_model(self):
+        """HOOK — implement the real network here.
+
+        Instantiate your architecture and load its weights.  Everything this
+        engine needs at build time is in ``self.cfg``; engine-specific settings
+        belong under the ``"<your_name>"`` key of engine/<your_name>.json, e.g.::
+
+            cfg = self.cfg.get("<your_name>", {})
+            weights = cfg.get("model_weights")          # e.g. "engine/<your_name>_weights.pt"
+            model = _YourRealNetwork(num_classes=len(self.classes), ...)
+            if weights:
+                model.load_state_dict(torch.load(weights, map_location=self.device,
+                                                 weights_only=False))
+
+        The returned module MUST map uint8 (N, 4, tile_size, tile_size) to
+        logits (N, len(self.classes)) for tile mode (see STEP 1 above); the
+        base class moves it to self.device and calls .eval() itself.
+        """
+        # TODO(<your_name>): replace with the real network + weights (see above).
+        return _TilebasedPlaceholder(len(self.classes))
+
+    def run_whole_image(self, frame):
+        """HOOK — implement the real whole-image design here.
+
+        Only called when engine/<your_name>.json sets ``"input": {"mode":
+        "whole_image"}``.  ``frame`` is the raw numpy HxWx4 uint8 RGBA frame
+        from shared memory (runs under torch.inference_mode()).  Return::
+
+            (points, classes, confidences)
+
+        points      = list of (x, y) pixel coordinates of detection centres,
+        classes     = class-name strings taken from self.classes,
+        confidences = float score per detection, one entry per detection.
+
+        Points must be in the ORIGINAL frame's pixel coordinates (the base
+        class draws them on the untouched frame).
+
+        The default below is a working stand-in: it feeds the ENTIRE frame —
+        at full camera resolution — to the model (the placeholder network is
+        fully convolutional, so it accepts any spatial size), and — if the top
+        class is not the clean class — reports a single detection at the frame
+        centre.  If the real design needs a fixed input size, set
+        ``"resize": [W, H]`` under ``"input"`` in engine/<your_name>.json (read
+        as ``self.whole_image_resize``).  Replace this with the real design
+        (e.g. a detector or segmenter returning per-defect points/boxes).  For
+        detections you want to suppress, simply omit them from the lists — the
+        gate is a tile-mode concept and does not apply here.
+        """
+        # TODO(<your_name>): replace with the real whole-image design (see above).
+        orig_h, orig_w = frame.shape[:2]
+
+        # Optional fixed input size for designs that need one; absent/None
+        # means the model receives the ENTIRE frame at full resolution.
+        if self.whole_image_resize is not None:
+            rw, rh = self.whole_image_resize
+            frame = cv2.resize(frame, (rw, rh), interpolation=cv2.INTER_AREA)
+
+        x = torch.as_tensor(frame, device=self.device, dtype=torch.uint8)
+        x = x.permute(2, 0, 1).unsqueeze(0)
+        probs = F.softmax(self.model(x).float(), dim=1)
+        conf, cls = torch.max(probs, dim=1)
+        cls, conf = int(cls.item()), float(conf.item())
+        if self.classes[cls].lower() in ("class_clean", "clean"):
+            return [], [], []
+        # Detection centre in the ORIGINAL frame's coordinates.
+        return [(orig_w // 2, orig_h // 2)], [self.classes[cls]], [conf]
+
+
+def build_classifier(cfg_path):
+    """Entry point the loader (mvc.inference.engine_base.build_engine) imports
+    by name — KEEP this name and signature.  ``cfg_path`` is the engine's .json
+    config (default engine/<your_name>.json; override with --model-config).
+    Replace the name string below with your plug-in's name."""
+    return TilebasedEngine(cfg_path, name="<your_name>")

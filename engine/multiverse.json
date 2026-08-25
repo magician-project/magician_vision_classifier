@@ -1,0 +1,20 @@
+{
+  "engine": "multiverse",
+  "classes": ["class_clean", "class_bubble"],
+  "input": {
+    "mode": "whole_image",
+    "tile_size": 64,
+    "step": 16,
+    "resize": null,
+    "_comment_resize": "whole_image mode only: [W, H] fixed input size for designs that need one; null = the model receives the entire frame at full camera resolution"
+  },
+  "gate": {
+    "mode": "defect_mass",
+    "threshold": 0.60,
+    "assign_best_defect_class": true
+  },
+  "multiverse": {
+    "_comment": "Engine-specific settings — weights path, arch params, anything the engine needs. Read from self.cfg in load_model().",
+    "model_weights": "engine/multiverse_weights.pt"
+  }
+}
