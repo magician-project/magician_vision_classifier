@@ -23,9 +23,37 @@
     "checkpoint, so treat the absolute values as slightly optimistic -- the ranking between",
     "operating points is sound (see ISSUES.md M3).",
     "",
-    "runtime.step / runtime.target_fps are the existing node defaults and are NOT tuned per",
-    "model: no throughput has been measured for these models yet (perf.csv has no rows for",
-    "them). Run benchmarkAllModels.py before trusting them on new hardware."
+    "runtime.step / runtime.target_fps ARE tuned for this model: step 18 (21% less spatial",
+    "sampling than the old step-16 default) is what knowledge/24-8-report.md's frame-level",
+    "test (§13) actually measured convnext_tiny at -- it beats convnext_pico@16 on that",
+    "test despite the coarser sampling. 23.0 fps is the standing deployment target for the",
+    "whole Aug26_78K campaign (5090, GPU_SCALE 1.6x over the A6000 bench).",
+    "",
+    "2026-08-25 UPDATE: model switched from mix_convnext_tiny (legacy forth_altinay",
+    "protocol, pre-Aug26_78K) to fzcnxtiny_convnext_tiny (Aug26_78K, 4ch+DoLP, 10-class,",
+    "coverage carve-out -- knowledge/24-8-report.md §7/§8/§13/§14). This is the",
+    "'challenger' the report's own §15 does NOT declare a clean ship call for: coverage",
+    "and the frame-level test both favor it (+4.34 TIER_A coverage at n=3, ESTABLISHED;",
+    "wins the matched-Hz frame-level comparison 96.40 vs 95.95), but the factory-KPI ship",
+    "rule is UNRESOLVED at n=3 for this model -- numerically a hair worse than the",
+    "incumbent, inside noise. §15: 'the data supports switching to convnext_tiny@step18 on",
+    "every generalization measure this campaign has; it does not support a claim that the",
+    "factory KPI has improved.' This file now reflects a decision to ship on the",
+    "generalization evidence anyway -- see §15 before reverting or re-litigating that call.",
+    "The lightweight mix_shufflenet_v2_x1_0 alternate preset was removed here: it has no",
+    "equivalent run under the current protocol, and leaving its legacy numbers next to",
+    "freshly recalibrated ones would misrepresent it as current.",
+    "",
+    "PUBLISHING NOTE, verified 2026-08-25: fzcnxtiny_convnext_tiny_20260819_161921.zip IS",
+    "already live at http://ammar.gr/magician/models/CameraV2Models/ (uploadModels.sh runs",
+    "with ALLOW_ALL=1 hardcoded, so the allowlist in scripts/upload_allowlist.txt does not",
+    "actually gate what reaches the server -- it is commented out there, but that file is",
+    "currently informational only, not enforced). Ran the exact startup path end to end",
+    "against a clean directory standing in for a deployment box: ensure_model() fetched",
+    "and extracted the newest archive, ClassifierPnm loaded it with zero missing/unexpected",
+    "state-dict keys, and applying this file's 'default' preset produced the same 77.3%",
+    "detected / 0.79% false-alarm gate the threshold_reference below states. Auto-download",
+    "and use are both confirmed working, not just configured."
   ],
 
   "version": 1,
@@ -34,52 +62,56 @@
     "_comment": [
       "Measured operating curve for the default model, so an operator can pick a gate",
       "level without opening the curve file. Read verbatim from",
-      "mix_convnext_tiny_threshold_curve.json (gate mode defect_mass, score = 1 - P(clean)).",
+      "fzcnxtiny_convnext_tiny_threshold_curve.json (gate mode defect_mass, score = 1 - P(clean)),",
+      "Aug26_78K factory-val split, seed 42, 2 epochs, monitored-best checkpoint.",
       "detected = fraction of DEFECT tiles flagged. false_alarm = fraction of CLEAN tiles",
       "flagged; multiply by the tiles-per-frame count to get crosses per frame.",
       "",
-      "NOTE the curve is unusually FLAT: 0.30 -> 0.96 cuts false alarms 21x (10.27% ->",
-      "0.49%) for only 6 points of detection. High thresholds are cheap on this model.",
-      "This is model-specific -- on allclass_forthalt_custom the same move costs 15 points.",
+      "This curve is an AGGREGATE, incidence-weighted number over the factory val split",
+      "(87.6% welding) -- knowledge/24-8-report.md §2.5 argues this instrument is weak for",
+      "exactly the class-balance reasons that make convnext_tiny's gain hard to see here.",
+      "The per-class TIER_A coverage case (+4.34, ESTABLISHED, §14) is the stronger evidence",
+      "for this model; this curve exists only to calibrate a deployable gate threshold.",
       "",
-      "A false-alarm rate below ~0.15% is NOT reachable: the sweep stops at 0.995."
+      "A false-alarm rate below ~0.24% is NOT reachable: the sweep bottoms out at threshold",
+      "0.995."
     ],
-    "model": "mix_convnext_tiny",
+    "model": "fzcnxtiny_convnext_tiny",
     "gate_mode": "defect_mass",
-    "source": "mix_convnext_tiny_threshold_curve.json",
+    "source": "fzcnxtiny_convnext_tiny_threshold_curve.json",
     "curve": [
-      {"threshold": 0.300, "detected": 0.972, "false_alarm": 0.1027},
-      {"threshold": 0.500, "detected": 0.960, "false_alarm": 0.0492},
-      {"threshold": 0.590, "detected": 0.955, "false_alarm": 0.0363, "pick": "best_kpi"},
-      {"threshold": 0.700, "detected": 0.947, "false_alarm": 0.0249},
-      {"threshold": 0.800, "detected": 0.939, "false_alarm": 0.0152},
-      {"threshold": 0.850, "detected": 0.934, "false_alarm": 0.0119},
-      {"threshold": 0.885, "detected": 0.929, "false_alarm": 0.0098},
-      {"threshold": 0.900, "detected": 0.927, "false_alarm": 0.0088, "pick": "default"},
-      {"threshold": 0.940, "detected": 0.918, "false_alarm": 0.0062},
-      {"threshold": 0.960, "detected": 0.911, "false_alarm": 0.0049, "pick": "deployment"},
-      {"threshold": 0.980, "detected": 0.898, "false_alarm": 0.0034},
-      {"threshold": 0.990, "detected": 0.883, "false_alarm": 0.0022},
-      {"threshold": 0.995, "detected": 0.865, "false_alarm": 0.0015}
+      {"threshold": 0.300, "detected": 0.9676, "false_alarm": 0.1835},
+      {"threshold": 0.500, "detected": 0.9405, "false_alarm": 0.0882},
+      {"threshold": 0.515, "detected": 0.9384, "false_alarm": 0.0837, "pick": "best_kpi"},
+      {"threshold": 0.635, "detected": 0.9179, "false_alarm": 0.0555, "pick": "balanced"},
+      {"threshold": 0.700, "detected": 0.9047, "false_alarm": 0.0441},
+      {"threshold": 0.800, "detected": 0.8795, "false_alarm": 0.0298},
+      {"threshold": 0.880, "detected": 0.8506, "false_alarm": 0.0198},
+      {"threshold": 0.900, "detected": 0.8400, "false_alarm": 0.0174},
+      {"threshold": 0.940, "detected": 0.8114, "false_alarm": 0.0123},
+      {"threshold": 0.960, "detected": 0.7888, "false_alarm": 0.0095, "pick": "one_percent_fa"},
+      {"threshold": 0.970, "detected": 0.7727, "false_alarm": 0.0079, "pick": "default"},
+      {"threshold": 0.985, "detected": 0.7339, "false_alarm": 0.0049, "pick": "deployment"},
+      {"threshold": 0.995, "detected": 0.6673, "false_alarm": 0.0024, "pick": "minimal_false_alarm"}
     ],
     "lowest_threshold_meeting_a_false_alarm_budget": [
-      {"budget": 0.0025, "threshold": 0.990, "detected": 0.883, "false_alarm": 0.0022},
-      {"budget": 0.0050, "threshold": 0.960, "detected": 0.911, "false_alarm": 0.0049},
-      {"budget": 0.0100, "threshold": 0.885, "detected": 0.929, "false_alarm": 0.0098},
-      {"budget": 0.0200, "threshold": 0.740, "detected": 0.944, "false_alarm": 0.0197},
-      {"budget": 0.0500, "threshold": 0.500, "detected": 0.960, "false_alarm": 0.0492},
-      {"budget": 0.1000, "threshold": 0.310, "detected": 0.972, "false_alarm": 0.0984}
+      {"budget": 0.0025, "threshold": 0.995, "detected": 0.6673, "false_alarm": 0.0024},
+      {"budget": 0.0050, "threshold": 0.985, "detected": 0.7339, "false_alarm": 0.0049},
+      {"budget": 0.0100, "threshold": 0.960, "detected": 0.7888, "false_alarm": 0.0095},
+      {"budget": 0.0200, "threshold": 0.880, "detected": 0.8506, "false_alarm": 0.0198},
+      {"budget": 0.0500, "threshold": 0.670, "detected": 0.9112, "false_alarm": 0.0492},
+      {"budget": 0.1000, "threshold": 0.465, "detected": 0.9454, "false_alarm": 0.0995}
     ]
   },
 
   "configurations": [
     {
       "name": "default",
-      "description": "mix_convnext_tiny at the node's historical gate setting. Best detection-vs-false-alarm of the mix_* family: 92.7% of defect tiles caught for 0.88% false alarms on clean tiles.",
-      "model": "mix_convnext_tiny",
+      "description": "fzcnxtiny_convnext_tiny (Aug26_78K challenger, step 18) at ~0.8% false alarms on the factory-val curve. Best per-class coverage in the campaign (+4.34 TIER_A, ESTABLISHED n=3, knowledge/24-8-report.md §14) -- see the file-level README before treating this as a fully settled ship decision.",
+      "model": "fzcnxtiny_convnext_tiny",
       "gate": {
         "mode": "defect_mass",
-        "threshold": 0.90,
+        "threshold": 0.970,
         "assign_best_defect_class": true
       },
       "runtime": {
@@ -92,116 +124,16 @@
         "two_stage": false
       },
       "measured": {
-        "source": "mix_convnext_tiny_threshold_curve.json",
-        "detected": 0.927,
-        "false_alarm": 0.0088
+        "source": "fzcnxtiny_convnext_tiny_threshold_curve.json",
+        "detected": 0.7727,
+        "false_alarm": 0.0079
       }
     },
 
     {
       "name": "low_false_alarm",
-      "description": "Same model at its trainer-computed deployment point (highest detection subject to a 0.5% false-alarm budget). Roughly halves false alarms for 1.6 points of detection.",
-      "model": "mix_convnext_tiny",
-      "gate": {
-        "mode": "defect_mass",
-        "threshold": 0.96,
-        "assign_best_defect_class": true
-      },
-      "runtime": {
-        "step": 18,
-        "target_fps": 23.0,
-        "erosion_kernel": 1,
-        "min_votes": 2,
-        "majority_voting": true,
-        "frame_limiter": true,
-        "two_stage": false
-      },
-      "measured": {
-        "source": "mix_convnext_tiny_threshold_curve.json",
-        "detected": 0.911,
-        "false_alarm": 0.0049
-      }
-    },
-
-    {
-      "name": "minimal_false_alarm",
-      "description": "Strictest useful gate: 0.22% false alarms, still catching 88.3% of defect tiles. Use when crosses are acted on automatically and a false stop is expensive. Below roughly 0.15% FA is not reachable on this model.",
-      "model": "mix_convnext_tiny",
-      "gate": {
-        "mode": "defect_mass",
-        "threshold": 0.99,
-        "assign_best_defect_class": true
-      },
-      "runtime": {
-        "step": 18,
-        "target_fps": 23.0,
-        "erosion_kernel": 1,
-        "min_votes": 2,
-        "majority_voting": true,
-        "frame_limiter": true,
-        "two_stage": false
-      },
-      "measured": {
-        "source": "mix_convnext_tiny_threshold_curve.json",
-        "detected": 0.883,
-        "false_alarm": 0.0022
-      }
-    },
-
-    {
-      "name": "one_percent_fa",
-      "description": "Highest detection available inside a 1% false-alarm budget. Practically the same detection as the default (92.9% vs 92.7%) at a marginally higher false-alarm rate -- pick whichever budget the line actually enforces.",
-      "model": "mix_convnext_tiny",
-      "gate": {
-        "mode": "defect_mass",
-        "threshold": 0.885,
-        "assign_best_defect_class": true
-      },
-      "runtime": {
-        "step": 18,
-        "target_fps": 23.0,
-        "erosion_kernel": 1,
-        "min_votes": 2,
-        "majority_voting": true,
-        "frame_limiter": true,
-        "two_stage": false
-      },
-      "measured": {
-        "source": "mix_convnext_tiny_threshold_curve.json",
-        "detected": 0.929,
-        "false_alarm": 0.0098
-      }
-    },
-
-    {
-      "name": "high_recall",
-      "description": "mix_convnext_tiny at its KPI-optimal gate (misses weighted 2x against false alarms). Use only where an operator reviews the crosses -- the false-alarm rate is an order of magnitude higher than the default.",
-      "model": "mix_convnext_tiny",
-      "gate": {
-        "mode": "defect_mass",
-        "threshold": 0.59,
-        "assign_best_defect_class": true
-      },
-      "runtime": {
-        "step": 18,
-        "target_fps": 23.0,
-        "erosion_kernel": 1,
-        "min_votes": 2,
-        "majority_voting": true,
-        "frame_limiter": true,
-        "two_stage": false
-      },
-      "measured": {
-        "source": "mix_convnext_tiny_threshold_curve.json",
-        "detected": 0.955,
-        "false_alarm": 0.0363
-      }
-    },
-
-    {
-      "name": "lightweight",
-      "description": "mix_shufflenet_v2_x1_0 -- by far the smallest archive (14 MB vs 311 MB) for constrained hardware or slow links. Detection is materially worse at a matched false-alarm budget, so prefer the default unless throughput or download size forces this.",
-      "model": "mix_shufflenet_v2_x1_0",
+      "description": "Same model near the trainer's deployment point (~0.5% false-alarm budget). Roughly halves false alarms relative to default for 4 points of factory-curve detection.",
+      "model": "fzcnxtiny_convnext_tiny",
       "gate": {
         "mode": "defect_mass",
         "threshold": 0.985,
@@ -217,9 +149,84 @@
         "two_stage": false
       },
       "measured": {
-        "source": "mix_shufflenet_v2_x1_0_threshold_curve.json",
-        "detected": 0.762,
-        "false_alarm": 0.0039
+        "source": "fzcnxtiny_convnext_tiny_threshold_curve.json",
+        "detected": 0.7339,
+        "false_alarm": 0.0049
+      }
+    },
+
+    {
+      "name": "minimal_false_alarm",
+      "description": "Strictest useful gate: 0.24% false alarms on the factory curve. Use when crosses are acted on automatically and a false stop is expensive. Below roughly 0.24% FA is not reachable on this model.",
+      "model": "fzcnxtiny_convnext_tiny",
+      "gate": {
+        "mode": "defect_mass",
+        "threshold": 0.995,
+        "assign_best_defect_class": true
+      },
+      "runtime": {
+        "step": 18,
+        "target_fps": 23.0,
+        "erosion_kernel": 1,
+        "min_votes": 2,
+        "majority_voting": true,
+        "frame_limiter": true,
+        "two_stage": false
+      },
+      "measured": {
+        "source": "fzcnxtiny_convnext_tiny_threshold_curve.json",
+        "detected": 0.6673,
+        "false_alarm": 0.0024
+      }
+    },
+
+    {
+      "name": "one_percent_fa",
+      "description": "Highest detection available inside a 1% false-alarm budget on the factory curve.",
+      "model": "fzcnxtiny_convnext_tiny",
+      "gate": {
+        "mode": "defect_mass",
+        "threshold": 0.960,
+        "assign_best_defect_class": true
+      },
+      "runtime": {
+        "step": 18,
+        "target_fps": 23.0,
+        "erosion_kernel": 1,
+        "min_votes": 2,
+        "majority_voting": true,
+        "frame_limiter": true,
+        "two_stage": false
+      },
+      "measured": {
+        "source": "fzcnxtiny_convnext_tiny_threshold_curve.json",
+        "detected": 0.7888,
+        "false_alarm": 0.0095
+      }
+    },
+
+    {
+      "name": "high_recall",
+      "description": "fzcnxtiny_convnext_tiny at its trainer-calibrated KPI-optimal gate. Use only where an operator reviews the crosses -- the false-alarm rate is an order of magnitude higher than the default.",
+      "model": "fzcnxtiny_convnext_tiny",
+      "gate": {
+        "mode": "defect_mass",
+        "threshold": 0.515,
+        "assign_best_defect_class": true
+      },
+      "runtime": {
+        "step": 18,
+        "target_fps": 23.0,
+        "erosion_kernel": 1,
+        "min_votes": 2,
+        "majority_voting": true,
+        "frame_limiter": true,
+        "two_stage": false
+      },
+      "measured": {
+        "source": "fzcnxtiny_convnext_tiny_threshold_curve.json",
+        "detected": 0.9384,
+        "false_alarm": 0.0837
       }
     }
   ]
