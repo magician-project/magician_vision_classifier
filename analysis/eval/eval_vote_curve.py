@@ -17,8 +17,21 @@ per-class table in this repo (see e.g. `knowledge/25-8-mono-vs-pol-report.md` §
 This runs ONE deployment-step frame pass per frame (reusing `eval_step_curve.py`'s
 frame-reading, labelling and tiling machinery exactly, so a mislabel here is not a second
 place to get the annotator's conventions subtly wrong), caches each frame's mass grid, and
-then sweeps GATE THRESHOLD x MIN_VOTES in memory -- one inference pass per frame, not one
-per (threshold, votes) combination.
+then sweeps GATE THRESHOLD x EROSION_KERNEL x MIN_VOTES in memory -- one inference pass per
+frame, not one per combination.
+
+KERNEL IS SWEPT TOO, NOT FIXED AT THE DEPLOYED DEFAULT
+--------------------------------------------------------
+`min_votes` only means something relative to its neighbourhood size: `min_votes=2` in a 3x3
+window (9 cells, kernel=1) is a very different bar than `min_votes=2` in a 5x5 window (25
+cells, kernel=2). Fixing kernel at the deployed default and only sweeping threshold x votes
+cannot tell you whether that default is actually a good choice, or whether a different
+neighbourhood size gives a strictly better tradeoff at the same or fewer required votes. The
+per-(frame, threshold, kernel) neighbour count is an integral image, O(cells) regardless of
+kernel size, and it is the once-per-frame inference pass that dominates cost either way -- so
+this is cheap to add. `kernel=0` (a 1x1 "neighbourhood" -- only the tile itself) makes
+`votes<=1` a no-op and `votes>=2` unsatisfiable by construction (a tile only ever counts
+itself); that is not a bug, it is kernel=0 correctly reporting "no spatial context available".
 
 WHY IT ONLY APPLIES TO CONFIGS WITH A REAL COVERAGE CARVE-OUT
 ---------------------------------------------------------------
@@ -42,7 +55,7 @@ contract -- so the votes=0 or 1 row of the output is exactly the existing no-vot
 Usage:
     python -m analysis.eval.eval_vote_curve <config.json> [checkpoint.ckpt] \\
         [--step 16] [--stride N] [--limit N] \\
-        [--kernel 1] [--votes 0,1,2,3,4] [--thresholds 0.30:0.995:0.01]
+        [--kernels 0,1,2] [--votes 0,1,2,3,4] [--thresholds 0.30:0.995:0.01]
 """
 
 import argparse
@@ -135,7 +148,9 @@ def main():
                     help='deployment tiling step (default: ships-at step from the bench, else 16)')
     ap.add_argument('--stride', type=int, default=1, help='score every Nth frame')
     ap.add_argument('--limit', type=int, default=0, help='stop after N frames (0 = all)')
-    ap.add_argument('--kernel', type=int, default=1, help='erosion_kernel (neighbourhood radius)')
+    ap.add_argument('--kernels', default='0,1,2',
+                    help='erosion_kernel (neighbourhood radius) values to sweep; 1 is the '
+                         'current deployed default (recommended_configuration.json)')
     ap.add_argument('--votes', default='0,1,2,3,4', help='min_votes values to sweep')
     ap.add_argument('--thresholds', default='0.30:0.995:0.01', help='lo:hi:step')
     ap.add_argument('--min-points', type=int, default=25)
@@ -176,6 +191,7 @@ def main():
                     step = 18   # matches the one non-16 deployment step used in this repo
             break
     votes_list = [int(v) for v in args.votes.split(',')]
+    kernels = [int(k) for k in args.kernels.split(',')]
     thresholds = parse_thresholds(args.thresholds)
 
     p = find_artifact('val_coverage_frames.json')
@@ -184,7 +200,7 @@ def main():
     wanted = sorted(set(json.load(open(p))['frames']))[::args.stride]
     if args.limit:
         wanted = wanted[:args.limit]
-    print(f'[vote-curve] step {step}, kernel {args.kernel}, votes {votes_list}, '
+    print(f'[vote-curve] step {step}, kernels {kernels}, votes {votes_list}, '
           f'{len(thresholds)} thresholds, {len(wanted):,} coverage frames requested')
 
     import glob
@@ -250,63 +266,77 @@ def main():
           f'macro over {len(macro_set)} classes ({len(tier_a_set)} TIER_A)')
 
     # --- the sweep ----------------------------------------------------------------------
+    # masks depend only on threshold, not kernel -- computed once per threshold and shared
+    # across every kernel in the loop below, so the kernel axis adds neighbour-count cost
+    # only (integral image, O(cells)), not a second inference or mask pass.
     rows = []
     for t in thresholds:
         masks = [f['mass2d'] >= t for f in frames]
-        counts_per_frame = [neighbor_counts(m, args.kernel) for m in masks]
-        for v in votes_list:
-            voted = [m & (c >= v) for m, c in zip(masks, counts_per_frame)]
-            fa_num = fa_den = 0
-            per_class_hit = defaultdict(int)
-            per_class_n = defaultdict(int)
-            for f, vm in zip(frames, voted):
-                keep = f['keep']
-                fa_num += int(vm[keep].sum())
-                fa_den += int(keep.sum())
-                for (iy, ix, cls) in f['points']:
-                    if cls not in macro_set:
-                        continue
-                    per_class_n[cls] += 1
-                    if iy is not None and vm[iy, ix].any():
-                        per_class_hit[cls] += 1
-            fa = fa_num / max(fa_den, 1)
-            per_class_det = {c: per_class_hit[c] / max(per_class_n[c], 1) for c in macro_set}
-            macro = float(np.mean([per_class_det[c] for c in macro_set])) if macro_set else float('nan')
-            macro_a = float(np.mean([per_class_det[c] for c in tier_a_set])) if tier_a_set else float('nan')
-            rows.append({'threshold': round(float(t), 4), 'min_votes': v,
-                         'false_alarm': fa, 'macro_detect': macro,
-                         'macro_detect_tier_a': macro_a})
+        for k in kernels:
+            counts_per_frame = [neighbor_counts(m, k) for m in masks]
+            for v in votes_list:
+                voted = [m & (c >= v) for m, c in zip(masks, counts_per_frame)]
+                fa_num = fa_den = 0
+                per_class_hit = defaultdict(int)
+                per_class_n = defaultdict(int)
+                for f, vm in zip(frames, voted):
+                    keep = f['keep']
+                    fa_num += int(vm[keep].sum())
+                    fa_den += int(keep.sum())
+                    for (iy, ix, cls) in f['points']:
+                        if cls not in macro_set:
+                            continue
+                        per_class_n[cls] += 1
+                        if iy is not None and vm[iy, ix].any():
+                            per_class_hit[cls] += 1
+                fa = fa_num / max(fa_den, 1)
+                per_class_det = {c: per_class_hit[c] / max(per_class_n[c], 1) for c in macro_set}
+                macro = float(np.mean([per_class_det[c] for c in macro_set])) if macro_set else float('nan')
+                macro_a = float(np.mean([per_class_det[c] for c in tier_a_set])) if tier_a_set else float('nan')
+                rows.append({'threshold': round(float(t), 4), 'kernel': k, 'min_votes': v,
+                             'false_alarm': fa, 'macro_detect': macro,
+                             'macro_detect_tier_a': macro_a})
 
-    # --- pick an operating point per votes level: highest macro_detect_tier_a inside a
-    # false-alarm budget matched to what the raw (no-vote) curve needs for ~1% FA, so the
+    # --- pick an operating point per (kernel, votes) pair: highest macro_detect_tier_a
+    # inside a false-alarm budget matched to what the raw curve needs for ~1% FA, so the
     # picks are comparable to what score_checkpoints.py already reports.
     picks = {}
-    for v in votes_list:
-        vrows = [r for r in rows if r['min_votes'] == v]
-        in_budget = [r for r in vrows if r['false_alarm'] <= 0.01]
-        picks[v] = max(in_budget, key=lambda r: r['macro_detect_tier_a']) if in_budget \
-            else min(vrows, key=lambda r: r['false_alarm'])
+    for k in kernels:
+        for v in votes_list:
+            vrows = [r for r in rows if r['kernel'] == k and r['min_votes'] == v]
+            in_budget = [r for r in vrows if r['false_alarm'] <= 0.01]
+            picks[(k, v)] = max(in_budget, key=lambda r: r['macro_detect_tier_a']) if in_budget \
+                else min(vrows, key=lambda r: r['false_alarm'])
 
-    print(f"\n{'min_votes':>9s} {'threshold':>9s} {'FA%':>7s} {'macro%':>7s} {'TIER_A%':>8s}"
-          f"   (best inside a 1% FA budget)")
-    for v in votes_list:
-        p = picks[v]
-        print(f"{v:9d} {p['threshold']:9.3f} {p['false_alarm']*100:7.3f} "
-              f"{p['macro_detect']*100:7.2f} {p['macro_detect_tier_a']*100:8.2f}")
+    print(f"\n{'kernel':>6s} {'min_votes':>9s} {'threshold':>9s} {'FA%':>7s} {'macro%':>7s} "
+          f"{'TIER_A%':>8s}   (best inside a 1% FA budget)")
+    for k in kernels:
+        for v in votes_list:
+            p = picks[(k, v)]
+            print(f"{k:6d} {v:9d} {p['threshold']:9.3f} {p['false_alarm']*100:7.3f} "
+                  f"{p['macro_detect']*100:7.2f} {p['macro_detect_tier_a']*100:8.2f}")
 
-    no_vote = picks[min(v for v in votes_list if v <= 1)] if any(v <= 1 for v in votes_list) else None
-    deployed = picks[2] if 2 in picks else None
-    if no_vote and deployed:
-        print(f"\nvoting (min_votes=2) vs no voting, both at their own best-in-budget "
-              f"threshold:\n  ΔFA    = {(deployed['false_alarm']-no_vote['false_alarm'])*100:+.3f} pts"
-              f"\n  ΔTIER_A = {(deployed['macro_detect_tier_a']-no_vote['macro_detect_tier_a'])*100:+.2f} pts")
+    best = max(picks.values(), key=lambda r: r['macro_detect_tier_a'])
+    print(f"\nbest overall inside the 1% FA budget: kernel={best['kernel']} "
+          f"min_votes={best['min_votes']} threshold={best['threshold']:.3f} "
+          f"-> TIER_A {best['macro_detect_tier_a']*100:.2f}%")
+
+    deployed_key = (1, 2)   # recommended_configuration.json's current default
+    no_vote_key = (1, 1)
+    if deployed_key in picks and no_vote_key in picks:
+        d, nv = picks[deployed_key], picks[no_vote_key]
+        print(f"\ndeployed default (kernel=1, min_votes=2) vs no voting (kernel=1, "
+              f"min_votes<=1), both at their own best-in-budget threshold:"
+              f"\n  ΔFA     = {(d['false_alarm']-nv['false_alarm'])*100:+.3f} pts"
+              f"\n  ΔTIER_A = {(d['macro_detect_tier_a']-nv['macro_detect_tier_a'])*100:+.2f} pts")
 
     out = args.out or out_path(f"{cfg['name']}_{cfg['model']}", '_vote_curve.json')
     json.dump({'config': os.path.basename(args.config), 'model': cfg['model'],
-               'checkpoint': os.path.basename(ckpt), 'step': step, 'kernel': args.kernel,
+               'checkpoint': os.path.basename(ckpt), 'step': step, 'kernels': kernels,
                'frames_scored': len(frames), 'tiles_per_frame': tpf,
                'macro_classes': macro_set, 'macro_classes_tier_a': tier_a_set,
-               'rows': rows, 'picks': {str(k): v for k, v in picks.items()}},
+               'rows': rows,
+               'picks': {f'{k}_{v}': picks[(k, v)] for k in kernels for v in votes_list}},
               open(out, 'w'), indent=1)
     print(f'\nwrote {out}')
 
