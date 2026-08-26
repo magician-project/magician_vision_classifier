@@ -88,6 +88,7 @@ def plot_threshold_curve(path, title, sweep, best_balanced, best_kpi):
     bal = det - fa
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle(title)
     lim = max(10.0, fa.max() * 1.1)
     ax1.plot([0, lim], [0, lim], ls=':', color='gray', lw=1)
     ax1.plot(fa, det, color='#2a78d6', lw=2)
@@ -104,7 +105,7 @@ def plot_threshold_curve(path, title, sweep, best_balanced, best_kpi):
                      fontsize=9, ha='right' if bx > lim * 0.7 else 'left')
     ax1.set_xlabel('False alarms on clean tiles (%)')
     ax1.set_ylabel('Defect tiles detected (%)')
-    ax1.set_title(f'{title} - Operating Curve')
+    ax1.set_title('Operating Curve')
     ax1.grid(alpha=0.3)
 
     ax2.plot(thr, bal, color='#2a78d6', lw=2)
@@ -112,10 +113,10 @@ def plot_threshold_curve(path, title, sweep, best_balanced, best_kpi):
     ax2.scatter([thr[bb]], [bal[bb]], s=50, color='#2a78d6', zorder=4)
     ax2.set_xlabel('Confidence threshold')
     ax2.set_ylabel('Balance = detected% - false-alarm%')
-    ax2.set_title(f'{title} - Balance vs Threshold')
+    ax2.set_title('Balance vs Threshold')
     ax2.grid(alpha=0.3)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
     plt.savefig(f'{path}_curve.png')
     plt.close()
     print(f'Wrote {path}_curve.png')
