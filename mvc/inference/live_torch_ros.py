@@ -193,7 +193,7 @@ class DefectPublisher(Node):
         self._threshold = 0.90
         self._last_pushed_threshold = None   # avoid re-assigning an unchanged value every frame
         self._erosion_kernel = 1   # neighborhood radius for tile voting: (2k+1)^2 tiles
-        self._min_votes = 2        # activated tiles (incl. itself) required in the neighborhood to accept a tile; 0/1 = voting off
+        self._min_votes = 6        # activated tiles (incl. itself) required in the neighborhood to accept a tile; 0/1 = voting off
         self._majority_voting = True
 
         self._lock = threading.Lock()
