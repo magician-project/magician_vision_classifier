@@ -87,7 +87,8 @@ CANDIDATES = [
 REPARAM = {'repvgg_a0', 'mobileone_s0', 'mobileone_s1'}
 
 RESULT_KEYS = ('confusion_matrix', 'classes', 'classes_int', 'gate', 'model_md5',
-               'best_threshold_balanced', 'best_threshold_kpi', 'best_threshold_deployment')
+               'best_threshold_balanced', 'best_threshold_kpi', 'best_threshold_deployment',
+               'training_started', 'training_finished', 'training_seconds', 'fit_seconds')
 
 
 def main():

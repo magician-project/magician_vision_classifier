@@ -37,7 +37,8 @@ TILE_SPLIT = 'experiments/configs_frozen/traintest_tile_split_frozen.json'
 EXCLUDE_UNFINISHED = {'swin_v2_t', 'resnet18_fullres'}
 
 RESULT_KEYS = ('confusion_matrix', 'classes', 'classes_int', 'gate', 'model_md5',
-               'best_threshold_balanced', 'best_threshold_kpi', 'best_threshold_deployment')
+               'best_threshold_balanced', 'best_threshold_kpi', 'best_threshold_deployment',
+               'training_started', 'training_finished', 'training_seconds', 'fit_seconds')
 
 
 def model_list():

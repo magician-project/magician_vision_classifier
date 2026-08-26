@@ -55,7 +55,8 @@ LIMIT_TRAIN_BATCHES = 30000   # ~31 min/run; the anchor did 121,322 steps in ~2h
 # Result keys the trainer writes back into the config. Copying them into a fresh config
 # would leave a run advertising another run's confusion matrix until it finishes.
 RESULT_KEYS = ('confusion_matrix', 'classes', 'classes_int', 'gate', 'model_md5',
-               'best_threshold_balanced', 'best_threshold_kpi', 'best_threshold_deployment')
+               'best_threshold_balanced', 'best_threshold_kpi', 'best_threshold_deployment',
+               'training_started', 'training_finished', 'training_seconds', 'fit_seconds')
 
 ARMS = {
     'base':    {},

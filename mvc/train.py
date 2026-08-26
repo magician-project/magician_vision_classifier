@@ -15,6 +15,7 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 from collections import Counter
 
 import numpy as np
@@ -74,6 +75,13 @@ def main():
     """
     # Enable TF32 for faster matmul on Ampere+ GPUs without losing meaningful precision.
     torch.set_float32_matmul_precision('high')
+
+    # Wall-clock timing, written into the run's own JSON (see the save site below) so
+    # `analysis/sweeps/*` hour estimates can be checked against a measured number instead
+    # of only the throughput-ratio guesses they currently use, and so a driver script's log
+    # timestamps are not the only record of how long a run actually took.
+    _run_started_at = datetime.datetime.now().isoformat()
+    _run_t0 = time.perf_counter()
 
     configuration_file = "config.json"
     if len(sys.argv) > 1:
@@ -482,7 +490,9 @@ def main():
 
     #Train and log to console
     #------------------------------------------------------------------
+    _fit_t0 = time.perf_counter()
     trainer.fit(classifier, train_loader, val_loader)
+    fit_seconds = time.perf_counter() - _fit_t0
 
     # Restore the best-val_loss epoch before saving/validating/confusion matrix
     if best_ckpt.best_model_path:
@@ -522,6 +532,19 @@ def main():
         for chunk in iter(lambda: f.read(8192), b''):
             md5.update(chunk)
     config_json['model_md5'] = md5.hexdigest()
+
+    # Wall-clock timing (see the _run_t0/_fit_t0 markers above). `training_seconds` is the
+    # whole `mvc.train` invocation -- config load, dataset/RAM-cache setup, fit, and this
+    # run's own post-fit confusion/threshold sweep -- i.e. exactly how long
+    # `python -m mvc.train <config>` took, matching what a driver script's log timestamps
+    # already show but were not previously captured into the run's own JSON.
+    # `fit_seconds` isolates just the trainer.fit() call, so a run dominated by dataset
+    # RAM-caching (PLAN.md's 2026-08-01 note: ~9 min to cache 6.7M tiles) can be told apart
+    # from one that is actually slow to train.
+    config_json['training_started'] = _run_started_at
+    config_json['training_finished'] = datetime.datetime.now().isoformat()
+    config_json['training_seconds'] = round(time.perf_counter() - _run_t0, 1)
+    config_json['fit_seconds'] = round(fit_seconds, 1)
 
     #Save the JSON
     #------------------------------------------------------------------

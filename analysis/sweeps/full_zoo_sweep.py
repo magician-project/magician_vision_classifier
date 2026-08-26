@@ -44,7 +44,8 @@ GPU_SCALE = 1.6                 # A6000 bench -> RTX 5090, conservative
 REF_HOURS, REF_HZ = 4.4, 22.5
 
 RESULT_KEYS = ('confusion_matrix', 'classes', 'classes_int', 'gate', 'model_md5',
-               'best_threshold_balanced', 'best_threshold_kpi', 'best_threshold_deployment')
+               'best_threshold_balanced', 'best_threshold_kpi', 'best_threshold_deployment',
+               'training_started', 'training_finished', 'training_seconds', 'fit_seconds')
 
 # Short tags keep artifact names readable -- the writers emit `{name}_{model}`.
 TAGS = {
