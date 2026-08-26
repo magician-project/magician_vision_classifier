@@ -45,7 +45,7 @@ MANIFEST=experiments/zoo_sweep_manifest.tsv
 # Files whose contents define the training protocol. A change to any of these makes runs
 # before and after incomparable. Paths are repo-root-relative; the `cd` above guarantees
 # that is the cwd.
-PROTOCOL_FILES="mvc/core/model_zoo.py mvc/train.py mvc/core/datasets.py mvc/core/lit_classifier.py analysis/eval/score_checkpoints.py analysis/eval/eval_coverage.py"
+PROTOCOL_FILES="mvc/core/model_zoo.py mvc/train.py mvc/core/datasets.py mvc/core/lit_classifier.py analysis/eval/score_checkpoints.py analysis/eval/eval_coverage.py analysis/eval/eval_vote_curve.py analysis/eval/eval_step_curve.py"
 
 # A MISSING protocol file must be fatal, not silent. These paths were the pre-refactor root
 # filenames until the layout move, and `md5sum missing 2>/dev/null | md5sum` is perfectly
@@ -139,12 +139,32 @@ import sys
 sys.exit(0 if exists(sys.argv[1] + '_coverage.json') else 1)
 " "$run"
 }
+# Added after the fact (2026-08-26): a real per-tile gate threshold is not what the live
+# node applies -- it also votes over a spatial neighbourhood (min_votes/erosion_kernel).
+# vote_curve_exists() is checked SEPARATELY from coverage_exists() so a model that already
+# finished training and scoring, just before this step existed, gets ONLY this step
+# backfilled on a resume -- not retrained and not re-scored.
+vote_curve_exists() {
+    local run="$1"
+    python3 -c "
+from mvc.core.artifact_paths import exists
+import sys
+sys.exit(0 if exists(sys.argv[1] + '_vote_curve.json') else 1)
+" "$run"
+}
 
 for CFG in "${CFGS[@]}"; do
     run="${CFG%.json}"
     [ -f "$CFG" ] || { echo "!!! missing $CFG, skipping"; continue; }
     if coverage_exists "$run"; then
-        echo "=== $(date -Is) $run already complete, skipping"
+        if vote_curve_exists "$run"; then
+            echo "=== $(date -Is) $run already complete, skipping"
+            continue
+        fi
+        echo "=== $(date -Is) [$run] already trained+scored, backfilling eval_vote_curve only"
+        blog="$LOGDIR/${run}_votecurve_$(date +%Y%m%d_%H%M).log"
+        CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_vote_curve "$CFG" > "$blog" 2>&1
+        echo "=== $(date -Is) [$run] vote_curve rc=$?"
         continue
     fi
 
@@ -172,6 +192,10 @@ for CFG in "${CFGS[@]}"; do
     echo "=== $(date -Is) [$run] eval_coverage"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$CFG" >> "$log" 2>&1
     echo "=== $(date -Is) [$run] coverage rc=$?"
+
+    echo "=== $(date -Is) [$run] eval_vote_curve"
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_vote_curve "$CFG" >> "$log" 2>&1
+    echo "=== $(date -Is) [$run] vote_curve rc=$?"
 
     echo "--- [$run] (incumbent convnext_pico: 9.24 miss@FA5, TIER_A 73.59) ---"
     grep -aA 8 'epoch   val_loss' "$log" | tail -10

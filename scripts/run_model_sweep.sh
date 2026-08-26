@@ -61,12 +61,34 @@ RUNS=(
 gpu_wait_legacy run_seed_replicates.sh run_pfc_variance.sh
 gpu_wait
 
+# Added after the fact (2026-08-26): the real per-tile gate threshold is not what the live
+# node applies -- it also votes over a spatial neighbourhood (min_votes/erosion_kernel), and
+# nothing before this measured that. Checked via artifact_paths.exists() (root OR
+# experiments/, once tidied), same fix already applied to run_full_zoo_sweep.sh -- unlike
+# this file's pre-existing coverage check just below, which is a root-only `-f` and would
+# go blind on a tidied run; left as-is rather than fixed in passing.
+vote_curve_exists() {
+    local run="$1" model="$2"
+    python3 -c "
+from mvc.core.artifact_paths import exists
+import sys
+sys.exit(0 if exists(sys.argv[1] + '_' + sys.argv[2] + '_vote_curve.json') else 1)
+" "$run" "$model"
+}
+
 for entry in "${RUNS[@]}"; do
     run="${entry%%:*}"; model="${entry##*:}"
     CFG="${run}_${model}.json"
     [ -f "$CFG" ] || { echo "!!! missing $CFG, skipping"; continue; }
     if [ -f "${run}_${model}_coverage.json" ]; then
-        echo "=== $(date -Is) $run already complete, skipping"
+        if vote_curve_exists "$run" "$model"; then
+            echo "=== $(date -Is) $run already complete, skipping"
+            continue
+        fi
+        echo "=== $(date -Is) [$run] already trained+scored, backfilling eval_vote_curve only"
+        blog="$LOGDIR/${run}_votecurve_$(date +%Y%m%d_%H%M).log"
+        CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_vote_curve "$CFG" > "$blog" 2>&1
+        echo "=== $(date -Is) [$run] vote_curve rc=$?"
         continue
     fi
 
@@ -85,6 +107,10 @@ for entry in "${RUNS[@]}"; do
     echo "=== $(date -Is) [$run] eval_coverage"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$CFG" >> "$log" 2>&1
     echo "=== $(date -Is) [$run] coverage rc=$?"
+
+    echo "=== $(date -Is) [$run] eval_vote_curve"
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_vote_curve "$CFG" >> "$log" 2>&1
+    echo "=== $(date -Is) [$run] vote_curve rc=$?"
 
     echo "--- [$run] factory (incumbent convnext_pico: 9.24 s42 / 7.41 s1337 miss@FA5) ---"
     grep -aA 8 'epoch   val_loss' "$log" | tail -10

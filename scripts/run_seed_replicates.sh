@@ -44,7 +44,7 @@ CFGS=(
 # launch) so each manifest line certifies the code state that run actually trained under --
 # a mid-queue `git pull` changes the fingerprint for every run after it, and a fixed
 # once-at-launch value would hide that instead of flagging it.
-PROTOCOL_FILES="mvc/core/model_zoo.py mvc/train.py mvc/core/datasets.py mvc/core/lit_classifier.py analysis/eval/score_checkpoints.py analysis/eval/eval_coverage.py"
+PROTOCOL_FILES="mvc/core/model_zoo.py mvc/train.py mvc/core/datasets.py mvc/core/lit_classifier.py analysis/eval/score_checkpoints.py analysis/eval/eval_coverage.py analysis/eval/eval_vote_curve.py analysis/eval/eval_step_curve.py"
 require_protocol_files() {
     local missing=""
     for f in $PROTOCOL_FILES; do
@@ -76,6 +76,18 @@ import sys
 sys.exit(0 if exists(sys.argv[1] + '_coverage.json') else 1)
 " "$run"
 }
+# Added after the fact (2026-08-26): the real per-tile gate threshold is not what the live
+# node applies -- it also votes over a spatial neighbourhood (min_votes/erosion_kernel), and
+# nothing before this measured that. Checked separately from coverage_exists() so an
+# already-trained-and-scored run gets ONLY this step backfilled on a resume, not retrained.
+vote_curve_exists() {
+    local run="$1"
+    python3 -c "
+from mvc.core.artifact_paths import exists
+import sys
+sys.exit(0 if exists(sys.argv[1] + '_vote_curve.json') else 1)
+" "$run"
+}
 
 # Don't contend with a trainer already on the box -- the ~5h/run estimate assumes the GPU
 # to itself.
@@ -91,7 +103,14 @@ for CFG in "${CFGS[@]}"; do
     run="${CFG%.json}"
     [ -f "$CFG" ] || { echo "!!! missing $CFG, skipping"; continue; }
     if coverage_exists "$run"; then
-        echo "=== $(date -Is) $run already complete, skipping"
+        if vote_curve_exists "$run"; then
+            echo "=== $(date -Is) $run already complete, skipping"
+            continue
+        fi
+        echo "=== $(date -Is) [$run] already trained+scored, backfilling eval_vote_curve only"
+        blog="$LOGDIR/${run}_votecurve_$(date +%Y%m%d_%H%M).log"
+        CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_vote_curve "$CFG" > "$blog" 2>&1
+        echo "=== $(date -Is) [$run] vote_curve rc=$?"
         continue
     fi
 
@@ -114,6 +133,10 @@ for CFG in "${CFGS[@]}"; do
     echo "=== $(date -Is) [$run] eval_coverage (monitored-best checkpoint)"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$CFG" >> "$log" 2>&1
     echo "=== $(date -Is) [$run] coverage rc=$?"
+
+    echo "=== $(date -Is) [$run] eval_vote_curve"
+    CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_vote_curve "$CFG" >> "$log" 2>&1
+    echo "=== $(date -Is) [$run] vote_curve rc=$?"
 
     echo "--- [$run] factory, per epoch ---"
     grep -aA 8 'epoch   val_loss' "$log" | tail -10
