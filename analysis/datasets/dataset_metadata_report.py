@@ -2,9 +2,10 @@
 """Scan a tile dataset's HDF5 metadata and plot every characteristic it carries:
 class distribution, tiles/frames per source recording, sensor Distance1-3 /
 DistanceAverage, Light1-6 / lightDirection / lightNumber / lightConfidence,
-per-recording duration & framerate derived from dev_timestamp, and camera
+per-recording duration & framerate derived from dev_timestamp, camera
 settings (exposure, gain, frameRate, blackLevel) read from each source
-recording's info.json.
+recording's info.json, and manual-vs-auto annotation point counts read
+from each frame's raw source JSON (pointSources).
 
 Metadata is per-tile but most fields (Distance*, Light*, timestamps, ...) are
 constant across every tile cropped from the same source frame, so frame-level
@@ -147,6 +148,50 @@ def load_recording_info(list_files):
     return info
 
 
+def load_recording_dirs(list_files):
+    """{recording_name: recording_dir} from the same list files as load_recording_info
+    -- needed separately to locate each frame's raw source JSON (for pointSources,
+    which -- unlike Distance*/Light* -- was never copied into the H5 metadata)."""
+    dirs = {}
+    for lf in list_files:
+        if not os.path.exists(lf):
+            continue
+        for line in open(lf):
+            d = line.strip()
+            if not d:
+                continue
+            dirs[os.path.basename(d.rstrip("/"))] = d
+    return dirs
+
+
+def load_annotation_sources(frame_keys, rec_dirs, cache_path):
+    """{frame_key: {source: point_count}} for pointSources in each frame's raw
+    source JSON (".../<rec>/<file>.json") -- "manual" (a human click) vs "auto"
+    (propagated/tracked). Cached across runs since it touches one file per frame."""
+    cache = {}
+    if os.path.exists(cache_path):
+        cache = json.load(open(cache_path))
+
+    missing = [fk for fk in frame_keys if fk not in cache]
+    added = 0
+    for fk in missing:
+        rec, filename = fk.split("/", 1)
+        rec_dir = rec_dirs.get(rec)
+        if rec_dir is None:
+            continue
+        path = os.path.join(rec_dir, filename)
+        try:
+            raw = json.load(open(path))
+        except Exception:
+            continue
+        cache[fk] = dict(Counter(raw.get("pointSources") or []))
+        added += 1
+
+    if added:
+        json.dump(cache, open(cache_path, "w"))
+    return cache
+
+
 def value_bar(ax, counts, title, ylabel, rotate=0, color=DEFAULT_COLOR):
     """Bar chart over a {value: count} dict, sorted by value -- for small
     discrete settings (exposure, frameRate, ...) where a histogram would be
@@ -191,14 +236,18 @@ def bar(ax, labels, values, title, ylabel, rotate=90, top=None, color=DEFAULT_CO
     ax.margins(x=0.01)
 
 
-def report_split(h5_path, out_dir, cache_dir, split_name, recording_info=None, limit=None):
+def report_split(h5_path, out_dir, cache_dir, split_name, recording_info=None, rec_dirs=None,
+                  limit=None):
     os.makedirs(out_dir, exist_ok=True)
     cache_path = os.path.join(cache_dir, f"{split_name}_meta_cache.npz")
     d = extract(h5_path, cache_path, limit=limit)
-    return analyze_and_plot(d, out_dir, split_name, recording_info=recording_info)
+    ann_cache_path = os.path.join(cache_dir, "annotation_source_cache.json")
+    return analyze_and_plot(d, out_dir, split_name, recording_info=recording_info,
+                             rec_dirs=rec_dirs, annotation_cache_path=ann_cache_path)
 
 
-def report_coverage(train_h5_path, train_cache_path, manifest_path, out_dir, recording_info=None):
+def report_coverage(train_h5_path, train_cache_path, manifest_path, out_dir, recording_info=None,
+                     rec_dirs=None):
     """Coverage isn't a separate dataset.h5 -- it's a subset of TRAIN's own frames,
     carved out by build_coverage_val.py and recorded (as full source paths) in its
     manifest json. Reuse train's cached per-tile extraction and just restrict to the
@@ -221,11 +270,14 @@ def report_coverage(train_h5_path, train_cache_path, manifest_path, out_dir, rec
     tile_mask = np.isin(d["frame_id"], list(keep_frame_ids))
     print(f"coverage: {len(keep_frame_ids):,}/{len(frame_names_full):,} train frames, "
           f"{int(tile_mask.sum()):,} tiles")
+    ann_cache_path = os.path.join(os.path.dirname(train_cache_path), "annotation_source_cache.json")
     return analyze_and_plot(d, out_dir, "coverage", recording_info=recording_info,
+                             rec_dirs=rec_dirs, annotation_cache_path=ann_cache_path,
                              tile_indices=np.where(tile_mask)[0])
 
 
-def analyze_and_plot(d, out_dir, split_name, recording_info=None, tile_indices=None):
+def analyze_and_plot(d, out_dir, split_name, recording_info=None, rec_dirs=None,
+                      annotation_cache_path=None, tile_indices=None):
     """Plot every characteristic for one split. `tile_indices`, if given, restricts
     to a subset of tiles from `d` (used for the coverage pseudo-split) instead of
     using every tile -- frame-level stats are then recomputed over just the frames
@@ -373,6 +425,24 @@ def analyze_and_plot(d, out_dir, split_name, recording_info=None, tile_indices=N
             fig.savefig(os.path.join(out_dir, f"{split_name}_camera_settings.png"), dpi=130)
             plt.close(fig)
 
+    # --- manual vs auto annotation points, from each frame's raw source JSON ---
+    if rec_dirs:
+        ann_cache = load_annotation_sources(frame_names, rec_dirs, annotation_cache_path)
+        src_counts = Counter()
+        for fk in frame_names:
+            for src, cnt in ann_cache.get(fk, {}).items():
+                src_counts[src] += cnt
+        if src_counts:
+            fig, ax = plt.subplots(figsize=(6, 5))
+            value_bar(ax, src_counts, f"{split_name}: annotation points by source", "points",
+                      color=color)
+            fig.tight_layout()
+            fig.savefig(os.path.join(out_dir, f"{split_name}_annotation_source.png"), dpi=130)
+            plt.close(fig)
+            total = sum(src_counts.values())
+            summary["points_by_annotation_source"] = dict(src_counts)
+            summary["manual_annotation_fraction"] = src_counts.get("manual", 0) / total if total else None
+
     return summary
 
 
@@ -395,6 +465,8 @@ def main():
                           "blackLevel). Default: autodetect '<dataset-dir>_*_list.txt'")
     ap.add_argument("--no-camera-settings", action="store_true",
                      help="skip the exposure/gain/frameRate/blackLevel plots entirely")
+    ap.add_argument("--no-annotation-source", action="store_true",
+                     help="skip the manual-vs-auto annotation-point plots entirely")
     ap.add_argument("--coverage-manifest", default=None,
                      help="also report the COVERAGE set: a val_coverage_frames.json manifest "
                           "(see build_coverage_val.py) naming frames carved out of train. "
@@ -415,11 +487,12 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(cache_dir, exist_ok=True)
 
+    list_files = args.recording_lists
+    if list_files is None:
+        list_files = sorted(glob.glob(f"{args.dataset_dir.rstrip('/')}_*_list.txt"))
+
     recording_info = {}
     if not args.no_camera_settings:
-        list_files = args.recording_lists
-        if list_files is None:
-            list_files = sorted(glob.glob(f"{args.dataset_dir.rstrip('/')}_*_list.txt"))
         recording_info = load_recording_info(list_files)
         if recording_info:
             print(f"loaded camera settings for {len(recording_info)} recordings "
@@ -428,11 +501,19 @@ def main():
             print(f"no recording info.json found via {list_files or '(no list files found)'} "
                   "-- camera-settings plots skipped")
 
+    rec_dirs = {}
+    if not args.no_annotation_source:
+        rec_dirs = load_recording_dirs(list_files)
+        if not rec_dirs:
+            print(f"no recording directories found via {list_files or '(no list files found)'} "
+                  "-- annotation-source plots skipped")
+
     all_summaries = {}
     for split_name, h5_path in h5s:
         print(f"=== {split_name}: {h5_path} ===")
         all_summaries[split_name] = report_split(h5_path, out_dir, cache_dir, split_name,
                                                    recording_info=recording_info,
+                                                   rec_dirs=rec_dirs,
                                                    limit=args.limit)
 
     if args.coverage_manifest:
@@ -441,7 +522,8 @@ def main():
         train_cache_path = os.path.join(cache_dir, "train_meta_cache.npz")
         all_summaries["coverage"] = report_coverage(train_h5_path, train_cache_path,
                                                       args.coverage_manifest, out_dir,
-                                                      recording_info=recording_info)
+                                                      recording_info=recording_info,
+                                                      rec_dirs=rec_dirs)
 
     summary_path = os.path.join(out_dir, "summary.json")
     with open(summary_path, "w") as f:
@@ -456,6 +538,9 @@ def main():
                   f"mean framerate: {s['mean_framerate_fps']:.1f} fps")
         if s.get("mean_DistanceAverage") is not None:
             print(f"  mean DistanceAverage: {s['mean_DistanceAverage']:.1f} mm")
+        if s.get("points_by_annotation_source") is not None:
+            src = s["points_by_annotation_source"]
+            print(f"  annotation points: {src} ({s['manual_annotation_fraction']*100:.1f}% manual)")
 
 
 if __name__ == "__main__":
