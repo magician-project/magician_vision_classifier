@@ -43,7 +43,7 @@ FRAME_FIELDS = ["Distance1", "Distance2", "Distance3", "DistanceAverage",
 RECORDING_INFO_FIELDS = ["exposure", "gain", "frameRate", "blackLevel"]
 
 # train vs val get fixed, easily-told-apart colors; other splits fall back to DEFAULT_COLOR.
-SPLIT_COLORS = {"train": "#4C72B0", "val": "#55A868"}
+SPLIT_COLORS = {"train": "#4C72B0", "val": "#55A868", "coverage": "#DD8452"}
 DEFAULT_COLOR = "#8172B2"
 
 # Frame source paths end in "<name>.json(x,y)" (Aug26_78K train/val) or
@@ -195,18 +195,65 @@ def report_split(h5_path, out_dir, cache_dir, split_name, recording_info=None, l
     os.makedirs(out_dir, exist_ok=True)
     cache_path = os.path.join(cache_dir, f"{split_name}_meta_cache.npz")
     d = extract(h5_path, cache_path, limit=limit)
+    return analyze_and_plot(d, out_dir, split_name, recording_info=recording_info)
 
-    labels = d["labels"]
-    rec_id = d["rec_id"]
-    frame_id = d["frame_id"]
-    rec_names = list(d["rec_names"])
-    frame_names = list(d["frame_names"])
+
+def report_coverage(train_h5_path, train_cache_path, manifest_path, out_dir, recording_info=None):
+    """Coverage isn't a separate dataset.h5 -- it's a subset of TRAIN's own frames,
+    carved out by build_coverage_val.py and recorded (as full source paths) in its
+    manifest json. Reuse train's cached per-tile extraction and just restrict to the
+    tiles whose frame is in the manifest, instead of rescanning the H5."""
+    d = extract(train_h5_path, train_cache_path)
+    manifest = json.load(open(manifest_path))
+    frame_names_full = list(d["frame_names"])
+
+    # Manifest frames are full source paths (".../<rec>/<file>.json"); our frame
+    # keys are "<rec>/<file>.json" -- normalize the manifest side to match.
+    def to_key(raw):
+        parts = raw.rstrip("/").split("/")
+        return f"{parts[-2]}/{parts[-1]}"
+
+    wanted = {to_key(f) for f in manifest["frames"]}
+    keep_frame_ids = {i for i, fn in enumerate(frame_names_full) if fn in wanted}
+    if not keep_frame_ids:
+        raise SystemExit(f"none of {manifest_path}'s {len(wanted)} frames matched train's "
+                          f"cached frame names -- cache/manifest mismatch?")
+    tile_mask = np.isin(d["frame_id"], list(keep_frame_ids))
+    print(f"coverage: {len(keep_frame_ids):,}/{len(frame_names_full):,} train frames, "
+          f"{int(tile_mask.sum()):,} tiles")
+    return analyze_and_plot(d, out_dir, "coverage", recording_info=recording_info,
+                             tile_indices=np.where(tile_mask)[0])
+
+
+def analyze_and_plot(d, out_dir, split_name, recording_info=None, tile_indices=None):
+    """Plot every characteristic for one split. `tile_indices`, if given, restricts
+    to a subset of tiles from `d` (used for the coverage pseudo-split) instead of
+    using every tile -- frame-level stats are then recomputed over just the frames
+    those tiles touch, not every frame train/val ever saw."""
+    os.makedirs(out_dir, exist_ok=True)
+
     class_names = list(d["class_names"])
-    frame_meta = list(d["frame_meta"])
+    frame_names_full = list(d["frame_names"])
+    rec_names = list(d["rec_names"])
+
+    if tile_indices is not None:
+        labels = d["labels"][tile_indices]
+        rec_id = d["rec_id"][tile_indices]
+        frame_id_raw = d["frame_id"][tile_indices]
+        uniq_frames, frame_id = np.unique(frame_id_raw, return_inverse=True)
+        frame_names = [frame_names_full[i] for i in uniq_frames]
+        frame_meta = [d["frame_meta"][i] for i in uniq_frames]
+    else:
+        labels = d["labels"]
+        rec_id = d["rec_id"]
+        frame_id = d["frame_id"]
+        frame_names = frame_names_full
+        frame_meta = list(d["frame_meta"])
 
     n_tiles, n_frames, n_recs = len(labels), len(frame_names), len(rec_names)
+    n_recs_present = int(np.unique(rec_id).size) if n_tiles else 0
     summary = {"split": split_name, "n_tiles": n_tiles, "n_frames": n_frames,
-               "n_recordings": n_recs}
+               "n_recordings": n_recs_present}
     color = SPLIT_COLORS.get(split_name, DEFAULT_COLOR)
 
     # rec_id per unique frame (first tile carrying each frame id also carries its rec)
@@ -305,9 +352,10 @@ def report_split(h5_path, out_dir, cache_dir, split_name, recording_info=None, l
 
     # --- camera settings (exposure, gain, frameRate, blackLevel) from info.json ---
     if recording_info:
-        matched_recs = [r for r in rec_names if r in recording_info]
+        present_recs = [rec_names[i] for i in np.unique(rec_id)] if n_tiles else []
+        matched_recs = [r for r in present_recs if r in recording_info]
         summary["recordings_with_info_json"] = len(matched_recs)
-        summary["recordings_missing_info_json"] = [r for r in rec_names if r not in recording_info]
+        summary["recordings_missing_info_json"] = [r for r in present_recs if r not in recording_info]
         if matched_recs:
             fig, axes = plt.subplots(2, 2, figsize=(10, 8))
             for ax, field in zip(axes.flat, RECORDING_INFO_FIELDS):
@@ -347,6 +395,10 @@ def main():
                           "blackLevel). Default: autodetect '<dataset-dir>_*_list.txt'")
     ap.add_argument("--no-camera-settings", action="store_true",
                      help="skip the exposure/gain/frameRate/blackLevel plots entirely")
+    ap.add_argument("--coverage-manifest", default=None,
+                     help="also report the COVERAGE set: a val_coverage_frames.json manifest "
+                          "(see build_coverage_val.py) naming frames carved out of train. "
+                          "Reuses train's cached extraction instead of rescanning the H5.")
     args = ap.parse_args()
 
     if args.splits:
@@ -382,6 +434,14 @@ def main():
         all_summaries[split_name] = report_split(h5_path, out_dir, cache_dir, split_name,
                                                    recording_info=recording_info,
                                                    limit=args.limit)
+
+    if args.coverage_manifest:
+        print(f"=== coverage: {args.coverage_manifest} ===")
+        train_h5_path = dict(h5s).get("train", os.path.join(args.dataset_dir, "train", "dataset.h5"))
+        train_cache_path = os.path.join(cache_dir, "train_meta_cache.npz")
+        all_summaries["coverage"] = report_coverage(train_h5_path, train_cache_path,
+                                                      args.coverage_manifest, out_dir,
+                                                      recording_info=recording_info)
 
     summary_path = os.path.join(out_dir, "summary.json")
     with open(summary_path, "w") as f:
