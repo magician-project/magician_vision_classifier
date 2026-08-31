@@ -57,17 +57,25 @@ def best_epoch(ckpt_dir, max_epoch=1):
 
 def scores(name, model):
     sfx = model.replace('/', '_')
+    # macro5 (eval_traintest_split.py) and miss5 (score_checkpoints.py) are two
+    # INDEPENDENT writers -- eval_traintest_split picks its own checkpoint by globbing
+    # datasets/mix_ckpts/ directly, it does not read score_checkpoints' curve at all. A
+    # bug in score_checkpoints (fixed 2026-08-31: it looked up its own curve file by an
+    # unsanitised `timm/x` model name and crashed before writing the best epoch's curve
+    # for 12 of 14 timm/* models in this campaign) must not hide a macro5 that scored
+    # fine -- so each is looked up independently and either can be None on its own,
+    # rather than one missing artifact dropping the whole row.
     ep = best_epoch(f'datasets/mix_ckpts/{name}_{sfx}')
     if ep is None:
         return None
+    out = {'epoch': ep, 'miss5': None, 'macro5': None}
     curve = find_artifact(f'{name}_ep{ep}_{sfx}_threshold_curve.json')
-    if not curve:
-        return None
-    out = {'epoch': ep, 'miss5': miss_at_fa(curve)[0.05], 'macro5': None}
+    if curve:
+        out['miss5'] = miss_at_fa(curve)[0.05]
     detect = find_artifact(f'{name}_{sfx}_traintest_detect.json')
     if detect:
         out['macro5'] = json.load(open(detect)).get('macro_detect_at_fa5')
-    return out
+    return out if (out['miss5'] is not None or out['macro5'] is not None) else None
 
 
 def bench():
@@ -116,20 +124,27 @@ def main():
         ships = 'yes' if h5090 >= TARGET_HZ else 'NO'
         params = b.get('params_M')
         pstr = f'{params:9.2f}' if params is not None else f'{"--":>9}'
-        if s is None or s['miss5'] is None:
+        if s is None:
             if not show_all:
                 return
             print(f'{model:40s} {"--":>9s} {"--":>7s} {"--":>8s} {"--":>7s} '
                   f'{h5090:8.1f} {ships:>6s} {pstr} not run yet')
             return
-        d = s['miss5'] - base
+        # miss5 and macro5 are independent writers (see scores()' docstring) -- a run can
+        # have one without the other, most commonly a macro5 with no miss5 (the
+        # score_checkpoints.py timm/* bug, fixed 2026-08-31, backfill pending on 12 runs).
+        if s['miss5'] is not None:
+            mi5str, midstr = f'{s["miss5"]:9.2f}', f'{s["miss5"] - base:+7.2f}'
+        else:
+            mi5str, midstr = f'{"--":>9s}', f'{"--":>7s}'
         m5 = s['macro5']
         if m5 is not None and base_macro is not None:
             mstr, mdstr = f'{m5:8.2f}', f'{m5 - base_macro:+7.2f}'
         else:
             mstr, mdstr = f'{"--":>8s}', f'{"--":>7s}'
-        print(f'{model:40s} {s["miss5"]:9.2f} {d:+7.2f} {mstr} {mdstr} '
-              f'{h5090:8.1f} {ships:>6s} {pstr}')
+        note = '' if s['miss5'] is not None else '  (miss@FA5 pending backfill)'
+        print(f'{model:40s} {mi5str} {midstr} {mstr} {mdstr} '
+              f'{h5090:8.1f} {ships:>6s} {pstr}{note}')
 
     for tag, model in models:
         s = scores(f'tt{tag}', model)

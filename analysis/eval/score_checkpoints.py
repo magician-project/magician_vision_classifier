@@ -29,7 +29,7 @@ import torch
 from mvc.core.config import load_hyperparameters
 from mvc.core.datasets import build_val_only, val_dataloader
 from mvc.core.metrics import miss_at_fa
-from mvc.core.artifact_paths import find_artifact
+from mvc.core.artifact_paths import find_artifact, sanitise
 from mvc.core.evaluation import run_confusion_and_threshold_sweep
 from mvc.core.lit_classifier import Classifier
 
@@ -113,7 +113,18 @@ def main():
         # by hand here would look for the curve where it is no longer written. This is the
         # same fault that broke eval_coverage -- a reader left pointing at the old layout
         # after the writer moved.
-        curve_name = f"{name}_{config_json['model']}_threshold_curve.json"
+        #
+        # sanitise(), not the raw model name: out_path() (what the write above actually
+        # used, via run_confusion_and_threshold_sweep) sanitises `timm/x` -> `timm_x`
+        # before writing. A `timm/*` model name here has a bare slash, which
+        # find_artifact() then treats as an unwanted directory separator and never
+        # finds -- this crashed on the FIRST checkpoint for every timm/* model in the
+        # traintest-split sweep (2026-08-26 to -31), silently dropping every later
+        # checkpoint's score for 12 of 14 timm models (confirmed via the sweep logs).
+        # eval_traintest_split.py's macro detect@FA5 was unaffected -- it picks its
+        # checkpoint by its own glob, not by reading this file -- so only the aggregate
+        # miss@FA5 column was ever missing.
+        curve_name = f"{name}_{sanitise(config_json['model'])}_threshold_curve.json"
         curve = find_artifact(curve_name)
         if curve is None:
             raise FileNotFoundError(
