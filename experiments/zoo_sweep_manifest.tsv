@@ -35,3 +35,5 @@ fzdense121_densenet121	fzdense121_densenet121	259fc61ae980	53f451b	2026-08-20T01
 fzrx50_resnext50	fzrx50_resnext50	259fc61ae980	53f451b	2026-08-20T08:40:28+00:00
 fzeffv2s_efficientnet_v2_s	fzeffv2s_efficientnet_v2_s	259fc61ae980	53f451b	2026-08-20T16:31:06+00:00
 fzswin_swin_v2_t	fzswin_swin_v2_t	259fc61ae980	53f451b	2026-08-21T03:51:38+00:00
+fzswin_swin_v2_t	fzswin_swin_v2_t	41c586c016d0	fef6bb9	2026-09-02T04:57:31+00:00
+fzr18full_resnet18_fullres	fzr18full_resnet18_fullres	41c586c016d0	fef6bb9	2026-09-03T00:54:59+00:00
