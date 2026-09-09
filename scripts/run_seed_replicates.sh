@@ -110,7 +110,8 @@ for CFG in "${CFGS[@]}"; do
         echo "=== $(date -Is) [$run] already trained+scored, backfilling eval_vote_curve only"
         blog="$LOGDIR/${run}_votecurve_$(date +%Y%m%d_%H%M).log"
         CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_vote_curve "$CFG" > "$blog" 2>&1
-        echo "=== $(date -Is) [$run] vote_curve rc=$?"
+        vc_rc=$?
+        echo "=== $(date -Is) [$run] vote_curve rc=$vc_rc"
         continue
     fi
 
@@ -128,15 +129,18 @@ for CFG in "${CFGS[@]}"; do
     # Per-epoch, because the epoch choice has to be made on the KPI itself.
     echo "=== $(date -Is) [$run] score_checkpoints"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$CFG" >> "$log" 2>&1
-    echo "=== $(date -Is) [$run] score rc=$?"
+    sc_rc=$?
+    echo "=== $(date -Is) [$run] score rc=$sc_rc"
 
     echo "=== $(date -Is) [$run] eval_coverage (monitored-best checkpoint)"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$CFG" >> "$log" 2>&1
-    echo "=== $(date -Is) [$run] coverage rc=$?"
+    cov_rc=$?
+    echo "=== $(date -Is) [$run] coverage rc=$cov_rc"
 
     echo "=== $(date -Is) [$run] eval_vote_curve"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_vote_curve "$CFG" >> "$log" 2>&1
-    echo "=== $(date -Is) [$run] vote_curve rc=$?"
+    vc_rc=$?
+    echo "=== $(date -Is) [$run] vote_curve rc=$vc_rc"
 
     echo "--- [$run] factory, per epoch ---"
     grep -aA 8 'epoch   val_loss' "$log" | tail -10

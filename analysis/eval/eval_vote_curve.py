@@ -68,7 +68,7 @@ import torch
 
 from analysis.eval.eval_step_curve import (DEV_ROOT, QUARANTINE_PX, RAW_ROOT, TILE,
                                             frame_points, grid_origins, local_path)
-from mvc.core.artifact_paths import find_artifact, out_path
+from mvc.core.artifact_paths import find_artifact, find_config_with_classes, out_path
 from mvc.core.config import load_hyperparameters
 from mvc.core.datasets import clean_class_index
 from mvc.core.lit_classifier import Classifier
@@ -158,6 +158,17 @@ def main():
     args = ap.parse_args()
 
     cfg = load_hyperparameters(args.config)
+
+    # The root copy of a config is the PRE-training template -- `classes` is resolved and
+    # written back only into the copy filed alongside the run's checkpoints/results, never
+    # into the root stub itself. Confirmed live: every driver hands this tool the root
+    # path, so this fired on 100% of backfill attempts across all 4 campaigns (2026-09-03)
+    # until this fix -- `sys.exit()` below, which every caller logged as rc=0 due to an
+    # unrelated bash bug (see the drivers' `$?`-after-`$(date)` fix, same commit).
+    if not cfg.get('classes'):
+        alt_path = find_config_with_classes(os.path.basename(args.config))
+        if alt_path:
+            cfg = load_hyperparameters(alt_path)
 
     if cfg['dataloader'].get('frozen_tile_split'):
         sys.exit(
