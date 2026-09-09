@@ -148,7 +148,7 @@
       "model": "ttcnxpico_convnext_pico",
       "gate": {
         "mode": "defect_mass",
-        "threshold": 0.900,
+        "threshold": 0.960,
         "assign_best_defect_class": true
       },
       "runtime": {

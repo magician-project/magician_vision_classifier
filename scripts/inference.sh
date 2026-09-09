@@ -93,7 +93,7 @@ fi
 
 # ---- Stream the dataset into shared memory ----
 echo "Streaming $DATASET into shared memory stream 'stream1' (log: $STREAMER_LOG)..."
-python3 -u -m mvc.inference.folder_shared_memory_streamer "$DATASET" --stream stream1 \
+python3 -u -m mvc.inference.folder_shared_memory_streamer "$DATASET" --stream stream1 --fps 0 \
   "${STREAMER_ARGS[@]}" >"$STREAMER_LOG" 2>&1 &
 STREAMER_PID=$!
 sleep 1
