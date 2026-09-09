@@ -32,7 +32,7 @@ from mvc.inference.live_torch import (
     estimatePoseSingleMarkers, make_approx_camera_matrix, rvec_to_quaternion,
     resize_to_fit_screen, filter_type, class_to_severity,
 )
-from mvc.inference.ensemble_classifier import EnsembleClassifierPnm
+from mvc.inference.ensemble_classifier import EnsembleClassifierPnm, CascadeClassifierPnm
 from mvc.core.shared_memory import SharedMemoryManager
 from mvc.paths import repo_root
 
@@ -93,7 +93,7 @@ def unix_ns_to_ros_time(ns):
 # The loader lives in classifierPnm so the ROS node, wxAnnotator and any other consumer
 # share ONE definition rather than hand-copied variants that drift apart.
 from mvc.inference.classifier_pnm import (load_recommended_configuration, FALLBACK_PRESET,
-                           RECOMMENDED_CONFIG_FILE)
+                           RECOMMENDED_CONFIG_FILE, GATE_DEFECT_MASS)
 
 
 # Two-stage ensemble members. This path is OPTIONAL: if any member cannot be resolved the
@@ -168,6 +168,12 @@ class DefectPublisher(Node):
         self._visualization_enabled = False
         self._inference_paused = False
         self._two_stage_enabled = False
+        # Ordered N-stage screen-then-recheck chain (CascadeClassifierPnm) -- a DIFFERENT
+        # mechanism from the two-stage ensemble above; see live_torch.py's identical
+        # attribute for the full rationale. Populated from the preset's "cascade" block,
+        # never from a service call: retuning means switching presets.
+        self._cascade_enabled = False
+        self._cascade_stages = []
         self._autosave_defect_snapshots = False
         self._frame_limiter = True
 
@@ -235,6 +241,7 @@ class DefectPublisher(Node):
         self.create_service(SetBool,    "magician_vision_classifier/set_visualization", self._set_visualization_cb)
         self.create_service(SetBool,    "magician_vision_classifier/pause", self._pause_inference_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_two_stage", self._set_two_stage_cb)
+        self.create_service(SetBool,    "magician_vision_classifier/set_cascade", self._set_cascade_cb)
         self.create_service(SetFloat64, "magician_vision_classifier/set_fps", self._set_fps_cb)
         self.create_service(SetInt64,   "magician_vision_classifier/set_step", self._set_step_cb)
         self.create_service(SetFloat64, "magician_vision_classifier/set_threshold", self._set_threshold_cb)
@@ -256,6 +263,8 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/set_visualization (SetBool)")
         self.get_logger().info("  magician_vision_classifier/pause (SetBool)")
         self.get_logger().info("  magician_vision_classifier/set_two_stage (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/set_cascade (SetBool; needs the "
+                               "active preset's \"cascade\" stage list)")
         self.get_logger().info("  magician_vision_classifier/set_fps (SetFloat64)")
         self.get_logger().info("  magician_vision_classifier/set_step (SetInt64)")
         self.get_logger().info("  magician_vision_classifier/set_threshold (SetFloat64)")
@@ -283,6 +292,7 @@ class DefectPublisher(Node):
         """
         rt = preset.get("runtime") or {}
         gate = preset.get("gate") or {}
+        cascade = preset.get("cascade") or {}
         with self._lock:
             self._step_size          = int(rt.get("step", self._step_size))
             self._target_fps         = float(rt.get("target_fps", self._target_fps))
@@ -293,12 +303,19 @@ class DefectPublisher(Node):
             self._two_stage_enabled  = bool(rt.get("two_stage", self._two_stage_enabled))
             if gate.get("threshold") is not None:
                 self._threshold = float(gate["threshold"])
+            self._cascade_enabled = bool(cascade.get("enabled", False))
+            self._cascade_stages  = list(cascade.get("stages") or [])
         m = preset.get("measured") or {}
         self.get_logger().info(
             f"Preset '{preset.get('name','?')}': model={preset.get('model')} "
             f"gate={gate.get('mode')}@{gate.get('threshold')} step={self._step_size} "
             f"fps={self._target_fps} erosion_kernel={self._erosion_kernel} "
             f"min_votes={self._min_votes} majority_voting={self._majority_voting}")
+        if self._cascade_enabled:
+            chain = " -> ".join(f"{s.get('model')}(step={s.get('step')}, "
+                                f"thr={(s.get('gate') or {}).get('threshold')})"
+                                for s in self._cascade_stages)
+            self.get_logger().info(f"  cascade ENABLED: {chain}")
         if preset.get("description"):
             self.get_logger().info(f"  {preset['description']}")
         if "detected" in m and "false_alarm" in m:
@@ -348,6 +365,17 @@ class DefectPublisher(Node):
             self._two_stage_enabled = bool(request.data)
         response.success = True
         response.message = ("Two-stage execution ENABLED" if request.data else "Two-stage execution DISABLED")
+        self.get_logger().info(response.message)
+        return response
+
+    def _set_cascade_cb(self, request, response):
+        """Service callback to toggle cascade mode on/off. Only takes effect if the active
+        preset defined a stage list at startup -- this does not build a cascade out of thin
+        air. See CascadeClassifierPnm."""
+        with self._lock:
+            self._cascade_enabled = bool(request.data)
+        response.success = True
+        response.message = ("Cascade execution ENABLED" if request.data else "Cascade execution DISABLED")
         self.get_logger().info(response.message)
         return response
  
@@ -671,6 +699,16 @@ class DefectPublisher(Node):
         with self._lock:
             return self._two_stage_enabled
 
+    def cascade_enabled(self):
+        """Thread-safe getter for the cascade mode."""
+        with self._lock:
+            return self._cascade_enabled
+
+    def get_cascade_stages(self):
+        """Thread-safe getter for the active preset's ordered stage list."""
+        with self._lock:
+            return list(self._cascade_stages)
+
     def autosave_defect_snapshots_enabled(self):
         """Thread-safe getter for the autosave defect snapshots toggle."""
         with self._lock:
@@ -966,6 +1004,45 @@ def main():
             ros_node.get_logger().warning(f"Two-stage ensemble DISABLED — build failed: {e!r}")
             ensemble_classifier = None
 
+    # Cascade is OPTIONAL, same non-fatal-missing-model pattern as the ensemble above.
+    cascade_classifier = None
+    _cascade_stages_cfg = ros_node.get_cascade_stages()
+    if ros_node.cascade_enabled():
+        if len(_cascade_stages_cfg) < 2:
+            ros_node.get_logger().warning(
+                f"Cascade requested but the active preset defines "
+                f"{len(_cascade_stages_cfg)} stage(s) (need >= 2) — cascade DISABLED")
+        else:
+            _cascade_needed = [s["model"] for s in _cascade_stages_cfg]
+            _cascade_missing = [m for m in _cascade_needed
+                                if not (os.path.isfile(os.path.join(PATH, m + ".pth"))
+                                        and os.path.isfile(os.path.join(PATH, m + ".json")))]
+            if _cascade_missing:
+                ros_node.get_logger().warning(
+                    f"Cascade DISABLED — missing models: {_cascade_missing}. "
+                    f"Fetch them with: python3 -m mvc.inference.model_download "
+                    f"{' '.join(_cascade_missing)}")
+            else:
+                try:
+                    cascade_classifier = CascadeClassifierPnm(stage_cfgs=[
+                        dict(model_path=os.path.join(PATH, s["model"] + ".pth"),
+                             cfg_path=os.path.join(PATH, s["model"] + ".json"),
+                             step=int(s.get("step", 16)),
+                             threshold=float((s.get("gate") or {}).get("threshold", 0.0)),
+                             gate_mode=(s.get("gate") or {}).get("mode", GATE_DEFECT_MASS),
+                             assign_best_defect_class=bool(
+                                 (s.get("gate") or {}).get("assign_best_defect_class", True)))
+                        for s in _cascade_stages_cfg
+                    ])
+                    ros_node.get_logger().info(
+                        "Cascade built: " + " -> ".join(
+                            f"{s['model']}(step={s.get('step', 16)}, "
+                            f"thr={(s.get('gate') or {}).get('threshold', 0.0)})"
+                            for s in _cascade_stages_cfg))
+                except Exception as e:
+                    ros_node.get_logger().warning(f"Cascade DISABLED — build failed: {e!r}")
+                    cascade_classifier = None
+
     tile_size = 0  # updated inside the inference block each iteration
 
     # Shared memory frame source
@@ -979,6 +1056,7 @@ def main():
 
     last_processed_timestamp = None
     _warned_no_ensemble = False   # log the two-stage fallback once, not every frame
+    _warned_no_cascade = False    # log the cascade fallback once, not every frame
 
     try:
         while True:
@@ -1019,6 +1097,13 @@ def main():
             # Run the neural network
             majority_voting = ros_node.majority_voting_enabled()
             with torch.inference_mode():
+                if ros_node.cascade_enabled() and cascade_classifier is None:
+                    if not _warned_no_cascade:
+                        ros_node.get_logger().warning(
+                            "cascade requested but unavailable (see the DISABLED warning "
+                            "at startup) — falling back to two-stage/single classifier")
+                        _warned_no_cascade = True
+
                 if ros_node.two_stage_enabled() and ensemble_classifier is None:
                     if not _warned_no_ensemble:
                         ros_node.get_logger().warning(
@@ -1026,7 +1111,15 @@ def main():
                             "falling back to the single classifier")
                         _warned_no_ensemble = True
 
-                if ros_node.two_stage_enabled() and ensemble_classifier is not None:
+                if ros_node.cascade_enabled() and cascade_classifier is not None:
+                    # No per-frame step/threshold push here, unlike the two branches below
+                    # -- a cascade's per-stage step/threshold are jointly tuned offline;
+                    # retuning means switching presets. See live_torch.py's identical branch.
+                    with ros_node._model_lock:
+                        tile_size = cascade_classifier.stages[-1].tile_size
+                        heatmap, occupancy, responses = cascade_classifier.forward(
+                            frame, legend=True, log=True)
+                elif ros_node.two_stage_enabled() and ensemble_classifier is not None:
                     with ros_node._model_lock:
                         ensemble_classifier.step = ros_node.get_step_size()
                         thr = ros_node.get_max_probability_threshold()

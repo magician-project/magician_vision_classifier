@@ -417,6 +417,16 @@ class LiveClassifier:
         self._window_scale = 1.0
         self._inference_paused = False
         self._two_stage_enabled = False
+        # Ordered N-stage screen-then-recheck chain (CascadeClassifierPnm) -- a DIFFERENT
+        # mechanism from the two-stage ensemble above (which reuses stage 1's tiles verbatim
+        # and majority-votes with no per-member threshold; see mvc/inference/
+        # ensemble_classifier.py). Populated from the preset's "cascade" block, never from
+        # per-frame keystrokes: a cascade's value is a jointly-tuned set of per-stage
+        # step/threshold pairs, not a knob an operator free-runs one stage at a time --
+        # retuning means switching presets (or restarting with a different one), same as a
+        # model hot-swap.
+        self._cascade_enabled = False
+        self._cascade_stages = []
         self._autosave_defect_snapshots = False
         self._frame_limiter = True
 
@@ -498,6 +508,7 @@ class LiveClassifier:
         """
         rt = preset.get("runtime") or {}
         gate = preset.get("gate") or {}
+        cascade = preset.get("cascade") or {}
         with self._lock:
             self._step_size          = int(rt.get("step", self._step_size))
             self._target_fps         = float(rt.get("target_fps", self._target_fps))
@@ -508,12 +519,19 @@ class LiveClassifier:
             self._two_stage_enabled  = bool(rt.get("two_stage", self._two_stage_enabled))
             if gate.get("threshold") is not None:
                 self._threshold = float(gate["threshold"])
+            self._cascade_enabled = bool(cascade.get("enabled", False))
+            self._cascade_stages  = list(cascade.get("stages") or [])
         m = preset.get("measured") or {}
         self.logger.info(
             f"Preset '{preset.get('name','?')}': model={preset.get('model')} "
             f"gate={gate.get('mode')}@{gate.get('threshold')} step={self._step_size} "
             f"fps={self._target_fps} erosion_kernel={self._erosion_kernel} "
             f"min_votes={self._min_votes} majority_voting={self._majority_voting}")
+        if self._cascade_enabled:
+            chain = " -> ".join(f"{s.get('model')}(step={s.get('step')}, "
+                                f"thr={(s.get('gate') or {}).get('threshold')})"
+                                for s in self._cascade_stages)
+            self.logger.info(f"  cascade ENABLED: {chain}")
         if preset.get("description"):
             self.logger.info(f"  {preset['description']}")
         if "detected" in m and "false_alarm" in m:
@@ -531,6 +549,7 @@ class LiveClassifier:
             if args.majority_voting is not None: self._majority_voting = bool(args.majority_voting)
             if args.frame_limiter is not None:   self._frame_limiter = bool(args.frame_limiter)
             if args.two_stage is not None:       self._two_stage_enabled = bool(args.two_stage)
+            if args.cascade is not None:          self._cascade_enabled = bool(args.cascade)
             if args.visualization is not None:   self._visualization_enabled = bool(args.visualization)
             if args.window_scale is not None:
                 self._window_scale = max(WINDOW_SCALE_MIN, min(WINDOW_SCALE_MAX, float(args.window_scale)))
@@ -575,6 +594,14 @@ class LiveClassifier:
         with self._lock:
             self._two_stage_enabled = bool(enabled)
         self.logger.info("Two-stage execution ENABLED" if enabled else "Two-stage execution DISABLED")
+
+    def set_cascade(self, enabled):
+        """Toggle cascade mode on/off. Only takes effect if the active preset defined a
+        stage list at startup (this does not build a cascade out of thin air) -- see
+        CascadeClassifierPnm."""
+        with self._lock:
+            self._cascade_enabled = bool(enabled)
+        self.logger.info("Cascade execution ENABLED" if enabled else "Cascade execution DISABLED")
 
     def set_fps(self, fps):
         """Set target FPS (0 = no limiting)."""
@@ -862,6 +889,17 @@ class LiveClassifier:
         with self._lock:
             return self._two_stage_enabled
 
+    def cascade_enabled(self):
+        """Thread-safe getter for the cascade mode."""
+        with self._lock:
+            return self._cascade_enabled
+
+    def get_cascade_stages(self):
+        """Thread-safe getter for the active preset's ordered stage list (list of dicts,
+        each at least {'model', 'step', 'gate': {'mode', 'threshold', ...}})."""
+        with self._lock:
+            return list(self._cascade_stages)
+
     def autosave_defect_snapshots_enabled(self):
         """Thread-safe getter for the autosave defect snapshots toggle."""
         with self._lock:
@@ -1059,6 +1097,7 @@ Keys (the standalone equivalent of the ROS services):
   h / ?  this help                       q      quit
   v      toggle visualization            p      toggle pause  (set_visualization / pause)
   2      toggle two-stage ensemble       m      toggle majority voting
+  3      toggle cascade (needs a preset with a "cascade" stage list; see recommended_configuration.json)
   f      toggle frame limiter            a      toggle autosave of defect frames
   d      remember current frame as DEFECT  (remember_defect)
   c      remember current frame as CLEAN   (remember_clean)
@@ -1085,6 +1124,8 @@ def handle_key(key, runtime, model_names):
         runtime.pause_inference(not runtime.inference_paused())
     elif key == "2":
         runtime.set_two_stage(not runtime.two_stage_enabled())
+    elif key == "3":
+        runtime.set_cascade(not runtime.cascade_enabled())
     elif key == "m":
         runtime.set_majority_voting(not runtime.majority_voting_enabled())
     elif key == "f":
@@ -1172,6 +1213,10 @@ def parse_arguments(argv=None):
     parser.add_argument("--two-stage", dest="two_stage", action="store_true", default=None,
                         help="start in two-stage ensemble mode")
     parser.add_argument("--no-two-stage", dest="two_stage", action="store_false")
+    parser.add_argument("--cascade", dest="cascade", action="store_true", default=None,
+                        help="start in cascade mode (needs the active preset's \"cascade\" "
+                             "stage list -- see recommended_configuration.json)")
+    parser.add_argument("--no-cascade", dest="cascade", action="store_false")
     parser.add_argument("--visualization", dest="visualization", action="store_true", default=None,
                         help="show the live heatmap window (default on)")
     parser.add_argument("--no-visualization", dest="visualization", action="store_false")
@@ -1312,6 +1357,49 @@ def main(argv=None):
             runtime.logger.warning(f"Two-stage ensemble DISABLED — build failed: {e!r}")
             ensemble_classifier = None
 
+    # Cascade is OPTIONAL, same non-fatal-missing-model pattern as the ensemble above.
+    # Built only if the active preset actually requested it (runtime.cascade_enabled())
+    # -- an unpopulated "cascade" block (the common case) means no stages to resolve, no
+    # download attempt, no warning.
+    cascade_classifier = None
+    _cascade_stages_cfg = runtime.get_cascade_stages()
+    if runtime.cascade_enabled():
+        if len(_cascade_stages_cfg) < 2:
+            runtime.logger.warning(
+                f"Cascade requested but the active preset defines "
+                f"{len(_cascade_stages_cfg)} stage(s) (need >= 2) — cascade DISABLED")
+        else:
+            _cascade_needed = [s["model"] for s in _cascade_stages_cfg]
+            _cascade_missing = [m for m in _cascade_needed
+                                if not (os.path.isfile(os.path.join(PATH, m + ".pth"))
+                                        and os.path.isfile(os.path.join(PATH, m + ".json")))]
+            if _cascade_missing:
+                runtime.logger.warning(
+                    f"Cascade DISABLED — missing models: {_cascade_missing}. "
+                    f"Fetch them with: python3 -m mvc.inference.model_download "
+                    f"{' '.join(_cascade_missing)}")
+            else:
+                try:
+                    from mvc.inference.ensemble_classifier import CascadeClassifierPnm
+                    cascade_classifier = CascadeClassifierPnm(stage_cfgs=[
+                        dict(model_path=os.path.join(PATH, s["model"] + ".pth"),
+                             cfg_path=os.path.join(PATH, s["model"] + ".json"),
+                             step=int(s.get("step", 16)),
+                             threshold=float((s.get("gate") or {}).get("threshold", 0.0)),
+                             gate_mode=(s.get("gate") or {}).get("mode", GATE_DEFECT_MASS),
+                             assign_best_defect_class=bool(
+                                 (s.get("gate") or {}).get("assign_best_defect_class", True)))
+                        for s in _cascade_stages_cfg
+                    ])
+                    runtime.logger.info(
+                        "Cascade built: " + " -> ".join(
+                            f"{s['model']}(step={s.get('step', 16)}, "
+                            f"thr={(s.get('gate') or {}).get('threshold', 0.0)})"
+                            for s in _cascade_stages_cfg))
+                except Exception as e:
+                    runtime.logger.warning(f"Cascade DISABLED — build failed: {e!r}")
+                    cascade_classifier = None
+
     tile_size = 0  # updated inside the inference block each iteration
 
     # Shared memory frame source
@@ -1333,6 +1421,7 @@ def main(argv=None):
     last_processed_timestamp = None
     last_pushed_threshold    = None   # only log a gate change, never a per-frame no-op
     _warned_no_ensemble      = False  # log the two-stage fallback once, not every frame
+    _warned_no_cascade       = False  # log the cascade fallback once, not every frame
     _warned_channels         = False
 
     try:
@@ -1385,6 +1474,13 @@ def main(argv=None):
             # Run the neural network
             majority_voting = runtime.majority_voting_enabled()
             with torch.inference_mode():
+                if runtime.cascade_enabled() and cascade_classifier is None:
+                    if not _warned_no_cascade:
+                        runtime.logger.warning(
+                            "cascade requested but unavailable (see the DISABLED warning "
+                            "at startup) — falling back to two-stage/single classifier")
+                        _warned_no_cascade = True
+
                 if runtime.two_stage_enabled() and ensemble_classifier is None:
                     if not _warned_no_ensemble:
                         runtime.logger.warning(
@@ -1392,7 +1488,18 @@ def main(argv=None):
                             "falling back to the single classifier")
                         _warned_no_ensemble = True
 
-                if runtime.two_stage_enabled() and ensemble_classifier is not None:
+                if runtime.cascade_enabled() and cascade_classifier is not None:
+                    # No per-frame step/threshold push here, unlike the two branches below:
+                    # a cascade's whole point is a jointly-tuned set of per-stage step/
+                    # threshold pairs (chosen offline, see knowledge/7-9-report.md §8.4-
+                    # §8.7), not a single knob an operator free-runs live. Retuning means
+                    # switching presets, same as a model hot-swap.
+                    with runtime._model_lock:
+                        tile_size = cascade_classifier.stages[-1].tile_size
+                        heatmap, occupancy, responses = cascade_classifier.forward(
+                            frame, legend=True, log=True)
+                        inference_hz = getattr(cascade_classifier, "hz", 0.0)
+                elif runtime.two_stage_enabled() and ensemble_classifier is not None:
                     with runtime._model_lock:
                         ensemble_classifier.step = runtime.get_step_size()
                         thr = runtime.get_max_probability_threshold()

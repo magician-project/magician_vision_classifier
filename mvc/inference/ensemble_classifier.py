@@ -670,3 +670,265 @@ class EnsembleClassifierPnm:
           log_performance("perf.csv", runid, self.step, self.tile_size, majorityVote, self.maxProbabilityThreshold, len(non_clean_indices), self.hz)
         return heatmap, occupancy, responses
 
+
+# =======================================================================================
+# Cascade classifier: an ORDERED chain of stages, each with its own tiling step and gate
+# threshold, replacing EnsembleClassifierPnm's fixed "one screen + N-way majority vote"
+# shape with a genuine screen-then-recheck-then-recheck... pipeline.
+#
+# analysis/eval/eval_cascade_step_sweep.py measured this exact mechanism OFFLINE, from
+# cached per-frame scores, before any live code existed to run it -- the containment-
+# matrix geometry below is a direct port of that script's containment_matrix/
+# eligible_mask (same derivation: the tile grid is separable, square tiles, uniform
+# steps per axis, so "which target cells overlap a promoted source cell" is two matrix
+# multiplies, not a pixel raster), adapted from per-frame numpy arrays swept across many
+# cached frames offline to GPU torch tensors computed once per live frame.
+# =======================================================================================
+@torch.no_grad()
+def containment_matrix_torch(step_from, step_to, size, tile_size, device):
+    """(n_from, n_to) bool, ONE axis: does tile `f` of step_from contain the CENTER of
+    tile `t` of step_to? Geometry only -- independent of frame content and threshold, so
+    the caller should compute this once per (step_from, step_to, size, tile_size) and
+    reuse it for every frame that pair of stages ever processes (see
+    CascadeClassifierPnm._containment).
+
+    Mirrors tile_and_cast_data_torch's unfold convention exactly: tile origins at
+    0, step, 2*step, ... while the tile still fits (`torch.arange(0, size-tile+1, step)`,
+    the same formula grid_origins() in analysis/eval/eval_step_curve.py uses) -- any
+    independent formula here would silently drift from what the tiler actually produces.
+    """
+    xs_from = torch.arange(0, size - tile_size + 1, step_from, device=device)
+    xs_to   = torch.arange(0, size - tile_size + 1, step_to,   device=device)
+    centers_to = xs_to + tile_size // 2
+    return ((xs_from[:, None] <= centers_to[None, :]) &
+            (centers_to[None, :] < xs_from[:, None] + tile_size))
+
+
+@torch.no_grad()
+def eligible_mask_torch(promoted2d, y_contain, x_contain):
+    """(ny_to, nx_to) bool: which of the TARGET grid's cells overlap a promoted cell of
+    the SOURCE grid.
+
+        eligible[y2,x2] = OR over (y1,x1) promoted[y1,x1] AND y_contain[y1,y2] AND x_contain[x1,x2]
+                         = (y_contain.T @ promoted @ x_contain) > 0
+
+    See eval_cascade_step_sweep.py's docstring for the full derivation.
+
+    dtype note: the numpy original (eval_cascade_step_sweep.py) does this matmul in
+    int8/int32, which numpy's CPU BLAS handles fine. cuBLAS does NOT implement integer
+    GEMM ("addmm_cuda not implemented for 'Int'", caught live on GPU) -- so this uses
+    float32 instead. Every product/sum here is exactly 0 or a small positive integer
+    representable exactly in float32, so `> 0.5` is an exact, not approximate, test."""
+    promoted = promoted2d.to(torch.float32)
+    result = (y_contain.t().to(torch.float32) @ promoted) @ x_contain.to(torch.float32)
+    return result > 0.5
+
+
+class CascadeStage:
+    """One stage of a CascadeClassifierPnm: a model plus its own tiling step and gate."""
+
+    def __init__(self, model_path, cfg_path, tile_size=48, step=16, threshold=0.0,
+                 gate_mode=GATE_DEFECT_MASS, assign_best_defect_class=True, precache=False):
+        self.clf = ClassifierPnm(model_path=model_path, cfg_path=cfg_path,
+                                 tile_size=tile_size, step=step, precache=precache)
+        # ClassifierPnm overwrites tile_size from the model's own cfg["hparams"]["tile_size"]
+        # -- read it back rather than trust the constructor argument, so a stage's
+        # geometry always matches what its model actually expects.
+        self.tile_size = self.clf.tile_size
+        self.step = step
+        self.threshold = threshold
+        self.gate_mode = gate_mode
+        self.assign_best_defect_class = assign_best_defect_class
+
+    @property
+    def model(self):
+        return self.clf.model
+
+    @property
+    def classes(self):
+        return self.clf.classes
+
+    @property
+    def name(self):
+        return self.clf.name
+
+
+class CascadeClassifierPnm:
+    """Ordered screen-then-recheck cascade over N stages, each free to use its own
+    tiling step and gate threshold -- the live counterpart to
+    analysis/eval/eval_cascade_step_sweep.py, which measured this mechanism offline
+    before it existed to run here.
+
+    THE CHAIN, not a vote (unlike EnsembleClassifierPnm): stage 0 classifies every tile
+    of the full frame at its OWN step. A tile is "promoted" if stage 0's gate flags it
+    non-clean. Stage 1 then re-tiles ONLY the region stage 0 promoted, at stage 1's OWN
+    (possibly different) step, and re-classifies just that subset -- everything stage 0
+    locked clean never reaches stage 1 at all. This repeats for every later stage. The
+    FINAL stage's decision on a promoted tile is the frame's answer for that tile; a tile
+    no stage ever promotes stays clean by construction.
+
+    Because two consecutive stages can tile at different steps, mapping "stage i-1
+    promoted these grid cells" onto "these are the flat indices stage i's own grid
+    should classify" needs a geometric correspondence between two different regular
+    grids over the same frame -- containment_matrix_torch/eligible_mask_torch above.
+
+    CAVEAT carried over from the eval tool: the containment geometry assumes every stage
+    uses the SAME tile_size (48px, the one deployment geometry this repo trains against
+    -- see analysis/sweeps/bench_inference.py). A stage whose model was trained at a
+    different tile_size would need the containment math generalised; nothing in this
+    repo currently is.
+
+    STATUS: this is the ported geometry + a working forward() implementation, NOT yet
+    wired into live_torch.py/live_torch_ros.py's construction or recommended_
+    configuration.json's schema (both still only know EnsembleClassifierPnm's fixed
+    screen+vote shape) -- that wiring, and real-hardware Hz validation, are separate,
+    deliberately not-yet-done next steps.
+    """
+
+    def __init__(self, stage_cfgs, precache=False):
+        """stage_cfgs: ORDERED list of dicts, each at minimum
+            {'model_path': ..., 'cfg_path': ..., 'step': ..., 'threshold': ...}
+        and optionally 'tile_size', 'gate_mode', 'assign_best_defect_class'.
+        stage_cfgs[0] is the first screen; stage_cfgs[-1] makes the final decision.
+        """
+        assert len(stage_cfgs) >= 2, ("CascadeClassifierPnm needs at least 2 stages -- "
+                                      "use ClassifierPnm directly for a single model.")
+        self.stages = [CascadeStage(precache=precache, **sc) for sc in stage_cfgs]
+        self.name = "CascadeClassifier"
+        self.device = self.stages[0].clf.device
+
+        # The final stage's label space is what the frame is ultimately reported in --
+        # mirrors eval_cascade_step_sweep.py's convention (its "frames2" argument, whose
+        # classes/clean_id drive every macro/FA number).
+        self.classes = self.stages[-1].classes
+        self.class_colors = self.stages[-1].clf.class_colors
+        self.class_id_to_color = [torch.tensor(c, dtype=torch.uint8) for c in self.class_colors]
+
+        def find_clean_id(cls_list):
+            for i, c in enumerate(cls_list):
+                if c.lower() in ("class_clean", "clean"):
+                    return i
+            return None
+
+        self.clean_ids = [find_clean_id(s.classes) for s in self.stages]
+        if any(c is None for c in self.clean_ids):
+            raise ValueError("Could not find 'class_clean' in every stage's class list")
+
+        self._containment_cache = {}   # (step_from, step_to, H, W, tile_size) -> (y_c, x_c)
+        self.hz = 0.0
+        self.model_perf = {}
+
+        print(f"Initialized CascadeClassifierPnm with {len(self.stages)} stages: "
+              f"{[s.name for s in self.stages]} "
+              f"(steps={[s.step for s in self.stages]}, "
+              f"thresholds={[s.threshold for s in self.stages]})")
+
+    def _containment(self, step_from, step_to, h, w, tile_size):
+        key = (step_from, step_to, h, w, tile_size)
+        cached = self._containment_cache.get(key)
+        if cached is None:
+            y_c = containment_matrix_torch(step_from, step_to, h, tile_size, self.device)
+            x_c = containment_matrix_torch(step_from, step_to, w, tile_size, self.device)
+            cached = (y_c, x_c)
+            self._containment_cache[key] = cached
+        return cached
+
+    @staticmethod
+    def _grid_dims(size, tile_size, step):
+        return (size - tile_size) // step + 1   # matches unfold's window count exactly
+
+    @torch.no_grad()
+    def forward(self, image, legend=True, log=True):
+        """One frame through the full chain. Returns (heatmap, occupancy, responses),
+        the same triple ClassifierPnm.forward()/EnsembleClassifierPnm.forward() return.
+        """
+        start = time.time()
+
+        rgba_image = readPolarPNMToRGBALive(image)
+        rgba_image = cv2.cvtColor(rgba_image, cv2.COLOR_RGBA2BGRA)
+        rgba_image = torch.as_tensor(rgba_image, device=self.device, dtype=torch.uint8)
+        h, w = rgba_image.shape[:2]
+
+        # --- Stage 0: classify every tile of the full frame at its own step ---
+        stage0 = self.stages[0]
+        preds, confs, _tiles0 = classify_tiles(
+            stage0.model, rgba_image, tile_size=stage0.tile_size, step=stage0.step,
+            majorityVote=False, thresholdMaxProbability=stage0.threshold,
+            forceLowMaxProbToThisClass=self.clean_ids[0], gateMode=stage0.gate_mode,
+            assignBestDefectClass=stage0.assign_best_defect_class,
+            return_torch=True, return_tiles=True)
+
+        ny0 = self._grid_dims(h, stage0.tile_size, stage0.step)
+        nx0 = self._grid_dims(w, stage0.tile_size, stage0.step)
+        promoted2d = (preds.to(torch.int32) != self.clean_ids[0]).view(ny0, nx0)
+
+        final_predictions = final_confidences = None
+        final_ny, final_nx = ny0, nx0
+        prev_step, prev_tile_size = stage0.step, stage0.tile_size
+
+        # --- Stages 1..N-1: re-tile only what the PREVIOUS stage promoted, at THIS
+        #     stage's own step, and re-classify just that subset ---
+        for i in range(1, len(self.stages)):
+            stage = self.stages[i]
+            ny = self._grid_dims(h, stage.tile_size, stage.step)
+            nx = self._grid_dims(w, stage.tile_size, stage.step)
+
+            y_c, x_c = self._containment(prev_step, stage.step, h, w, prev_tile_size)
+            eligible2d = eligible_mask_torch(promoted2d, y_c, x_c)
+            selected_indices = eligible2d.flatten().nonzero(as_tuple=True)[0]
+
+            # Default every cell to THIS stage's clean class -- a tile the previous
+            # stage didn't promote never reaches this stage at all, and stays clean.
+            final_predictions = torch.full((ny * nx,), self.clean_ids[i],
+                                           dtype=torch.int32, device=self.device)
+            final_confidences = torch.zeros((ny * nx,), dtype=torch.float32, device=self.device)
+
+            if len(selected_indices) > 0:
+                _t0 = time.time()
+                sel_tiles = tile_and_cast_selected_tiles_torch(
+                    rgba_image, selected_indices, tile_size=stage.tile_size, step=stage.step)
+                # (N, tile, tile, C) -> (N, C, tile, tile): tile_and_cast_selected_tiles_torch
+                # does NOT do this permute itself (unlike tile_and_cast_data_torch inside
+                # classify_tiles, whose return_tiles=True output already has it applied).
+                sel_tiles = sel_tiles.permute(0, 3, 1, 2).contiguous()
+
+                sel_preds, sel_confs = classify_selected_tiles(
+                    stage.name, stage.model, rgba_image, sel_tiles,
+                    tile_size=stage.tile_size, step=stage.step,
+                    thresholdMaxProbability=stage.threshold,
+                    forceLowMaxProbToThisClass=self.clean_ids[i],
+                    gateMode=stage.gate_mode,
+                    assignBestDefectClass=stage.assign_best_defect_class,
+                    return_torch=True)
+
+                final_predictions[selected_indices] = sel_preds.to(torch.int32)
+                final_confidences[selected_indices] = sel_confs.to(torch.float32)
+                self.model_perf[stage.name] = 1.0 / (time.time() - _t0 + 1e-9)
+
+            promoted2d = (final_predictions != self.clean_ids[i]).view(ny, nx)
+            prev_step, prev_tile_size = stage.step, stage.tile_size
+            final_ny, final_nx = ny, nx
+
+        final_predictions_np = final_predictions.cpu().numpy()
+        final_confidences_np = final_confidences.cpu().numpy()
+
+        heatmap, occupancy, responses = generate_heatmap(
+            final_predictions_np, final_confidences_np, self.classes, self.class_id_to_color,
+            self.clean_ids[-1], rgba_image,
+            tile_size=self.stages[-1].tile_size, step=self.stages[-1].step)
+
+        if legend:
+            heatmap = self.stages[0].clf.add_legend(heatmap)
+
+        elapsed = time.time() - start + 1e-4
+        self.hz = 1.0 / elapsed
+        self._last_tile_count = final_ny * final_nx
+        self._last_elapsed = elapsed
+
+        if log:
+            log_performance("perf.csv", "cascade", self.stages[-1].step,
+                            self.stages[-1].tile_size, False, self.stages[-1].threshold,
+                            int(promoted2d.sum().item()), self.hz)
+
+        return heatmap, occupancy, responses
+

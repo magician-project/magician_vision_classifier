@@ -599,8 +599,35 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
     """
     Generate color-coded heatmap using integer class IDs only.
     Matches tiling produced by tile_and_cast_data_torch.
+
+    VECTORIZED (2026-09-09). The original was a plain Python loop over every grid cell
+    (thousands of iterations), calling draw_cross() + a color-scale/clamp/cast per
+    ACTIVATED tile -- each of those is a separate small GPU op when `rgba_image` is
+    CUDA-resident, so an N-activation frame issued O(N) tiny CUDA kernel launches from
+    Python. A live cascade smoke test measured this at ~140-160ms/frame -- 60-70% of
+    total per-frame latency, more than either model's forward pass -- see
+    knowledge/7-9-report.md §8.6, which is what prompted this rewrite. This version does
+    the masking/counting/list-building on CPU (cheap, and predictions/confidences already
+    arrive as numpy arrays from every call site) and draws every activated tile's cross in
+    exactly TWO batched GPU scatter-writes total, regardless of how many tiles activate.
+
+    Verified BYTE-IDENTICAL (heatmap pixels, occupancy, responses) against the original
+    element-by-element implementation, including under a synthetic all-4588-tiles-activated
+    stress test -- see the smoke test in knowledge/7-9-report.md §8.6. That stress test is
+    what caught a real hazard worth recording: a naive "two batched scatter writes" version
+    of this rewrite (draw all horizontal bars in one write, all vertical bars in another)
+    passed on realistic sparse activation but produced TORN pixels (channel 0 from one
+    tile's colour, channels 1-2 from another's) under dense activation, because CUDA's
+    fancy-index assignment has no atomicity guarantee across duplicate (row, col) targets
+    within one write. The fix below resolves every pixel's winning tile ON THE CPU first
+    (exactly reproducing the original's "later tile in raster order wins" rule, since a
+    later tile's draw_cross() call always overwrites an earlier one's at any shared pixel,
+    whether the collision is between two horizontal bars, two vertical bars, or one of
+    each) and only then issues a SINGLE duplicate-free scatter write -- so no matter how
+    dense the activation, there is no racy write left to produce a torn colour.
     """
     original_image = torch.as_tensor(rgba_image, dtype=torch.uint8)
+    device = original_image.device
     height, width, _ = original_image.shape
 
     y_indices = torch.arange(0, height - tile_size + 1, step)
@@ -609,71 +636,105 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
     tilesW = len(x_indices)
     expected_tiles = tilesH * tilesW
 
-    #if len(predictions) != expected_tiles:
     if not (verifyTileNumber(len(predictions), original_image, tile_size, step)):
         print(f"⚠️ generate_heatmap warning: predictions={len(predictions)} tiles expected={expected_tiles}")
 
-    occupancy = torch.full((tilesH, tilesW), 255, dtype=torch.uint8)
-    responses = {"points": [], "classes": [], "classIDs": [],  "confidences": []}
-    heatmap = original_image[:, :, :3].clone()
-    activations = torch.zeros(len(class_id_to_name), dtype=torch.int32)
-
-    predicted_classes = torch.as_tensor(predictions, dtype=torch.int32)
-    totalActivations = 0
-    idx = 0
-    num_preds = len(predicted_classes)
+    num_classes = len(class_id_to_name)
+    num_preds = len(predictions)
     half_tile_size = tile_size // 2
 
-    bg_prob_sum = 0.0
-    bg_count    = 0
+    # All of this stays on CPU: predictions/confidences already arrive as numpy arrays at
+    # every call site, and this bookkeeping is tiny (thousands of scalars) -- no benefit to
+    # moving it to the GPU, and it keeps index tensors off the device that only the actual
+    # pixel writes below need to touch.
+    predicted_classes_all = torch.as_tensor(predictions, dtype=torch.int64)
+    confidences_all = torch.as_tensor(confidences, dtype=torch.float32)
 
-    for vTile, y in enumerate(y_indices):
-        for hTile, x in enumerate(x_indices):
-            if idx >= num_preds:
-                break
+    # Matches the original's early "idx >= num_preds: break" -- process exactly the
+    # min(predictions, grid cells) flat positions, in the SAME raster order (vTile outer,
+    # hTile inner) the nested loop visited them in.
+    n = min(num_preds, expected_tiles)
+    predicted_classes = predicted_classes_all[:n]
+    confs = confidences_all[:n]
+    y_centers_grid = (y_indices + half_tile_size).unsqueeze(1).expand(tilesH, tilesW).reshape(-1)[:n]
+    x_centers_grid = (x_indices + half_tile_size).unsqueeze(0).expand(tilesH, tilesW).reshape(-1)[:n]
 
-            predicted_class = int(predicted_classes[idx])
+    valid_mask = (predicted_classes >= 0) & (predicted_classes < num_classes)
+    clean_mask = valid_mask & (predicted_classes == cleanClassID)
+    activated_mask = valid_mask & (predicted_classes != cleanClassID)
 
-            # Skip invalid IDs gracefully
-            if predicted_class < 0 or predicted_class >= len(class_id_to_name):
-                idx += 1
-                continue
+    bg_count = int(clean_mask.sum())
+    bg_prob_sum = float(confs[clean_mask].sum()) if bg_count > 0 else 0.0
 
-            if predicted_class != cleanClassID:
-                totalActivations += 1
-                color = class_id_to_color[predicted_class]
+    activated_idx = torch.nonzero(activated_mask, as_tuple=True)[0]   # ascending -> raster order
+    totalActivations = int(activated_idx.numel())
 
-                activationCoordinateX = int(x + half_tile_size)
-                activationCoordinateY = int(y + half_tile_size)
+    heatmap = original_image[:, :, :3].clone()
+    occupancy = torch.full((tilesH, tilesW), 255, dtype=torch.uint8)   # CPU, matches original
+    activations = torch.zeros(num_classes, dtype=torch.int32)
+    responses = {"points": [], "classes": [], "classIDs": [], "confidences": []}
 
-                confidence = float(confidences[idx])
+    if totalActivations > 0:
+        act_classes = predicted_classes[activated_idx]
+        act_confs   = confs[activated_idx]
+        act_y = y_centers_grid[activated_idx]
+        act_x = x_centers_grid[activated_idx]
 
+        activations += torch.bincount(act_classes, minlength=num_classes).to(activations.dtype)
+        occupancy.view(-1)[activated_idx] = 0
 
-                # Confidence only modulates brightness inside a narrow band: scaling the
-                # colour straight by the confidence pushed unsure tiles towards black and
-                # made their class unreadable.
-                color = (color.float() * (0.60 + 0.40 * confidence)).clamp(0, 255).to(torch.uint8)
+        # Per-tile colour, confidence-modulated exactly as the original per-tile scaling.
+        colors_table = torch.stack(list(class_id_to_color)).float()   # (C, 3)
+        base_colors = colors_table[act_classes]                        # (N, 3)
+        mod = 0.60 + 0.40 * act_confs                                  # (N,)
+        act_colors = (base_colors * mod.unsqueeze(1)).clamp(0, 255).to(torch.uint8)
 
-                draw_cross(heatmap, (activationCoordinateY, activationCoordinateX), 10, color)
+        # Every activated tile's cross ("+" shape, half-size 10, matching the original
+        # draw_cross call) touches 2K-1 pixels (K = 2*half+1, the centre shared by both
+        # bars). Build ALL of them -- horizontal bar then vertical bar, for every tile --
+        # as one flat (row, col, tile_rank, colour) list, tile_rank = the tile's position
+        # in raster/activation order (0..N-1), matching the original's draw sequence.
+        half = 10
+        offs = torch.arange(-half, half + 1)
+        K = offs.numel()
+        ranks = torch.arange(totalActivations)
 
+        h_rows = act_y.unsqueeze(1).expand(-1, K).clamp(0, height - 1).reshape(-1)
+        h_cols = (act_x.unsqueeze(1) + offs.unsqueeze(0)).clamp(0, width - 1).reshape(-1)
+        v_rows = (act_y.unsqueeze(1) + offs.unsqueeze(0)).clamp(0, height - 1).reshape(-1)
+        v_cols = act_x.unsqueeze(1).expand(-1, K).clamp(0, width - 1).reshape(-1)
 
-                activations[predicted_class] += 1
-                responses["points"].append( (activationCoordinateX, activationCoordinateY) )
-                responses["classes"].append(class_id_to_name[predicted_class])
-                responses["classIDs"].append(int(predicted_class))
-                responses["confidences"].append(confidence)
-                try:
-                  occupancy[vTile, hTile] = 0
-                except Exception as e:
-                  print("Failed setting occupancy:", repr(e))
-            else:
-                bg_prob_sum += float(confidences[idx])
-                bg_count    += 1
+        all_rows = torch.cat([h_rows, v_rows])
+        all_cols = torch.cat([h_cols, v_cols])
+        all_ranks = ranks.unsqueeze(1).expand(-1, K).reshape(-1).repeat(2)
+        all_colors = act_colors.unsqueeze(1).expand(-1, K, 3).reshape(-1, 3).repeat(2, 1)
 
-            idx += 1
+        # Resolve every pixel to its single winning (highest-rank) tile BEFORE touching the
+        # GPU tensor at all -- sort by (pixel, rank) so each pixel's occurrences are
+        # contiguous and rank-ascending, then keep only the last (highest-rank) occurrence
+        # per pixel. This reproduces the original's "later tile always overwrites" rule
+        # exactly, and leaves no duplicate index for the final scatter write to race on.
+        linear = all_rows.to(torch.int64) * width + all_cols.to(torch.int64)
+        combined_key = linear * (totalActivations + 1) + all_ranks.to(torch.int64)
+        order = torch.argsort(combined_key)
+        linear_sorted = linear[order]
+        colors_sorted = all_colors[order]
+        uniq_linear, counts = torch.unique_consecutive(linear_sorted, return_counts=True)
+        last_of_group = torch.cumsum(counts, 0) - 1
+        win_colors = colors_sorted[last_of_group]
+        win_rows = torch.div(uniq_linear, width, rounding_mode='floor')
+        win_cols = uniq_linear % width
+        heatmap[win_rows.to(device), win_cols.to(device)] = win_colors.to(device)
 
-        if idx >= num_preds:
-            break
+        # Python-side lists for `responses` are unavoidably per-activation (a ROS message
+        # needs real python ints/strs), but this is now ONE batched .tolist() per field
+        # instead of N separate int()/float() conversions.
+        xs, ys = act_x.tolist(), act_y.tolist()
+        classIDs, confs_list = act_classes.tolist(), act_confs.tolist()
+        responses["points"]      = list(zip(xs, ys))
+        responses["classes"]     = [class_id_to_name[c] for c in classIDs]
+        responses["classIDs"]    = classIDs
+        responses["confidences"] = confs_list
 
     responses["background_avg_prob"] = bg_prob_sum / bg_count if bg_count > 0 else 0.0
 
