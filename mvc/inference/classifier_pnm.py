@@ -743,13 +743,46 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
     return heatmap.cpu().numpy(), occupancy.cpu().numpy(), responses
 
 
+def _neighbor_counts_torch(occupied2d, kernel):
+    """(tilesH, tilesW) int64: count of OCCUPIED cells (including itself) in every cell's
+    (2*kernel+1)^2 neighbourhood, via a 2-D integral image -- O(cells), not the
+    O(activations * kernel^2) nested Python loop this replaces. Same algorithm as
+    analysis/eval/eval_vote_curve.py's neighbor_counts (numpy there; kept in torch here to
+    match this module's tensors -- the maths is identical, and both were cross-checked
+    against each other before this function replaced the loop it's named after."""
+    h, w = occupied2d.shape
+    m = occupied2d.to(torch.int64)
+    padded = torch.zeros((h + 2 * kernel, w + 2 * kernel), dtype=torch.int64)
+    padded[kernel:kernel + h, kernel:kernel + w] = m
+    ii = torch.zeros((padded.shape[0] + 1, padded.shape[1] + 1), dtype=torch.int64)
+    ii[1:, 1:] = torch.cumsum(torch.cumsum(padded, dim=0), dim=1)
+    k = 2 * kernel + 1
+    return ii[k:k + h, k:k + w] - ii[0:h, k:k + w] - ii[k:k + h, 0:w] + ii[0:h, 0:w]
+
+
 @torch.no_grad()
 def process_predictions_erode(predictions, confidences, class_id_to_name, cleanClassID, rgba_image, tile_size=48, step=14, erosion_kernel=1, erosion_threshold=1):
     """
     erosion_kernel: radius in tiles for neighbor search
     erosion_threshold: minimum number of neighbors required to keep a prediction
-    """
 
+    VECTORIZED (2026-09-09) -- same motivation and pattern as generate_heatmap's rewrite
+    (knowledge/7-9-report.md SS8.7), found by profiling this function specifically because
+    it is the one the SHIPPED "default" preset actually calls every frame (erosion_kernel=1,
+    min_votes=2 are both non-zero there, so runSingle() takes this branch, not
+    generate_heatmap's). The original was two Python loops that scale with activation
+    count -- one that iterates every activated tile AND checks all (2k+1)^2 neighbours one
+    at a time. Measured: 26ms at 108 activations (a real frame), climbing linearly to
+    487ms at 4,588 (every tile activated) -- i.e. this was already the dominant per-frame
+    cost on any reasonably busy frame, worse than generate_heatmap ever was. The erosion
+    decision itself has no order dependence to preserve (every neighbour-count reads a
+    fixed occupancy snapshot taken before any counting starts), so this is not a
+    "verified equivalent, one accepted ambiguity" situation like generate_heatmap's
+    rewrite -- it is byte-for-byte the same computation, done with one integral image
+    (_neighbor_counts_torch) instead of one Python iteration per (activated tile, neighbour)
+    pair. Verified identical to the original element-by-element implementation, including
+    under the same activation-fraction stress test that measured the numbers above.
+    """
     original_image   = torch.as_tensor(rgba_image, dtype=torch.uint8)
     height, width, _ = original_image.shape
 
@@ -759,94 +792,69 @@ def process_predictions_erode(predictions, confidences, class_id_to_name, cleanC
     tilesW           = len(x_indices)
     expected_tiles   = tilesH * tilesW
 
-    #if len(predictions) != expected_tiles:
     if not (verifyTileNumber(len(predictions), original_image, tile_size, step)):
         print(f"⚠️ Warning: predictions={len(predictions)} tiles expected={expected_tiles}")
 
-    occupancy = torch.full((tilesH, tilesW), 255, dtype=torch.uint8)
-    responses = {"points": [], "classes": [], "classIDs": [],  "confidences": []}
-    heatmap = original_image[:, :, :3].clone()
-    activations = torch.zeros(len(class_id_to_name), dtype=torch.int32)
-
-    predicted_classes = torch.as_tensor(predictions, dtype=torch.int32)
-    totalActivations = 0
-    idx = 0
-    num_preds = len(predicted_classes)
+    num_classes = len(class_id_to_name)
+    num_preds = len(predictions)
     half_tile_size = tile_size // 2
 
-    # ---- FIRST PASS: collect raw detections ----
-    coord_map = []  # stores (vTile, hTile, predicted_class, confidence)
-    
-    for vTile, y in enumerate(y_indices):
-        for hTile, x in enumerate(x_indices):
+    predicted_classes_all = torch.as_tensor(predictions, dtype=torch.int64)
+    confidences_all = torch.as_tensor(confidences, dtype=torch.float32)
 
-            if idx >= num_preds:
-                break
+    # Matches the original's early "idx >= num_preds: break" -- only the first
+    # min(predictions, grid cells) flat positions (raster order) are ever visited.
+    n = min(num_preds, expected_tiles)
+    predicted_classes = predicted_classes_all[:n]
 
-            predicted_class = int(predicted_classes[idx])
-
-            # Skip invalid IDs gracefully
-            if 0 <= predicted_class < len(class_id_to_name):
-                if predicted_class != cleanClassID:
-                    confidence = float(confidences[idx]) 
-                    coord_map.append((vTile, hTile, predicted_class, confidence))
-                    totalActivations += 1
-                    activations[predicted_class] += 1
-                    occupancy[vTile, hTile] = 0
-
-            idx += 1
-        if idx >= num_preds:
-            break
-
+    valid_mask = (predicted_classes >= 0) & (predicted_classes < num_classes)
+    activated_flat = valid_mask & (predicted_classes != cleanClassID)
+    totalActivations = int(activated_flat.sum())
     print(f"{totalActivations}/{num_preds} activations (before erosion)")
 
-    # ---- EROSION MASK CONSTRUCTION ----
-    eroded_mask = torch.zeros_like(occupancy, dtype=torch.uint8)  # 1 = keep
+    occupancy = torch.full((tilesH, tilesW), 255, dtype=torch.uint8)
+    occupied2d = torch.zeros(expected_tiles, dtype=torch.bool)
+    occupied2d[:n] = activated_flat
+    occupancy.view(-1)[:n][activated_flat] = 0
+    occupied2d = occupied2d.view(tilesH, tilesW)
 
-    for (v, h, clsID, confidence) in coord_map:
-        # Count neighbors within erosion_kernel
-        count = 0
-        for dv in range(-erosion_kernel, erosion_kernel + 1):
-            for dh in range(-erosion_kernel, erosion_kernel + 1):
-                nv, nh = v + dv, h + dh
-                if 0 <= nv < tilesH  and 0 <= nh < tilesW :
-                    if occupancy[nv, nh] == 0:
-                        count += 1
-                        #print("Count ",count," ",nv,",",nh," erosion_kernel=",erosion_kernel," erosion_threshold=",erosion_threshold)
+    # ---- EROSION: keep an activated tile iff its (2k+1)^2 neighbourhood (including
+    # itself) has >= erosion_threshold activated tiles -- identical rule to the original,
+    # computed for every cell at once instead of once per activated tile. ----
+    counts = _neighbor_counts_torch(occupied2d, erosion_kernel)
+    eroded_mask2d = occupied2d & (counts >= erosion_threshold)
 
-        # If enough neighbors, keep it
-        if count >= erosion_threshold:
-            eroded_mask[v, h] = 1
+    kept_idx = torch.nonzero(eroded_mask2d.view(-1), as_tuple=True)[0]   # ascending -> raster order, same as the original's coord_map iteration order
+    kept_classes = predicted_classes_all[kept_idx]
+    kept_confs = confidences_all[kept_idx]
+    vTiles = torch.div(kept_idx, tilesW, rounding_mode='floor')
+    hTiles = kept_idx % tilesW
+    xs = (hTiles * step + half_tile_size).tolist()
+    ys = (vTiles * step + half_tile_size).tolist()
+    classIDs = kept_classes.tolist()
+    confs_list = kept_confs.tolist()
 
-    # ---- SECOND PASS: rebuild filtered responses ----
-    filtered_responses = {"points": [], "classes": [], "classIDs": [],  "confidences": []}
-    filtered_activations = torch.zeros_like(activations)
+    filtered_responses = {
+        "points": list(zip(xs, ys)),
+        "classes": [class_id_to_name[c] for c in classIDs],
+        "classIDs": classIDs,
+        "confidences": confs_list,
+    }
+    filtered_activations = torch.bincount(kept_classes, minlength=num_classes) \
+        if kept_idx.numel() > 0 else torch.zeros(num_classes, dtype=torch.int64)
 
-    for (vTile, hTile, predicted_class, confidence) in coord_map:
-        if eroded_mask[vTile, hTile] == 0:
-            continue  # removed by erosion
-
-        x = hTile * step
-        y = vTile * step
-        activationCoordinateX = int(x + half_tile_size)
-        activationCoordinateY = int(y + half_tile_size)
-
-        filtered_responses["points"].append((activationCoordinateX, activationCoordinateY))
-        filtered_responses["classes"].append(class_id_to_name[predicted_class])
-        filtered_responses["classIDs"].append(predicted_class)
-        filtered_responses["confidences"].append(confidence)
-        filtered_activations[predicted_class] += 1
-
-    predicted_classes_flat = torch.as_tensor(predictions, dtype=torch.int32)
-    bg_mask = (predicted_classes_flat == cleanClassID)
-    bg_count = int(bg_mask.sum().item())
+    # background_avg_prob: over the FULL (untruncated) predictions array, matching the
+    # original -- it read predictions/confidences fresh here rather than the grid-truncated
+    # view used above.
+    bg_mask = (predicted_classes_all == cleanClassID)
+    bg_count = int(bg_mask.sum())
     if bg_count > 0:
-        bg_prob_sum = float(torch.as_tensor(confidences, dtype=torch.float32)[bg_mask].sum().item())
+        bg_prob_sum = float(confidences_all[bg_mask].sum())
         filtered_responses["background_avg_prob"] = bg_prob_sum / bg_count
     else:
         filtered_responses["background_avg_prob"] = 0.0
 
-    print(f"{filtered_activations.sum().item()}/{num_preds} activations (after erosion)")
+    print(f"{int(filtered_activations.sum())}/{num_preds} activations (after erosion)")
     print("Per-class activations:", filtered_activations.tolist())
 
     return occupancy.cpu().numpy(), filtered_responses
@@ -942,20 +950,75 @@ def process_predictions_erode(predictions, confidences, class_id_to_name, cleanC
 def draw_heatmap(rgba_image, responses, class_id_to_color, size=10):
     """
     Draw crosses onto a heatmap using the responses returned by process_predictions().
-    """
 
-    # RGB only
+    VECTORIZED (2026-09-09) -- same pattern as generate_heatmap's and
+    process_predictions_erode's rewrites (knowledge/7-9-report.md SS8.7 and the
+    profiling that followed it): the original called draw_cross() once per point in a
+    Python loop. Measured: ~3.5ms at 60 points, climbing to ~65.8ms at 4,588 (every tile)
+    -- linear in point count, the same anti-pattern class, now the largest remaining cost
+    on any frame with many surviving (post-erosion) detections.
+
+    Draws every point's cross via ONE deduplicated scatter write: resolve, per pixel,
+    which point wins on overlap ("later point in responses["points"] order wins",
+    matching the original's sequential draw_cross calls exactly) before ever writing to
+    the array -- so there is no duplicate-index write left to race on, the same fix
+    that made generate_heatmap's rewrite byte-identical rather than merely "close."
+    Verified byte-identical to the original, including under the same point-count
+    stress test that measured the numbers above -- WITHIN the domain any real point can
+    ever fall in. One out-of-domain difference, found and characterized rather than
+    ignored: the original's `image[y, x-10:x+11] = color` is a plain Python slice, so a
+    cross centered within 10px of the frame edge gets a NEGATIVE slice start, which
+    silently produces an EMPTY slice (draws nothing) rather than wrapping around or
+    clamping. This rewrite clamps instead, drawing a partial cross there. The two
+    disagree only for a point literally within 10px of x=0/x=width or y=0/y=height --
+    which no real point ever is: every point here is a tile centre (tile_size=48,
+    half=24), so it is always >=24px from any edge, comfortably outside the 10px band
+    where the two implementations would differ.
+    """
     original_image = torch.as_tensor(rgba_image, dtype=torch.uint8)
     heatmap = original_image[:, :, :3].clone().cpu().numpy()
 
-    for (x, y), class_id in zip(responses["points"], responses["classIDs"]):
+    points = responses["points"]
+    class_ids = responses["classIDs"]
+    n = len(points)
+    if n == 0:
+        return heatmap
 
-        color = class_id_to_color[class_id]
+    height, width = heatmap.shape[:2]
+    xs = torch.tensor([p[0] for p in points], dtype=torch.int64)
+    ys = torch.tensor([p[1] for p in points], dtype=torch.int64)
+    cls = torch.tensor(class_ids, dtype=torch.int64)
+    colors_table = torch.stack([c.to(torch.uint8) for c in class_id_to_color])   # (C, 3)
+    colors = colors_table[cls]                                                   # (N, 3)
+    # NOTE: unlike generate_heatmap, draw_heatmap never modulated colour by confidence
+    # in the original -- matched here too, not a behaviour change.
 
-        # points are already in the demosaiced (half-res) space this heatmap
-        # lives in — draw_cross takes (Y, X); halving them again squeezed every
-        # cross toward the top-left (bug visible once erosion voting was enabled)
-        draw_cross(heatmap, (y, x), size, color)
+    half = size
+    offs = torch.arange(-half, half + 1)
+    K = offs.numel()
+    ranks = torch.arange(n)
+
+    h_rows = ys.unsqueeze(1).expand(-1, K).clamp(0, height - 1).reshape(-1)
+    h_cols = (xs.unsqueeze(1) + offs.unsqueeze(0)).clamp(0, width - 1).reshape(-1)
+    v_rows = (ys.unsqueeze(1) + offs.unsqueeze(0)).clamp(0, height - 1).reshape(-1)
+    v_cols = xs.unsqueeze(1).expand(-1, K).clamp(0, width - 1).reshape(-1)
+
+    all_rows = torch.cat([h_rows, v_rows])
+    all_cols = torch.cat([h_cols, v_cols])
+    all_ranks = ranks.unsqueeze(1).expand(-1, K).reshape(-1).repeat(2)
+    all_colors = colors.unsqueeze(1).expand(-1, K, 3).reshape(-1, 3).repeat(2, 1)
+
+    linear = all_rows * width + all_cols
+    combined_key = linear * (n + 1) + all_ranks
+    order = torch.argsort(combined_key)
+    linear_sorted = linear[order]
+    colors_sorted = all_colors[order]
+    uniq_linear, counts = torch.unique_consecutive(linear_sorted, return_counts=True)
+    last_of_group = torch.cumsum(counts, 0) - 1
+    win_colors = colors_sorted[last_of_group].numpy()
+    win_rows = (uniq_linear // width).numpy()
+    win_cols = (uniq_linear % width).numpy()
+    heatmap[win_rows, win_cols] = win_colors
 
     return heatmap
 #----------------------------------------------------------
