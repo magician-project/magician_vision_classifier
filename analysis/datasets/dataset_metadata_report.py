@@ -2,7 +2,8 @@
 """Scan a tile dataset's HDF5 metadata and plot every characteristic it carries:
 class distribution, tiles/frames per source recording, sensor Distance1-3 /
 DistanceAverage, Light1-6 / lightDirection / lightNumber / lightConfidence,
-per-recording duration & framerate derived from dev_timestamp, camera
+per-recording duration & framerate derived from dev_timestamp, total hours of
+imagery and wall-clock capture time the split holds, camera
 settings (exposure, gain, frameRate, blackLevel) read from each source
 recording's info.json, and manual-vs-auto annotation point counts read
 from each frame's raw source JSON (pointSources).
@@ -222,6 +223,38 @@ def per_recording_duration_fps(frame_meta, rec_id_per_frame, rec_names):
     return result
 
 
+def total_recorded_time(dur_fps, frames_per_rec, recording_info=None):
+    """How many HOURS of surface the dataset actually holds.
+
+    Two numbers, because they answer different questions and differ by ~10%:
+      wallclock -- sum of each recording's dev_timestamp span. This is how long
+        the capture sessions ran, and it includes idle gaps and dropped frames.
+      imagery   -- sum of n_frames / frameRate. This is how much surface was
+        actually captured, and it is the honest "hours of data" figure.
+    frameRate is taken from the recording's info.json when the capture drive is
+    reachable, and falls back to the rate measured from dev_timestamp otherwise,
+    so the imagery total is available either way.
+    """
+    wallclock = sum(d for d, _ in dur_fps.values())
+    imagery, from_info, from_measured, skipped = 0.0, 0, 0, 0
+    for rec, (_, measured_fps) in dur_fps.items():
+        n = frames_per_rec.get(rec, 0)
+        fps = (recording_info or {}).get(rec, {}).get("frameRate")
+        if fps:
+            from_info += 1
+        elif measured_fps and not np.isnan(measured_fps):
+            fps, from_measured = measured_fps, from_measured + 1
+        else:
+            skipped += 1
+            continue
+        imagery += n / float(fps)
+    return {"wallclock_hours": wallclock / 3600.0,
+            "imagery_hours": imagery / 3600.0,
+            "recordings_rate_from_info_json": from_info,
+            "recordings_rate_from_dev_timestamp": from_measured,
+            "recordings_without_rate": skipped}
+
+
 def bar(ax, labels, values, title, ylabel, rotate=90, top=None, color=DEFAULT_COLOR):
     if top is not None and len(labels) > top:
         order = np.argsort(values)[::-1][:top]
@@ -401,6 +434,8 @@ def analyze_and_plot(d, out_dir, split_name, recording_info=None, rec_dirs=None,
     plt.close(fig)
     summary["mean_recording_duration_sec"] = float(durations.mean()) if len(durations) else None
     summary["mean_framerate_fps"] = float(fps.mean()) if len(fps) else None
+    summary["recorded_time"] = total_recorded_time(
+        dur_fps, Counter(rec_names[r] for r in rec_of_frame), recording_info)
 
     # --- camera settings (exposure, gain, frameRate, blackLevel) from info.json ---
     if recording_info:
@@ -536,6 +571,10 @@ def main():
         if s.get("mean_recording_duration_sec") is not None:
             print(f"  mean recording duration: {s['mean_recording_duration_sec']:.1f}s, "
                   f"mean framerate: {s['mean_framerate_fps']:.1f} fps")
+        if s.get("recorded_time") is not None:
+            rt = s["recorded_time"]
+            print(f"  recorded time: {rt['imagery_hours']:.2f} h of imagery "
+                  f"({rt['wallclock_hours']:.2f} h wall-clock)")
         if s.get("mean_DistanceAverage") is not None:
             print(f"  mean DistanceAverage: {s['mean_DistanceAverage']:.1f} mm")
         if s.get("points_by_annotation_source") is not None:
