@@ -53,7 +53,7 @@ elif [ -d venvNoROS/ ]; then
   source venvNoROS/bin/activate
 else
   echo "No venv/ or venvNoROS/ found -- set one up first (see README.md)."
-  exit 1
+  #exit 1
 fi
 
 # ---- Shared memory library ----
