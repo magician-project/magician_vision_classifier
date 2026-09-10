@@ -194,6 +194,10 @@ def exclude_frames_indices(dataset, exclude_frames):
         frames = list(exclude_frames)
     frames = set(frames)
     srcs = _np.array(_dataset_source_frames(dataset))
+    # NOT np.isin here -- measured SLOWER (5-10x) than the plain Python-set membership
+    # loop on this dataset's string arrays (7.1M tiles): numpy has no hash-based fast path
+    # for unicode dtype, so np.isin falls back to a sort/searchsorted strategy that loses
+    # to Python's O(1) set lookup at this scale. See knowledge/10-9-plan.md Phase 6.
     drop = _np.array([s in frames for s in srcs])
     present = len(set(srcs.tolist()) & frames)
     keep = _np.where(~drop)[0].tolist()
@@ -270,6 +274,8 @@ def frame_disjoint_split(dataset, val_split, seed, frozen_val_frames=None):
         else:
             frozen = list(frozen_val_frames)
         frozen = set(frozen)
+        # NOT np.isin -- see the same note in exclude_frames_indices: measured slower
+        # than this loop for string membership tests at this dataset's scale.
         is_val = _np.array([s in frozen for s in srcs])
         present = set(srcs.tolist())
         found = frozen & present
@@ -298,7 +304,7 @@ def frame_disjoint_split(dataset, val_split, seed, frozen_val_frames=None):
     rng = _np.random.default_rng(seed)
     n_val = max(1, int(round(len(uf) * val_split)))
     val_frames = set(rng.choice(uf, n_val, replace=False).tolist())
-    is_val = _np.array([fr in val_frames for fr in frame_id])
+    is_val = _np.isin(frame_id, list(val_frames))
     train_idx = _np.where(~is_val)[0].tolist()
     val_idx = _np.where(is_val)[0].tolist()
     print(f"[frame_disjoint_split] {len(uf)} frames -> {len(uf)-n_val} train / {n_val} val "
