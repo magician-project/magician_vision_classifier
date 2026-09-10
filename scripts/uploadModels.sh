@@ -43,14 +43,15 @@ REPO_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"             # the classifier repo, vi
 SRC="${SRC:-$REPO_DIR}"                                # where {name}.pth / .json live
 STORE="${STORE:-$REPO_DIR/models}"                     # ../models relative to this script
 SSH_PORT="${SSH_PORT:-2222}"
-#SERVER="${SERVER:-ammar@ammar.gr}"
-#SERVER_DIR="${SERVER_DIR:-/home/ammar/public_html/magician/models/CameraV2Models/}"
+SERVER="${SERVER:-ammar@ammar.gr}"
+SERVER_DIR="${SERVER_DIR:-/home/ammar/public_html/magician/models/CameraV2Models/}"
 ALLOWLIST="${ALLOWLIST:-$SCRIPT_DIR/upload_allowlist.txt}"
 DRY_RUN="${DRY_RUN:-0}"
 
 
-SERVER="${SERVER:-ammar@anoiksi.ammar.gr}"
-SERVER_DIR="${SERVER_DIR:-/media/ammar/games2/Datasets/Models/}"
+#Quick change to anoiksi.ammar.gr if needed, dont remove..
+#SERVER="${SERVER:-ammar@anoiksi.ammar.gr}"
+#SERVER_DIR="${SERVER_DIR:-/media/ammar/games2/Datasets/Models/}"
 
 
 
