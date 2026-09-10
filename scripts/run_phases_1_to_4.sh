@@ -76,7 +76,8 @@ else
     wait_for_gpu
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$P2_CFG" \
         > "$LOGDIR/p2_score_checkpoints_$(date +%Y%m%d_%H%M).log" 2>&1
-    echo "=== $(date -Is) [p2] scoring exited rc=$?"
+    rc=$?
+    echo "=== $(date -Is) [p2] scoring exited rc=$rc"
 fi
 
 echo "############ PHASE 3: torchvision re-screens with SEEDED pretrained stems"

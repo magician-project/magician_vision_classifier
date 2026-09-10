@@ -48,11 +48,13 @@ for run in "${RUNS[@]}"; do
 
     echo "=== $(date -Is) [$run] score_checkpoints"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$CFG" >> "$log" 2>&1
-    echo "=== $(date -Is) [$run] score rc=$?"
+    rc=$?
+    echo "=== $(date -Is) [$run] score rc=$rc"
 
     echo "=== $(date -Is) [$run] eval_coverage"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$CFG" >> "$log" 2>&1
-    echo "=== $(date -Is) [$run] coverage rc=$?"
+    rc=$?
+    echo "=== $(date -Is) [$run] coverage rc=$rc"
 
     echo "--- [$run] factory (pfc=0.5 anchor: 9.24 s42 / 7.41 s1337, sd 1.29) ---"
     grep -aA 8 'epoch   val_loss' "$log" | tail -10

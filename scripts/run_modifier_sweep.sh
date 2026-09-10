@@ -58,7 +58,8 @@ for seed in 42 1337 7; do
     log="$LOGDIR/mx${arm}${seed}_$(date +%Y%m%d_%H%M).log"
     echo "=== $(date -Is) [${arm}/${seed}] launching $cfg -> $log"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$cfg" > "$log" 2>&1
-    echo "=== $(date -Is) [${arm}/${seed}] exited rc=$?"
+    rc=$?
+    echo "=== $(date -Is) [${arm}/${seed}] exited rc=$rc"
   done
   echo "############ after seed $seed:"
   python -m analysis.sweeps.modifier_sweep 2>&1 | tail -22
