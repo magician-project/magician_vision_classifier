@@ -100,7 +100,10 @@ def main():
     #-----------------------------------------------------------------
     batch_size        = config_json['hparams']['batch_size']
     seed              = config_json['hparams']['seed']
-    dropout_rate      = config_json['hparams']['dropout_rate']
+    # dropout_rate is dead here -- Classifier.from_config() re-derives it from hparams
+    # independently (see load_model()'s comment on why one translation replaced the old
+    # by-hand kwargs). Commented, not deleted, 2026-09-10 (knowledge/10-9-plan.md Phase 5).
+    # dropout_rate      = config_json['hparams']['dropout_rate']
     epochs            = config_json['hparams']['training_epochs']
     tile_size         = config_json['hparams']['tile_size']
     val_split         = config_json['dataloader']['validation_split']
@@ -147,18 +150,24 @@ def main():
     polar_rot = bool(config_json['hparams'].get('polar_rot', False))
     frozen_body_start_epochs = int(config_json['hparams'].get('frozen_body_start_epochs', 0))
     frozen_body_end_epochs   = int(config_json['hparams'].get('frozen_body_end_epochs', 0))
-    custom_early_convs       = int(config_json['hparams'].get('custom_early_convs', 0))
-    custom_channels          = config_json['hparams'].get('custom_channels', None)
-    custom_res_blocks        = config_json['hparams'].get('custom_res_blocks', None)
-    custom_wavelet_pools     = config_json['hparams'].get('custom_wavelet_pools', None)
-    custom_wavelet_stem      = int(config_json['hparams'].get('custom_wavelet_stem', 0) or 0)
-    pretrained_backbone      = bool(config_json['hparams'].get('pretrained', True))
-    # The torchvision branches used to build a FRESH random stem when widening RGB ->
-    # 4+ polarization channels, throwing away the pretrained first layer, while the timm
-    # branch adapts it via in_chans=. That made the two families incomparable. Default
-    # True seeds both the same way; set false to reproduce a pre-2026-08 torchvision run.
-    seed_pretrained_stem     = bool(config_json['hparams'].get('seed_pretrained_stem', True))
-    timm_stem_stride         = config_json['hparams'].get('timm_stem_stride', None)
+    # custom_early_convs/custom_channels/custom_res_blocks/custom_wavelet_pools/
+    # custom_wavelet_stem/pretrained_backbone/seed_pretrained_stem/timm_stem_stride are
+    # dead here -- parsed from hparams but never read again, because Classifier.from_config()
+    # re-derives every one of them from hparams independently (see load_model()'s comment:
+    # this file used to enumerate the knobs by hand, from_config() is now the single source
+    # of truth). Commented, not deleted, 2026-09-10 (knowledge/10-9-plan.md Phase 5).
+    # custom_early_convs       = int(config_json['hparams'].get('custom_early_convs', 0))
+    # custom_channels          = config_json['hparams'].get('custom_channels', None)
+    # custom_res_blocks        = config_json['hparams'].get('custom_res_blocks', None)
+    # custom_wavelet_pools     = config_json['hparams'].get('custom_wavelet_pools', None)
+    # custom_wavelet_stem      = int(config_json['hparams'].get('custom_wavelet_stem', 0) or 0)
+    # pretrained_backbone      = bool(config_json['hparams'].get('pretrained', True))
+    # # The torchvision branches used to build a FRESH random stem when widening RGB ->
+    # # 4+ polarization channels, throwing away the pretrained first layer, while the timm
+    # # branch adapts it via in_chans=. That made the two families incomparable. Default
+    # # True seeds both the same way; set false to reproduce a pre-2026-08 torchvision run.
+    # seed_pretrained_stem     = bool(config_json['hparams'].get('seed_pretrained_stem', True))
+    # timm_stem_stride         = config_json['hparams'].get('timm_stem_stride', None)
     print("Augmentation: gain_jitter ", gain_jitter, "/ polar_flip ", polar_flip,
           "/ channel_jitter ", channel_jitter, "/ monochrome ", monochrome,
           "/ polar_rot ", polar_rot)
