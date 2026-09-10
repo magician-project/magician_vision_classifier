@@ -26,29 +26,21 @@ Usage:  python full_zoo_report.py [--all]      # --all includes models that cann
 """
 
 import json
-import os
-import re
 import sys
 from statistics import mean
 
 from mvc.core.artifact_paths import find_artifact
 from mvc.core.metrics import miss_at_fa
+from . import report_common as rc
 
 TARGET_HZ, GPU_SCALE = 23.0, 1.6
 COV_SD, FAC_SD = 0.43, 1.01          # anchor-arm seed sd, n=3, 2026-08-12
 
 
 def load_bench():
-    hz = {}
-    for f in ('phase4_inference_bench.json', 'zoo_inference_bench.json'):
-        p = find_artifact(f)
-        if not p:
-            continue
-        for r in json.load(open(p))['rows']:
-            # reparameterizable models deploy FUSED; that is the number that counts
-            if r['model'] not in hz or r.get('variant', '').lower() == 'fused':
-                hz[r['model']] = r.get('hz_step16', 0.0)
-    return hz
+    # Thin wrapper: this report only ever wants the deploy-variant hz_step16 scalar per
+    # model, so unpack report_common's full-row form into that shape at the one call site.
+    return {k: v.get('hz_step16', 0.0) for k, v in rc.load_bench().items()}
 
 
 def runs():
@@ -67,24 +59,8 @@ def runs():
     return out
 
 
-def best_epoch(run, sfx):
-    d = f'datasets/mix_ckpts/{run}_{sfx}'
-    if not os.path.isdir(d):
-        return None
-    best = None
-    for b in os.listdir(d):
-        e = re.search(r'epoch=(\d+)', b)
-        a = re.search(r'val_detect_auroc=([0-9]+\.[0-9]+)', b)
-        if not (e and a):
-            continue
-        c = (float(a.group(1)), int(e.group(1)))
-        if best is None or c[0] > best[0]:
-            best = c
-    return best[1] if best else None
-
-
 def score(run, sfx):
-    ep = best_epoch(run, sfx)
+    ep = rc.best_epoch(f'datasets/mix_ckpts/{run}_{sfx}')
     if ep is None:
         return None
     curve = find_artifact(f'{run}_ep{ep}_{sfx}_threshold_curve.json')
@@ -93,13 +69,11 @@ def score(run, sfx):
     if not (curve and cov):
         return None
     rows = [r for r in json.load(open(cov))['rows'] if r['class'] != 'class_clean']
-    ta = [r['detect_at_fa5'] for r in rows
-          if r['tier'] == 'TIER_A' and r.get('detect_at_fa5') is not None]
     weak = [r['detect_at_fa5'] for r in rows if r['class'].startswith('class_PositiveDent')]
     strong = [r['detect_at_fa5'] for r in rows
               if not r['class'].startswith('class_PositiveDent')]
     return {'ep': ep, 'miss5': miss_at_fa(curve)[0.05],
-            'tier_a': mean(ta) if ta else None,
+            'tier_a': rc.tier_a_macro_from_rows(rows),
             'weak': mean(weak) if weak else None,
             'strong': mean(strong) if strong else None}
 

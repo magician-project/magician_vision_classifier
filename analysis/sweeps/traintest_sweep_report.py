@@ -27,32 +27,16 @@ Usage:  python traintest_sweep_report.py [--all]
 """
 
 import json
-import os
-import re
 import sys
 
 from mvc.core.artifact_paths import find_artifact
 from mvc.core.metrics import miss_at_fa
+from . import report_common as rc
 
 from .traintest_sweep import model_list
 
 TARGET_HZ = 23.0
 GPU_SCALE = 1.6                  # A6000 bench -> RTX 5090, conservative
-
-
-def best_epoch(ckpt_dir, max_epoch=1):
-    best = None
-    if not os.path.isdir(ckpt_dir):
-        return None
-    for b in os.listdir(ckpt_dir):
-        m_ep = re.search(r'epoch=(\d+)', b)
-        m_mon = re.search(r'val_detect_auroc=([0-9]+\.[0-9]+)', b)
-        if not (m_ep and m_mon) or int(m_ep.group(1)) > max_epoch:
-            continue
-        cand = (float(m_mon.group(1)), int(m_ep.group(1)))
-        if best is None or cand[0] > best[0]:
-            best = cand
-    return best[1] if best else None
 
 
 def scores(name, model):
@@ -65,7 +49,7 @@ def scores(name, model):
     # for 12 of 14 timm/* models in this campaign) must not hide a macro5 that scored
     # fine -- so each is looked up independently and either can be None on its own,
     # rather than one missing artifact dropping the whole row.
-    ep = best_epoch(f'datasets/mix_ckpts/{name}_{sfx}')
+    ep = rc.best_epoch(f'datasets/mix_ckpts/{name}_{sfx}', max_epoch=1)
     if ep is None:
         return None
     out = {'epoch': ep, 'miss5': None, 'macro5': None}
@@ -78,22 +62,9 @@ def scores(name, model):
     return out if (out['miss5'] is not None or out['macro5'] is not None) else None
 
 
-def bench():
-    out = {}
-    for fname in ('phase4_inference_bench.json', 'zoo_inference_bench.json'):
-        p = find_artifact(fname)
-        if not p:
-            continue
-        for r in json.load(open(p))['rows']:
-            key = r['model']
-            if key not in out or r.get('variant', '').lower() == 'fused':
-                out[key] = r
-    return out
-
-
 def main():
     show_all = '--all' in sys.argv
-    hz = bench()
+    hz = rc.load_bench()
     models = model_list()
 
     inc_tag, inc_model = models[0]

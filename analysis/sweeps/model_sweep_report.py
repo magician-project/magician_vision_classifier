@@ -25,13 +25,9 @@ headline number.
 Usage:  python model_sweep_report.py
 """
 
-import json
-import os
-import re
-from statistics import mean
-
 from mvc.core.artifact_paths import find_artifact
 from mvc.core.metrics import miss_at_fa
+from . import report_common as rc
 
 # tag -> (model, note); mirrors model_sweep.CANDIDATES
 from .model_sweep import CANDIDATES, REPARAM
@@ -49,23 +45,8 @@ def epoch_scores(name, model, ep):
     return miss_at_fa(curve)[0.05] if curve else None
 
 
-def best_epoch(ckpt_dir, max_epoch=1):
-    best = None
-    if not os.path.isdir(ckpt_dir):
-        return None
-    for b in os.listdir(ckpt_dir):
-        m_ep = re.search(r'epoch=(\d+)', b)
-        m_mon = re.search(r'val_detect_auroc=([0-9]+\.[0-9]+)', b)
-        if not (m_ep and m_mon) or int(m_ep.group(1)) > max_epoch:
-            continue
-        cand = (float(m_mon.group(1)), int(m_ep.group(1)))
-        if best is None or cand[0] > best[0]:
-            best = cand
-    return best[1] if best else None
-
-
 def scores(name, model):
-    ep = best_epoch(f'datasets/mix_ckpts/{name}_{model}')
+    ep = rc.best_epoch(f'datasets/mix_ckpts/{name}_{model}', max_epoch=1)
     if ep is None:
         return None
     curve = find_artifact(f'{name}_ep{ep}_{model}_threshold_curve.json')
@@ -75,27 +56,12 @@ def scores(name, model):
     if curve:
         out['miss5'] = miss_at_fa(curve)[0.05]
     if cov:
-        rows = json.load(open(cov))['rows']
-        v = [r['detect_at_fa5'] for r in rows
-             if r['tier'] == 'TIER_A' and r['class'] != 'class_clean'
-             and r.get('detect_at_fa5') is not None]
-        out['tier_a'] = mean(v) if v else None
-    return out
-
-
-def bench():
-    b = json.load(open('phase4_inference_bench.json'))
-    out = {}
-    for r in b['rows']:
-        # A reparameterizable model deploys FUSED; that is the number that counts.
-        key = r['model']
-        if key not in out or r['variant'].lower() == 'fused':
-            out[key] = r
+        out['tier_a'] = rc.tier_a_macro(cov)
     return out
 
 
 def main():
-    hz = bench()
+    hz = rc.load_bench()
     inc_model, inc_name, _ = INCUMBENT
     inc = scores(inc_name, inc_model)
     if not inc or inc['miss5'] is None:

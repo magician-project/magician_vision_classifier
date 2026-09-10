@@ -41,14 +41,12 @@ Experiment A's step curve did not rule out.
 """
 
 import argparse
-import glob
 import json
-import os
-import re
 from statistics import mean, stdev
 
 from mvc.core.artifact_paths import find_artifact
 from mvc.core.metrics import miss_at_fa
+from . import report_common as rc
 
 SEEDS = (42, 1337, 7)
 MAX_EPOCH = 1                      # the replicate budget; see the note above
@@ -74,17 +72,7 @@ def run_name(arm, seed):
 def best_epoch(arm, model, seed):
     """The epoch the run's own checkpoint monitor prefers, within the replicate budget."""
     d = f'datasets/mix_ckpts/{run_name(arm, seed)}_{model}'
-    best = None
-    for ck in glob.glob(os.path.join(d, '*.ckpt')):
-        b = os.path.basename(ck)
-        m_ep = re.search(r'epoch=(\d+)', b)
-        m_mon = re.search(r'val_detect_auroc=([0-9]+\.[0-9]+)', b)
-        if not (m_ep and m_mon) or int(m_ep.group(1)) > MAX_EPOCH:
-            continue
-        cand = (float(m_mon.group(1)), int(m_ep.group(1)))
-        if best is None or cand[0] > best[0]:
-            best = cand
-    return best[1] if best else None
+    return rc.best_epoch(d, max_epoch=MAX_EPOCH)
 
 
 def factory(arm, model, seed, ep):
@@ -105,9 +93,7 @@ def cov_rows(arm, model, seed, ep):
 
 
 def tier_a_macro(rows):
-    v = [r['detect_at_fa5'] for r in rows.values()
-         if r['tier'] == 'TIER_A' and r.get('detect_at_fa5') is not None]
-    return mean(v) if v else None
+    return rc.tier_a_macro_from_rows(rows.values())
 
 
 def spread(vals):

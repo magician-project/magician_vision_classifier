@@ -22,13 +22,11 @@ backbone sweep needs its full stage 2.
 Usage:  python pfc_variance_report.py
 """
 
-import json
-import os
-import re
 from statistics import mean, stdev
 
 from mvc.core.artifact_paths import find_artifact
 from mvc.core.metrics import miss_at_fa
+from . import report_common as rc
 
 MODEL = 'convnext_pico'
 SEEDS = (42, 1337, 7)
@@ -40,19 +38,7 @@ ARMS = {
 
 
 def best_epoch(run):
-    d = f'datasets/mix_ckpts/{run}_{MODEL}'
-    if not os.path.isdir(d):
-        return None
-    best = None
-    for b in os.listdir(d):
-        m_ep = re.search(r'epoch=(\d+)', b)
-        m_mon = re.search(r'val_detect_auroc=([0-9]+\.[0-9]+)', b)
-        if not (m_ep and m_mon) or int(m_ep.group(1)) > MAX_EPOCH:
-            continue
-        cand = (float(m_mon.group(1)), int(m_ep.group(1)))
-        if best is None or cand[0] > best[0]:
-            best = cand
-    return best[1] if best else None
+    return rc.best_epoch(f'datasets/mix_ckpts/{run}_{MODEL}', max_epoch=MAX_EPOCH)
 
 
 def factory(run, ep):
@@ -63,13 +49,7 @@ def factory(run, ep):
 def coverage(run, ep):
     p = find_artifact(f'{run}_{MODEL}_coverage.json') or \
         find_artifact(f'epochcov_{run}_ep{ep}.json')
-    if not p:
-        return None
-    rows = json.load(open(p))['rows']
-    v = [r['detect_at_fa5'] for r in rows
-         if r['tier'] == 'TIER_A' and r['class'] != 'class_clean'
-         and r.get('detect_at_fa5') is not None]
-    return mean(v) if v else None
+    return rc.tier_a_macro(p)
 
 
 def collect(getter):
