@@ -1384,7 +1384,7 @@ def runSingle(image,
                                         )
        else:
           original_image = torch.as_tensor(rgba_image, dtype=torch.uint8)
-          heatmap = original_image[:, :, :3].clone().cpu().numpy()
+          heatmapRGBImage = original_image[:, :, :3].clone().cpu().numpy()
 
     return heatmapRGBImage, occupancy, responses
 
@@ -1727,37 +1727,55 @@ class ClassifierPnm:
         return valid
  
     def reload_model(self, directoryPath, name):
-        """Unload previous model and reload a new model + config from given name."""
+        """Unload previous model and reload a new model + config from given name.
+
+        Reads the new config and loads the new model into LOCAL variables first, and
+        only commits them onto self.* once load_model() has actually succeeded -- so a
+        failed hot-swap leaves self.model/self.cfg/self.classes/self.tile_size exactly
+        as they were (previously, self.cfg/self.classes/self.tile_size were overwritten
+        with the new model's values before load_model() was even attempted, so a failed
+        load left self.model pointing at the OLD model while the rest of self.* already
+        described the new one).
+        """
         found = ClassifierPnm.model_locate(directoryPath, name)
         if found is None:
             print(f"Missing model or config for '{name}' in {directoryPath} "
                   f"(checked the directory itself and experiments/<campaign>/<run>/)")
             return False
         model_path, cfg_path = found
-        self.name = os.path.basename(model_path)
+        new_name = os.path.basename(model_path)
 
         try:
             with open(cfg_path, "r") as f:
-                self.cfg = json.load(f)
-                self.tile_classes = self.cfg["classes"]
-                self.classes      = self.cfg["classes"]
-                self.tile_size    = self.cfg["hparams"]["tile_size"]
+                new_cfg = json.load(f)
+                new_tile_classes = new_cfg["classes"]
+                new_classes      = new_cfg["classes"]
+                new_tile_size    = new_cfg["hparams"]["tile_size"]
         except Exception as e:
             print("Failed reading config:", repr(e))
             return False
         #--------------------------------------------------------------
-        _hp = self.cfg['hparams']   # logged only -- see the note in __init__
+        _hp = new_cfg['hparams']   # logged only -- see the note in __init__
         print(f"Base channels {_hp.get('base_channels', 32)} / "
               f"final dense layer {_hp.get('final_dense_layer', 512)}")
         #-----------------------------------------------------------------
-        self.model_path = model_path
         print(f"Reloading model '{name}' from {directoryPath} ...")
+        # load_model() reads self.model_path/self.cfg/self.tile_size, so stage them on
+        # self.* only for the duration of the load attempt; roll back on failure.
+        prev = (self.name, self.cfg, self.tile_classes, self.classes, self.tile_size,
+                self.model_path)
+        self.name, self.cfg, self.tile_classes, self.classes, self.tile_size = (
+            new_name, new_cfg, new_tile_classes, new_classes, new_tile_size)
+        self.model_path = model_path
         try:
-            self.model = self.load_model()
+            new_model = self.load_model()
         except (RuntimeError, EOFError, Exception) as e:
             print(f"Failed to load model '{name}': {e}")
             print(f"The file '{model_path}' may be corrupted or incomplete.")
+            (self.name, self.cfg, self.tile_classes, self.classes, self.tile_size,
+             self.model_path) = prev
             return False
+        self.model = new_model
         # Adopt the NEW model's calibrated gate + its curve. Thresholds are not
         # portable between models, so a hot-swap must re-read both.
         gate_cfg = self.cfg.get("gate", {}) if isinstance(self.cfg, dict) else {}

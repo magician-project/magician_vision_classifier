@@ -156,7 +156,11 @@ def ensure_model(model_name, directory=SCRIPT_DIR, base_url=BASE_URL, include_pl
     if model_name in ClassifierPnm.model_scan(directory):
         print(f"{model_name} already present in {directory}")
         return True
-    download_model(model_name, directory, include_plots=include_plots, base_url=base_url)
+    try:
+        download_model(model_name, directory, include_plots=include_plots, base_url=base_url)
+    except Exception as e:
+        print(f"Failed to fetch '{model_name}' from {base_url}: {e}")
+        return False
     return model_name in ClassifierPnm.model_scan(directory)
 
 

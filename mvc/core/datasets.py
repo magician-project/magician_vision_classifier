@@ -60,17 +60,22 @@ def _get_available_ram_bytes() -> int:
 
     return 0
 
-def _get_path_size_bytes(path: str) -> int:
+def _get_path_size_bytes(path) -> int:
     """
-    Calculate the total size in bytes of all files under a path (directory or file).
-    Skips files that raise OSError on access (permission issues, etc.).
+    Calculate the total size in bytes of all files under a path (directory or file),
+    or the sum across a list of such paths -- 'training_dataset' in a config can
+    legitimately be either (see load_training_dataset's isinstance(directory, list)
+    branch), and callers pass it through unnormalized.
+    Skips files/paths that raise OSError on access (permission issues, etc.).
 
     Args:
-        path: File or directory path.
+        path: File or directory path, or a list of them.
 
     Returns:
         Total size in bytes, or 0 if calculation fails.
     """
+    if isinstance(path, (list, tuple)):
+        return sum(_get_path_size_bytes(p) for p in path)
     try:
         if os.path.isfile(path):
             return os.path.getsize(path)

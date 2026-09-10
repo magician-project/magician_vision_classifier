@@ -37,7 +37,7 @@ from mvc.core.config import (
 from mvc.core.datasets import (
     _human_bytes, _get_available_ram_bytes, _get_path_size_bytes, _estimate_dataset_ram_bytes,
     _dataset_source_frames, frame_disjoint_split, exclude_frames_indices,
-    build_train_val,
+    build_train_val, clean_class_index,
     load_rgba_image, load_rgba_image_pil,
     load_png_comment_metadata, metadata_collate_fn, RGBAImageFolder, RAMPreloadedDataset,
     CombinedDataset, BalancedBatchSampler,
@@ -345,10 +345,7 @@ def main():
     #Get clean class which could be needed for extra penalization. None when the
     #dataset has no clean class (e.g. an 'alldefect' run that dropped class_clean)
     #-- val_detect_auroc / penalize_false_clean / the threshold sweep all skip.
-    cleanClassID = None
-    for i in range(len(dataset.classes)):
-           if (dataset.classes[i] == "class_clean") or (dataset.classes[i] == "Clean"):
-              cleanClassID = i
+    cleanClassID = clean_class_index(dataset.classes)
     print(f"Clean class ID is : {cleanClassID}")
 
     # ---------------------------------------------------------------------
