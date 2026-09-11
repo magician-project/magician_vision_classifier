@@ -34,14 +34,48 @@ All features come from the unpolarized mono image (png_mono: the mean of the 4 D
 channels), never a luma grayscale, so matching never depends on which polarization
 channels the BGR weights happen to favour.
 
-Map from AltinayUniquePattern750 (stride 2, 4000 features): 323 of 700 frames anchored on
-marker 10, 1134 pairs, 39741 points, extent 4.8 x 4.5 x 1.5 marker sides.
+Map from AltinayUniquePattern750 (stride 3, 4000 features, --min-baseline 2.0): 367 pairs,
+6977 points, extent 4.7 x 4.1 x 1.2 marker sides.
 
-  Altinayuniquepatternmirror  18/20 frames localised, median 78 inliers  -- bare panel
-  AltinayUniquePattern750_2   73/160 frames localised                   -- held-out
-  vs ArUco on the 41 of those that also show a marker:
-      rotation  median 3.47 deg   (90th 7.31)
-      position  median 0.955      (90th 2.235) marker sides
+  Altinayuniquepatternmirror  18/20 frames localised, median 46 inliers  -- bare panel
+  AltinayUniquePattern750_2   77/160 frames localised                   -- held-out
+  vs ArUco on the 33 of those that also show a marker:
+      rotation  median 1.97 deg   (90th 4.68)
+      position  median 13.8 mm    (90th 34.3 mm)
+
+On AltinayUniquePattern750 itself, the recording the map was built from, the same
+comparison gives 0.93 deg and 5.6 mm. Treat the held-out figures as the real ones: the map
+fits its own session considerably better than it generalises to the next.
+
+SCALE. The markers are 25 mm and measure a median 144.8 px, so this corpus was recorded at
+0.173 mm/px, an optical distance of ~403 mm. That is NOT a different camera or a different
+focus -- the frames are as sharp as the defect recordings (median Tenengrad 332 and 189
+here, against 180 for AltinayWeldings and 268 for AltinayCarDown650_2). It is the same
+tool, and the stand-off datum is simply not the lens: D5.3 quotes a 153 x 129 mm footprint
+at 60 mm hover, which puts the lens centre ~232 mm behind the "bottom of the sensor" the
+hover is measured from. So these scans sit at roughly 171 mm hover against the nominal
+45-60 mm band, and the scale difference that actually matters is 0.173 vs 0.125 mm/px --
+a 38% coarser view, not the order of magnitude the raw optical distances suggest. SIFT
+absorbs 1.4x scale without complaint, so the corpus is usable as it stands; a map built
+here is simply 38% coarser than one built at the inspection hover.
+
+BASELINE IS THE LEVER, AND SHORT PAIRS ARE POISON
+--------------------------------------------------
+--min-baseline swept over 0.15 / 0.5 / 1.0 / 2.0 / 4.0 marker sides, paired on the 20
+held-out frames every setting solved:
+
+     50 mm (0.15 sides)   2.38 deg   15.5 mm   (25847 map points)   <- old default
+     12 mm (0.5)          2.46       16.5      (25579)
+     25 mm (1.0)          1.89       13.5      (19557)
+     50 mm (2.0)          1.80       12.1       (6977)   <- default
+    100 mm (4.0)          2.99       22.7       (1168)
+
+2.0 wins on accuracy AND coverage (77 of 160 held-out frames against 69 at 0.15) with a
+map a quarter the size, so it matches faster too. Bigger maps were not better maps: the
+extra points at a short baseline are badly conditioned triangulations that survive the
+reprojection gate and then drag the pose. Past 2.0 there are too few pairs left and it
+collapses. Nothing here is close to the parallax gate's job -- that removes points whose
+rays are near-parallel, while this removes whole PAIRS before matching.
 
 WHAT THE ILLUMINATOR LABEL IS AND IS NOT WORTH
 ----------------------------------------------
@@ -63,6 +97,32 @@ descriptors compete as wrong answers does not hold: RANSAC rejects them geometri
 already, and cutting the map to one sixth discards real coverage of the region. Kept as a
 flag because it is the obvious thing to try and the measurement is worth not repeating.
 
+DISCARDING OUTLIERS: GATE ON INLIER COUNT, DO NOT BOTHER REFINING
+------------------------------------------------------------------
+Of the four confidence signals recorded per frame, only two predict the error at all
+(Spearman rho against position error, 33 held-out frames): inlier count -0.50 (p 0.003)
+and reprojection RMS +0.40 (p 0.022). inlier_ratio is worthless (+0.01, p 0.96) and
+spread_px is weak (-0.34, p 0.054). So --min-inliers is the gate worth turning:
+
+    min-inliers   frames kept   pos median   pos 90th   rot median
+         12          76/160       15.1 mm     34.3 mm     1.94 deg    <- default
+         16          57/160       13.8         32.9       1.93
+         20          41/160       11.9         27.6       1.78
+         25          34/160       11.9         18.3       1.78
+         30          31/160       11.2         18.3       1.74
+         40          19/160        9.3         17.8       1.41
+
+The knee is 25-30: the tail halves (34.3 -> 18.3 mm at the 90th percentile) for a cut to
+roughly 40% of the frames. That trade is usually worth taking, because aligning a car does
+not need a pose from every frame of a scan, it needs one pose that can be trusted. The
+default is left at 12 so nothing is silently discarded; raise it deliberately.
+
+What is NOT available here is the bigger win. Every frame gives an independent estimate of
+the same car-to-robot transform, so a robust aggregate over a scan should beat any single
+frame comfortably -- but combining them needs the robot TCP pose per frame to relate the
+moving camera to a fixed frame, and no recording in this corpus logs one. That is the same
+gap that stops the grabber's calibrateHandEye half from running.
+
 WHAT LIMITS THIS, MEASURED RATHER THAN GUESSED
 -----------------------------------------------
 The surface is dark, specular and low-texture, so plain SIFT finds a median of 282
@@ -73,8 +133,9 @@ And marker 10 is detected in 90 of the Top-lit frames but only 13 Bottom-lit one
 the scaffolding is unevenly distributed over the lights. All three argue for learned
 features (SuperPoint/LoFTR) and a multi-marker board, not for tuning this pipeline.
 
-Units follow extrinsics_from_markers.py: --marker-length defaults to 1.0, so the map and
-every translation are in marker sides. Pass the measured side to get metres.
+Units follow extrinsics_from_markers.py: the markers measure 25 mm on a side, so
+--marker-length defaults to 0.025 and the map, the baselines and every translation are in
+metres. Pass --marker-length 1.0 to work in marker-side units instead.
 
 Usage:
   python analysis/extrinsics_from_pattern.py build --folder AltinayUniquePattern750 \
@@ -226,6 +287,48 @@ def match_to_map(desc, map_desc, map_points, matcher, min_separation):
     return np.array(pairs, int).reshape(-1, 2)
 
 
+def draw_overlay(out_path, mono, K, dist, pattern_pose, marker_pose, inlier_pts, row,
+                 axis_length):
+    """Write the frame with the recovered axes drawn on it.
+
+    The pattern axes are the answer being checked, so they are drawn full length; the
+    marker axes, when a marker happens to be in view, are drawn shorter and from the same
+    origin, so agreement shows up as two overlapping triads and disagreement as a visible
+    fork. Both use the OpenCV convention, X red, Y green, Z blue. The dots are the RANSAC
+    inliers: they show WHICH surface features carried the pose, which is what you want to
+    see when a frame fails -- a pose supported by a tight cluster in one corner is one to
+    distrust even when it looks plausible.
+    """
+    canvas = cv2.cvtColor(mono, cv2.COLOR_GRAY2BGR)
+
+    if inlier_pts is not None:
+        for point in inlier_pts.astype(int):
+            cv2.circle(canvas, tuple(point), 2, (0, 255, 255), -1)
+
+    if marker_pose is not None:
+        R_ref, t_ref = marker_pose
+        rvec_ref, _ = cv2.Rodrigues(R_ref)
+        cv2.drawFrameAxes(canvas, K, dist, rvec_ref, t_ref, axis_length * 0.6, 2)
+
+    if pattern_pose is not None:
+        cv2.drawFrameAxes(canvas, K, dist, pattern_pose[0], pattern_pose[1], axis_length, 4)
+
+    lines = [f"{row['frame']}  light={row['light'] or '?'}",
+             f"matches {row['matches']}  inliers {row['inliers']}"
+             + ("  POSE" if pattern_pose is not None else "  NO POSE")]
+    if row["rot_err_deg"] != "":
+        lines.append(f"vs marker: {row['rot_err_deg']:.2f} deg, {row['pos_err']:.3f} sides")
+    elif marker_pose is not None:
+        lines.append("marker visible (thin axes)")
+    for i, line in enumerate(lines):
+        cv2.putText(canvas, line, (10, 24 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(canvas, line, (10, 24 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.imwrite(out_path, canvas)
+
+
 def build(args):
     K, dist = load_intrinsics(args.intrinsics)
     obj = marker_object_points(args.marker_length)
@@ -285,7 +388,7 @@ def build(args):
     pairs_used = 0
     for view, other in candidates:
         baseline = np.linalg.norm(view["centre"] - other["centre"])
-        if baseline < args.min_baseline:
+        if baseline < (args.min_baseline or 2.0 * args.marker_length):
             continue
         idx = match(view["desc"], other["desc"], matcher)
         if len(idx) < 8:
@@ -362,6 +465,8 @@ def locate(args):
 
     folder = resolve(args.folder, args.data_root)
     paths = sorted(glob.glob(os.path.join(folder, "*.png")))[::args.stride]
+    if args.debug_dir:
+        os.makedirs(args.debug_dir, exist_ok=True)
 
     rows = []
     for path in paths:
@@ -388,10 +493,12 @@ def locate(args):
             idx[:, 1] = pool[idx[:, 1]]
         row = {"frame": os.path.basename(path), "light": light or "",
                "pooled": int(pooled), "matches": len(idx), "inliers": 0,
+               "inlier_ratio": "", "reproj_rms_px": "", "spread_px": "",
                "rvec_x": "", "rvec_y": "", "rvec_z": "",
                "cam_x": "", "cam_y": "", "cam_z": "",
                "rot_err_deg": "", "pos_err": ""}
 
+        pattern_pose, inlier_pts = None, None
         if len(idx) >= 6:
             image_pts = np.array([keypoints[k].pt for k in idx[:, 0]], np.float64)
             ok, rvec, tvec, inliers = cv2.solvePnPRansac(
@@ -399,9 +506,36 @@ def locate(args):
                 reprojectionError=args.max_reproj_px, iterationsCount=500,
                 flags=cv2.SOLVEPNP_EPNP)
             if ok and inliers is not None and len(inliers) >= args.min_inliers:
+                keep = inliers.ravel()
+                object_in = map_points[idx[keep, 1]]
+                image_in = image_pts[keep]
+
+                # Refitting the pose to all RANSAC inliers (--refine) ought to help and
+                # measurably does not: it improved 17 of 33 held-out frames and worsened
+                # 16, a net +0.18 mm. The limiting error is the MAP -- 3D points
+                # triangulated from noisy marker scaffolding -- not the fit to it, and
+                # polishing a fit against biased points buys nothing. Left as a flag.
+                if args.refine and len(keep) >= 4:
+                    rvec, tvec = cv2.solvePnPRefineLM(object_in, image_in, K, dist,
+                                                      rvec, tvec)
+
                 R, _ = cv2.Rodrigues(rvec)
                 centre = (-R.T @ tvec).ravel()
-                row.update({"inliers": len(inliers),
+                pattern_pose = (rvec, tvec)
+                inlier_pts = image_in
+
+                # Two cheap confidence signals, recorded so a caller can gate on them:
+                # how well the kept correspondences fit, and how far across the frame
+                # they are spread (a pose carried by one tight cluster is ill-conditioned
+                # however many inliers back it).
+                projected, _ = cv2.projectPoints(object_in, rvec, tvec, K, dist)
+                residual = np.linalg.norm(projected.reshape(-1, 2) - image_in, axis=1)
+                spread = float(np.sqrt(image_in[:, 0].var() + image_in[:, 1].var()))
+
+                row.update({"inliers": len(keep),
+                            "inlier_ratio": len(keep) / len(idx),
+                            "reproj_rms_px": float(np.sqrt((residual ** 2).mean())),
+                            "spread_px": spread,
                             "rvec_x": rvec[0, 0], "rvec_y": rvec[1, 0], "rvec_z": rvec[2, 0],
                             "cam_x": centre[0], "cam_y": centre[1], "cam_z": centre[2]})
                 if args.compare_markers and marker_pose is not None:
@@ -410,6 +544,11 @@ def locate(args):
                     angle = np.degrees(np.arccos(np.clip((np.trace(delta) - 1) / 2, -1, 1)))
                     row["rot_err_deg"] = angle
                     row["pos_err"] = float(np.linalg.norm(centre - (-R_ref.T @ t_ref).ravel()))
+
+        if args.debug_dir:
+            draw_overlay(os.path.join(args.debug_dir, os.path.basename(path)), mono,
+                         K, dist, pattern_pose, marker_pose, inlier_pts, row,
+                         args.axis_length or args.marker_length)
         rows.append(row)
 
     with open(args.out, "w", newline="") as handle:
@@ -446,8 +585,9 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("--folder", required=True)
         p.add_argument("--intrinsics", required=True)
-        p.add_argument("--marker-length", type=float, default=1.0,
-                       help="printed marker side; 1.0 (default) works in marker sides")
+        p.add_argument("--marker-length", type=float, default=0.025,
+                       help="printed marker side in metres (measured: 25 mm); pass 1.0 to "
+                            "work in marker-side units instead")
         p.add_argument("--stride", type=int, default=5, help="use every Nth frame")
         p.add_argument("--max-features", type=int, default=2000, help="SIFT keypoint cap")
         p.add_argument("--max-reproj-px", type=float, default=3.0)
@@ -455,6 +595,9 @@ def main():
                        help="treat frames whose decoded light scores below this as "
                             "unlabelled (mid-transition frames blend two lights); frames "
                             "with no recorded confidence are trusted")
+        p.add_argument("--refine", action="store_true",
+                       help="refit the pose to the RANSAC inliers with Levenberg-Marquardt "
+                            "(measured a wash on this corpus; see the docstring)")
         p.add_argument("--no-clahe", action="store_true",
                        help="skip contrast equalisation before feature detection")
         p.set_defaults(func=func)
@@ -465,8 +608,10 @@ def main():
                    help="marker id whose frame the map is expressed in")
     b.add_argument("--pair-span", type=int, default=4,
                    help="how many later views each view is matched against")
-    b.add_argument("--min-baseline", type=float, default=0.15,
-                   help="minimum camera separation for a pair, in marker sides")
+    b.add_argument("--min-baseline", type=float,
+                   help="minimum camera separation for a pair, in the same units as "
+                        "--marker-length (default: 2 marker sides, i.e. 50 mm, which a "
+                        "sweep found optimal -- see the docstring)")
     b.add_argument("--any-light", action="store_true",
                    help="also pair frames lit by different illuminators (off by default: "
                         "the same surface under two lights is two different appearances)")
@@ -490,6 +635,11 @@ def main():
     l.add_argument("--min-separation", type=float,
                    help="how far apart two map points must be to count as rivals in the "
                         "ratio test (default 0.25 marker sides)")
+    l.add_argument("--debug-dir",
+                   help="write each frame with the recovered axes, the marker axes where "
+                        "one is visible, and the RANSAC inliers drawn on it")
+    l.add_argument("--axis-length", type=float,
+                   help="length of the drawn axes (default: one marker side)")
     l.add_argument("--compare-markers", action="store_true",
                    help="also report error against the ArUco pose, where a marker is visible")
 

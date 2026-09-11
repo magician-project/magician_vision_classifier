@@ -44,20 +44,25 @@ UNITS -- read this before believing a translation
 Scaling the object points scales the translations and leaves the rotations, the camera
 matrix and the distortion coefficients untouched.
 
-The chessboard square is known (11.5 mm), so `calibrate` is metric. The printed ArUco
-markers have NOT been measured -- they never share a frame with the board, so nothing in
-the corpus pins their size -- and so --marker-length defaults to 1.0, which emits
-translations in units of ONE MARKER SIDE. That is deliberate: a plausible-looking default
-in metres would produce millimetres that are silently wrong. Measure a marker, pass
---marker-length 0.0138 (or whatever it is), and every translation becomes metric.
-Rotations are correct either way.
+The chessboard square is 11.5 mm and the printed ArUco markers are 25 mm on a side
+(measured, 2026-09-11), so both modes are metric by default and every translation below is
+in metres. Pass --marker-length 1.0 to go back to marker-side units. Rotations, the camera
+matrix and the distortion coefficients are unaffected by the choice either way.
+
+The resulting intrinsics check out against the documented optics, which is the best
+independent validation available here: fx = 2332 px at the 6.90 um debayered pixel of the
+XCG-CP510 implies a 16.1 mm focal length, and D5.3 specifies a C-mount 16 mm lens.
+
+At 25 mm the recorded marker distance is a median 403 mm. That is an OPTICAL distance and
+must not be compared with the 4.5-6.0 cm stand-off quoted for the tool, which is measured
+from the bottom of the sensor: D5.3's 153 x 129 mm footprint at 60 mm hover puts the lens
+centre ~232 mm behind that datum. In hover terms these scans sit at ~171 mm.
 
 Usage:
   python analysis/extrinsics_from_markers.py calibrate --folder . --out intrinsics.json
 
   python analysis/extrinsics_from_markers.py extrinsics --folder AltinayUniquePattern750 \
-      --intrinsics intrinsics.json --out poses.csv [--marker-length 0.0138] \
-      [--stride 1] [--debug-dir overlays/]
+      --intrinsics intrinsics.json --out poses.csv [--stride 1] [--debug-dir overlays/]
 
 Folders resolve against --data-root (default /media/ammar/games2/Datasets/Magician) unless
 given as an absolute path.
@@ -309,9 +314,9 @@ def main():
     ext.add_argument("--folder", required=True)
     ext.add_argument("--intrinsics", required=True)
     ext.add_argument("--out", default="poses.csv")
-    ext.add_argument("--marker-length", type=float, default=1.0,
-                     help="printed marker side; 1.0 (default) leaves translations "
-                          "in marker sides")
+    ext.add_argument("--marker-length", type=float, default=0.025,
+                     help="printed marker side in metres (measured: 25 mm); pass 1.0 to "
+                          "work in marker-side units instead")
     ext.add_argument("--stride", type=int, default=1, help="use every Nth frame")
     ext.add_argument("--debug-dir", help="write frames with detections and axes drawn")
     ext.set_defaults(func=extrinsics)
