@@ -157,6 +157,29 @@ def pick_best_checkpoint(cfg):
     return (max if mode == 'max' else min)(scored)[1] if scored else cks[-1]
 
 
+def class_breakdown(class_names, truth, values, fn, tp):
+    """Per real-defect-class stats of `values` for the FN and TP populations, sorted by FN
+    std DESCENDING -- surfaces which specific classes drive an aggregate FN statistic
+    (e.g. a variance asymmetry seen in the pooled FN-vs-TP comparison) rather than leaving
+    it as one number that could be hiding a single bad class or could be genuinely uniform
+    across classes."""
+    rows = []
+    for ci, cname in enumerate(class_names):
+        m_fn, m_tp = fn & (truth == ci), tp & (truth == ci)
+        if not m_fn.any() and not m_tp.any():
+            continue
+        rows.append((cname, values[m_fn], values[m_tp]))
+    rows.sort(key=lambda r: -(r[1].std() if len(r[1]) > 1 else -1.0))
+    print(f'{"class":26s} {"FN n":>6s} {"FN mean":>8s} {"FN std":>7s}   '
+          f'{"TP n":>6s} {"TP mean":>8s} {"TP std":>7s}')
+    for cname, vfn, vtp in rows:
+        fn_str = (f'{len(vfn):6,d} {vfn.mean():8.4f} {vfn.std():7.4f}' if len(vfn) else
+                  f'{0:6,d} {"--":>8s} {"--":>7s}')
+        tp_str = (f'{len(vtp):6,d} {vtp.mean():8.4f} {vtp.std():7.4f}' if len(vtp) else
+                  f'{0:6,d} {"--":>8s} {"--":>7s}')
+        print(f'{cname:26s} {fn_str}   {tp_str}')
+
+
 def summarize(name, values, mask_a, label_a, mask_b, label_b):
     a, b = values[mask_a], values[mask_b]
     a, b = a[~np.isnan(a)], b[~np.isnan(b)]
@@ -254,6 +277,13 @@ def main():
     print('  consistent with a geometric disruption (dent edge, weld splatter, deformation)')
     print('  but is not proof of one -- e.g. a flat but low-signal (low DoLP) tile can also')
     print('  read as locally incoherent from noise alone; read alongside the DoLP row above.')
+
+    print('\n--- AoLP local coherence, per defect class, sorted by FN std descending ---')
+    class_breakdown(class_names, truth, aolp_consist, fn, tp)
+    print('read this against the pooled FN vs TP std asymmetry above: a few classes at the')
+    print('top of this table driving most of the pooled FN std would mean the asymmetry is')
+    print("about which DEFECTS are hard, not a property of misses in general; a flat table")
+    print('(every class showing roughly the pooled ratio) would mean the opposite.')
 
     print('\n=== Sensor distance / tilt proxy ===')
     summarize('DistanceAverage', distance_avg, fn, 'FN', tp, 'TP')
