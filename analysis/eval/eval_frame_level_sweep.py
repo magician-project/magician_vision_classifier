@@ -58,6 +58,8 @@ from analysis.eval.eval_cascade_step_sweep import (CACHE_DIR, STEPS, T1_GRID, T2
                                                     cache_path, containment_matrix,
                                                     eligible_mask, wanted_frames)
 from analysis.eval.eval_step_curve import frame_points, local_path
+from mvc.core.artifact_paths import find_config_with_classes
+from mvc.core.config import load_hyperparameters
 
 FRAME_H, FRAME_W = 1024, 1224
 FA_BUDGETS = (0.05, 0.10)
@@ -69,17 +71,29 @@ MODELS = {
     'msfemto':    'convnext_femto',
 }
 GT_CACHE = os.path.join(CACHE_DIR, '_frame_gt_n3054.json')
+CLASS_GT_CACHE = os.path.join(CACHE_DIR, '_frame_class_gt_n3054.json')
 # (kernel, min_votes) settings to sweep -- kernel=0/min_votes<=1 is the "no voting" baseline
 # (a cell only ever counts itself, matching the ROS service's own 0/1-disables-voting
 # contract), kernel=1/min_votes=2 is the shipped default, kernel=2/min_votes=3 a stronger
 # denoise. Not a full kernel x min_votes grid -- these three points already answer "does
 # voting fix the max-of-4588-tiles blowup", a full grid is a follow-up if these disagree.
 VOTE_SETTINGS = [(0, 1), (1, 2), (2, 3)]
-# Coarser than eval_cascade_step_sweep's own T1_GRID -- this first pass is about which
-# (model pair, step pair) combos matter, not fine-tuning t1 to the last decimal; a screen
-# only has to notice something's nearby, so 4 points spanning its permissive range is
-# enough to see whether the axis matters at all. Widen later if a promising cell needs it.
-T1_GRID_COARSE = np.array([0.05, 0.20, 0.40, 0.60])
+# REFINED 2026-09-11, superseding the original 4-point coarse grid: that first pass found
+# every winning config sitting at t1=0.05 (the grid's own floor), across every pairing and
+# step combo -- meaning the screen was a no-op (nearly everything gets promoted at that
+# threshold) and the sweep never got to test whether a REAL screen adds value. Checked why
+# before widening blindly: the screen models' own per-cell score distribution has the same
+# near-1.0 saturation the recheck stage did (only 21 of 8,680+ unique values sit above 0.99
+# for a representative model/step) -- so the interesting range for t1 is not the original
+# grid's 0.05-0.60 span, it is close to 1.0, same as t2. This grid keeps light coverage of
+# the traditional "permissive screen" range and adds dense coverage near 1.0 to actually
+# test that hypothesis, while staying small enough to sweep in a few minutes (a full
+# unique-value grid there is 1,800+ points -- checked and rejected as too slow for this
+# pass).
+T1_GRID_REFINED = np.array([
+    0.05, 0.15, 0.30, 0.45, 0.60,                                   # original range, kept
+    0.75, 0.85, 0.90, 0.95, 0.97, 0.99, 0.995, 0.999, 0.9995, 0.9999, 0.99995,  # near-1.0
+])
 # Curated (screen, recheck) pairs -- the practical cascade shape (cheap screen, expensive
 # precise recheck), not all 20 permutations of the 5 cached models. squeezenet1_1 and
 # convnext_femto are the two cheapest/most-permissive-screen candidates from the earlier
@@ -136,6 +150,64 @@ def frame_ground_truth():
     os.makedirs(CACHE_DIR, exist_ok=True)
     json.dump({'is_defect': [bool(x) for x in is_defect]}, open(GT_CACHE, 'w'))
     return np.array(is_defect, dtype=bool)
+
+
+def canonical_class_scheme():
+    """merges/drops shared by all 5 cached models -- verified identical merge_classes/
+    drop_classes print output across every eval_failure_conditions.py run this session
+    (all 5 configs are Aug26_78K campaign runs under the same canonical 10-class scheme).
+    Read from one config rather than hardcoded, so a future scheme change can't silently
+    desync this from what the models actually trained on."""
+    cfg = load_hyperparameters(find_config_with_classes('anc_convnext_pico.json'))
+    return cfg.get('class_merges') or {}, set(cfg.get('drop_classes') or [])
+
+
+def class_ground_truth():
+    """Model-independent per-frame, PER-CLASS GT: for each of the campaign's real defect
+    classes, True = frame has >=1 point mapped to that class under the canonical scheme.
+    Same iteration/skip logic and positional-alignment guarantee as frame_ground_truth()
+    (just also keeping which class(es) instead of collapsing to one bool) -- a frame with
+    points from multiple classes counts toward each of them, same as any other per-class
+    recall table in this repo (e.g. eval_failure_conditions.class_breakdown())."""
+    if os.path.exists(CLASS_GT_CACHE):
+        d = json.load(open(CLASS_GT_CACHE))
+        return {k: np.array(v, dtype=bool) for k, v in d.items()}
+    merges, drops = canonical_class_scheme()
+    wanted = wanted_frames(1, 0)
+    assert len(wanted) == 3054, f'expected 3054 frames, got {len(wanted)} -- caches assume this'
+    present_sets = []
+    for fj in wanted:
+        img_path, json_path = local_path(fj)
+        if img_path is None:
+            continue
+        pts, no_light = frame_points(json_path, merges, drops, True)
+        if pts is None or no_light:
+            continue
+        present_sets.append({cls for (_x, _y, cls) in pts
+                             if cls is not None and cls != 'class_clean'})
+    assert len(present_sets) == 3054, \
+        f'{len(present_sets)} survived GT scan, but every cache has 3054 frames'
+    all_classes = sorted({c for s in present_sets for c in s})
+    per_class = {c: [c in s for s in present_sets] for c in all_classes}
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    json.dump(per_class, open(CLASS_GT_CACHE, 'w'))
+    return {k: np.array(v, dtype=bool) for k, v in per_class.items()}
+
+
+def per_class_report(flagged, class_gt, indent='    '):
+    """detect% among GT-defect frames of each class, at an ALREADY-CHOSEN operating
+    point (the pooled-optimal one found by the search functions above) -- this is the
+    threshold-impact-per-class study: does the config that maximises the POOLED number
+    actually serve every class, or does it favour the easy ones? Not a per-class
+    re-optimisation -- one fixed flagged array, sliced by class."""
+    print(f'{indent}{"class":26s} {"n":>6s} {"detect%":>8s}')
+    for cname in sorted(class_gt):
+        gt = class_gt[cname]
+        n = int(gt.sum())
+        if n == 0:
+            continue
+        det = 100.0 * float(flagged[gt].mean())
+        print(f'{indent}{cname:26s} {n:6,d} {det:8.2f}')
 
 
 def load(run, step):
@@ -203,7 +275,7 @@ def best_at_fa_budget(mass3d, is_defect, fa_budget, vote_settings=VOTE_SETTINGS,
 
 
 # --------------------------------------------------------------------------------- solo
-def solo_report(is_defect):
+def solo_report(is_defect, class_gt):
     print(f'\n{"="*90}\nSOLO MODELS -- frame-level detect% at frame FA<=5%/10%, vote-filtered '
           f'(kernel,min_votes swept over {VOTE_SETTINGS})\n{"="*90}')
     print(f'{"model":18s} {"step":>5s} {"det@FA5":>8s} {"(k,mv,t)":>10s} '
@@ -220,6 +292,11 @@ def solo_report(is_defect):
             d10 = f'{b10[3]*100:9.2f}' if b10 else '      --'
             k10 = f'({b10[1]},{b10[2]},{b10[0]:.2f})' if b10 else '  --'
             print(f'{model:18s} {step:5d} {d5} {k5:>10s} {d10} {k10:>10s}')
+            if b5:
+                t, kernel, min_votes = b5[0], b5[1], b5[2]
+                flagged = (batched_neighbor_counts(mass3d >= t, kernel) >= min_votes).any(axis=(1, 2))
+                print(f'  per-class detect% at this FA5 operating point (pooled={b5[3]*100:.2f}%):')
+                per_class_report(flagged, class_gt)
             rows.append({'run': run, 'model': model, 'step': step,
                          'best_at_fa5': b5 and {'t': b5[0], 'kernel': b5[1], 'min_votes': b5[2],
                                                 'detect_pct': b5[3] * 100, 'fa_pct': b5[4] * 100},
@@ -261,7 +338,7 @@ def _search_best_cascade(t2_grid, elig, kernel, min_votes, mass2, is_defect, fa_
 
 
 def cascade_sweep_pair(run1, run2, is_defect, step_pairs=CASCADE_STEP_PAIRS,
-                       t1_grid=T1_GRID_COARSE, fa_budget=0.05):
+                       t1_grid=T1_GRID_REFINED, fa_budget=0.05):
     """(step1, step2) x t1 x (t2, kernel, min_votes) combos for one ordered (screen,
     recheck) pairing, over the given step_pairs only (not a full steps x steps grid).
     Voting applies to the RECHECK stage only -- the screen's job is to not miss anything
@@ -293,7 +370,7 @@ def cascade_sweep_pair(run1, run2, is_defect, step_pairs=CASCADE_STEP_PAIRS,
     return best_by_step
 
 
-def cascade_report(is_defect):
+def cascade_report(is_defect, class_gt):
     print(f'\n{"="*90}\nCASCADE (screen -> recheck) -- best frame detect% at frame FA<=5%, '
           f'per (step1, step2), recheck vote-filtered\n'
           f'curated pairs={CASCADE_PAIRS}, step pairs={CASCADE_STEP_PAIRS}\n{"="*90}')
@@ -310,6 +387,15 @@ def cascade_report(is_defect):
             t1, t2, kernel, min_votes, det, fa = b
             print(f'{s1:6d} {s2:6d} {t1:6.2f} {t2:6.2f} ({kernel},{min_votes}) '
                   f'{det*100:8.2f} {fa*100:6.2f}')
+            frames1 = load(run1, s1)
+            mass2 = stacked_mass(load(run2, s2))
+            y_c = containment_matrix(s1, s2, FRAME_H)
+            x_c = containment_matrix(s1, s2, FRAME_W)
+            elig = np.stack([eligible_mask(f1['mass2d'], t1, y_c, x_c) for f1 in frames1])
+            counts = batched_neighbor_counts(mass2 >= t2, kernel)
+            flagged = (elig & (counts >= min_votes)).any(axis=(1, 2))
+            print(f'  per-class detect% at this operating point (pooled={det*100:.2f}%):')
+            per_class_report(flagged, class_gt)
             rows.append({'screen': run1, 'recheck': run2, 'step1': s1, 'step2': s2,
                          't1': t1, 't2': t2, 'kernel': kernel, 'min_votes': min_votes,
                          'frame_detect_pct': det * 100, 'frame_fa_pct': fa * 100})
@@ -346,15 +432,17 @@ def _search_best_vote(t_grid, masses, subset, min_votes, is_defect, fa_budget):
 
 
 # --------------------------------------------------------------------------------- vote
-def vote_report(is_defect):
+def vote_report(is_defect, class_gt, top_n_class_breakdown=5):
     print(f'\n{"="*90}\nVOTE (majority-agreement across models, SAME shared step) -- best frame '
           f'detect% at frame FA<=5%\n{"="*90}')
     runs = list(MODELS)
     rows = []
+    masses_by_step = {}
     for step in STEPS:
         cached = {run: load(run, step) for run in runs}
         masses = {run: np.stack([f['mass2d'] for f in cached[run]]).astype(np.float32)
                  for run in runs}  # (n_frames, ny, nx) -- same grid shape, all models @ this step
+        masses_by_step[step] = masses
         t_grid = fine_grid(np.stack(list(masses.values())))
         for k in (2, 3, 4, 5):
             for subset in itertools.combinations(runs, k):
@@ -372,6 +460,20 @@ def vote_report(is_defect):
                     rows.append({'step': step, 'models': list(subset), 'k': k,
                                  'threshold': t, 'min_votes': mv,
                                  'frame_detect_pct': det * 100, 'frame_fa_pct': fa * 100})
+
+    # Per-class breakdown only for the top N by pooled detect% -- 104 combos is too many
+    # to print a 9-row table for each; this still answers the threshold-impact-per-class
+    # question for every config a reader would actually consider deploying.
+    top = sorted(rows, key=lambda r: -r['frame_detect_pct'])[:top_n_class_breakdown]
+    print(f'\n--- per-class detect%, top {len(top)} vote configs by pooled detect% ---')
+    for r in top:
+        subset, step, t, mv = r['models'], r['step'], r['threshold'], r['min_votes']
+        masses = masses_by_step[step]
+        votes = sum((masses[run] >= t).astype(np.int32) for run in subset)
+        flagged = (votes >= mv).any(axis=(1, 2))
+        print(f"\n  step={step} {'+'.join(subset)} t={t:.4f} votes>={mv}/{len(subset)} "
+              f"(pooled detect%={r['frame_detect_pct']:.2f}, FA%={r['frame_fa_pct']:.2f}):")
+        per_class_report(flagged, class_gt, indent='    ')
     return rows
 
 
@@ -385,16 +487,19 @@ def main():
     run_all = not (args.solo or args.cascade or args.vote)
 
     is_defect = frame_ground_truth()
+    class_gt = class_ground_truth()
     print(f'[frame-level] {len(is_defect):,} frames, {int(is_defect.sum()):,} GT-defect '
           f'({100*is_defect.mean():.1f}%), {int((~is_defect).sum()):,} GT-clean')
+    print(f'[frame-level] {len(class_gt)} defect classes: ' +
+          ', '.join(f'{c}={int(v.sum())}' for c, v in sorted(class_gt.items())))
 
     out = {}
     if args.solo or run_all:
-        out['solo'] = solo_report(is_defect)
+        out['solo'] = solo_report(is_defect, class_gt)
     if args.cascade or run_all:
-        out['cascade'] = cascade_report(is_defect)
+        out['cascade'] = cascade_report(is_defect, class_gt)
     if args.vote or run_all:
-        out['vote'] = vote_report(is_defect)
+        out['vote'] = vote_report(is_defect, class_gt)
 
     path = os.path.join(CACHE_DIR, 'frame_level_sweep_results.json')
     json.dump(out, open(path, 'w'), indent=1)
