@@ -224,10 +224,19 @@ def detect_and_mask(mono, detector, sift, obj, K, dist, reference_marker, equali
     panel across frames lit from different directions must not depend on which
     polarization channels the luma weights happen to favour.
 
+    `detector=None` skips ArUco entirely (no masking, pose always None) -- the marker-free
+    LOCATE path (locate_single_frame, used by the live ROS service) has no need for one:
+    markers are scaffolding for `build` only, not something a deployed car is expected to
+    carry (see the module docstring). `build`/`locate`'s own CLI callers always pass a
+    real detector, unchanged from before this was made optional.
+
     Returns (pose, keypoints, descriptors) where pose is (R, t) or None.
     """
     gray = mono
-    corners, ids, _ = detector.detectMarkers(gray)
+    if detector is None:
+        corners, ids = None, None
+    else:
+        corners, ids, _ = detector.detectMarkers(gray)
 
     mask = np.full(gray.shape, 255, np.uint8)
     pose = None
@@ -285,6 +294,56 @@ def match_to_map(desc, map_desc, map_points, matcher, min_separation):
         if rival is None or best.distance < RATIO * rival.distance:
             pairs.append((best.queryIdx, best.trainIdx))
     return np.array(pairs, int).reshape(-1, 2)
+
+
+def locate_single_frame(mono, K, dist, map_points, map_desc, sift, matcher, obj,
+                        reference_marker, *, detector=None, min_inliers=12, max_reproj_px=3.0,
+                        min_separation=None, marker_length=0.025, refine=False,
+                        equalise=True):
+    """Localise ONE in-memory mono frame against an already-loaded map -- NO marker needs
+    to be visible in `mono` for this to work; that is the entire point of this tool over
+    extrinsics_from_markers.py (see the module docstring). `detector` defaults to None
+    (ArUco skipped entirely, see detect_and_mask) for exactly that reason -- pass a real
+    one only if you also want an incidentally-visible marker masked out of the SIFT
+    features, or its pose back for comparison (result['marker_pose']).
+
+    Same detect_and_mask -> match_to_map -> solvePnPRansac steps `locate()` runs per frame
+    in its folder loop, factored out here for a caller that has a single live frame instead
+    of a folder to batch (mvc/inference/live_torch_ros.py). Deliberately NOT wired into
+    `locate()` itself -- that CLI path is validated against real recordings (see the module
+    docstring's measured numbers) and additionally supports --pool-by-light/--compare-markers/
+    --debug-dir, which this single-frame path does not reproduce; changing a working,
+    measured tool to share this code was judged more risk than the duplication is worth.
+
+    Returns a dict (rvec, tvec, inliers, inlier_ratio, reproj_rms_px, marker_pose) or None
+    if the frame does not localise (too few matches or RANSAC inliers) -- callers should
+    treat None as "no pose available now", not an error.
+    """
+    marker_pose, keypoints, descriptors = detect_and_mask(
+        mono, detector, sift, obj, K, dist, reference_marker, equalise)
+    separation = min_separation if min_separation else 0.25 * marker_length
+    idx = match_to_map(descriptors, map_desc, map_points, matcher, separation)
+    if len(idx) < 6:
+        return None
+    image_pts = np.array([keypoints[k].pt for k in idx[:, 0]], np.float64)
+    ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+        map_points[idx[:, 1]], image_pts, K, dist,
+        reprojectionError=max_reproj_px, iterationsCount=500, flags=cv2.SOLVEPNP_EPNP)
+    if not ok or inliers is None or len(inliers) < min_inliers:
+        return None
+    keep = inliers.ravel()
+    object_in = map_points[idx[keep, 1]]
+    image_in = image_pts[keep]
+    if refine and len(keep) >= 4:
+        rvec, tvec = cv2.solvePnPRefineLM(object_in, image_in, K, dist, rvec, tvec)
+    projected, _ = cv2.projectPoints(object_in, rvec, tvec, K, dist)
+    residual = np.linalg.norm(projected.reshape(-1, 2) - image_in, axis=1)
+    return {
+        'rvec': rvec, 'tvec': tvec, 'inliers': int(len(keep)),
+        'inlier_ratio': float(len(keep) / len(idx)),
+        'reproj_rms_px': float(np.sqrt((residual ** 2).mean())),
+        'marker_pose': marker_pose,
+    }
 
 
 def draw_overlay(out_path, mono, K, dist, pattern_pose, marker_pose, inlier_pts, row,

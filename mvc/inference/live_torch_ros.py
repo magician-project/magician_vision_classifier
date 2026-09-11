@@ -36,6 +36,15 @@ from mvc.inference.ensemble_classifier import EnsembleClassifierPnm, CascadeClas
 from mvc.core.shared_memory import SharedMemoryManager
 from mvc.paths import repo_root
 
+# Marker-FREE camera localisation against the car's own surface pattern -- a DIFFERENT
+# mechanism from scan_and_publish_markers' ArUco-only pose above: that needs a marker in
+# view every time, this needs one only to have BUILT the map (offline, see
+# analysis/extrinsics_from_pattern.py's own docstring/measured numbers). locate_single_frame
+# is the one place the per-frame localisation logic lives; the CLI's own locate() has its
+# own loop, deliberately not refactored onto this to avoid touching a validated tool
+# (see locate_single_frame's docstring).
+from analysis.extrinsics_from_pattern import locate_single_frame, marker_object_points, load_intrinsics
+
 # --------------------------------------------------------
 import rclpy
 from rclpy.node import Node
@@ -57,6 +66,7 @@ from datetime import datetime
 from magician_vision_classifier.srv import SetInt64
 from magician_vision_classifier.srv import SetFloat64
 #from magician_vision_classifier.srv import SetString
+from magician_vision_classifier.srv import LocatePattern
 
 
 from std_msgs.msg import Float32, Header
@@ -123,6 +133,27 @@ LASER_TOPICS = [
 # LASER_XY_PIXELS (the laser positions in the classifier's 2D image plane) and
 # LASER_IDW_POWER are imported from liveClassifierTorch so both runners fuse depth
 # identically; only the ROS topics that feed them are node-specific.
+
+
+# ========================================================
+# Pattern-based extrinsics (analysis/extrinsics_from_pattern.py)
+# ========================================================
+# The map (map.npz) and a real calibration (intrinsics.json, camera_matrix+dist_coeffs)
+# are built OFFLINE beforehand -- `python analysis/extrinsics_from_pattern.py build ...`
+# against a marker-bearing recording, once per car/rig -- and are NOT rebuilt by this
+# node. Neither is committed to git (they are distributed the same way model
+# checkpoints are, off the same server: scripts/uploadExtrinsics.sh /
+# mvc.inference.extrinsics_download) -- see that module for the on-disk naming
+# convention this reuses. These are just the DEFAULT rig/paths; set_locate_pattern's
+# request can override map_path/intrinsics_path per call, and if neither the local
+# files nor a server copy exist yet the service reports that clearly instead of
+# crashing the node.
+from mvc.inference.extrinsics_download import (DEFAULT_RIG as _EXTRINSICS_DEFAULT_RIG,
+                                                local_paths as _extrinsics_local_paths,
+                                                ensure_extrinsics)
+DEFAULT_EXTRINSICS_MAP, DEFAULT_EXTRINSICS_INTRINSICS = _extrinsics_local_paths(
+    _EXTRINSICS_DEFAULT_RIG)
+EXTRINSICS_MARKER_LENGTH_M = DEFAULT_MARKER_LENGTH_M  # same printed marker as the ArUco path
 
 
 # ========================================================
@@ -225,6 +256,17 @@ class DefectPublisher(Node):
         self._cb_criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4)
         self._cam_matrix_cache = {}   # (h, w) -> (K, dist)
 
+        # Pattern-based extrinsics (marker-FREE localisation against a prebuilt map) --
+        # see analysis/extrinsics_from_pattern.py. The SIFT detector/matcher are built once
+        # here, same as the CLI tool's own build()/locate() do; the map+intrinsics are
+        # lazy-loaded on first request and cached by path, since loading a map is not free
+        # and most deployments only ever use one.
+        self._extrinsics_sift = cv2.SIFT_create(nfeatures=2000)
+        self._extrinsics_matcher = cv2.BFMatcher(cv2.NORM_L2)
+        self._extrinsics_obj = marker_object_points(EXTRINSICS_MARKER_LENGTH_M)
+        self._extrinsics_map_cache = {}         # map_path -> (points, descriptors, reference_marker)
+        self._extrinsics_intrinsics_cache = {}  # intrinsics_path -> (K, dist)
+
         # Laser state (latest samples)
         self._laser_depths = [float("nan"), float("nan"), float("nan")]
         if USE_LASERS:
@@ -255,6 +297,7 @@ class DefectPublisher(Node):
         self.create_service(SetBool,    "magician_vision_classifier/set_frame_limiter", self._set_frame_limiter_cb)
         #self.create_service(SetString,  "magician_vision_classifier/set_model", self._set_model_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_majority_voting", self._set_majority_voting_cb)
+        self.create_service(LocatePattern, "magician_vision_classifier/locate_pattern", self._locate_pattern_cb)
 
         # ------------------------------------------------
         # Services (NEW): runtime tuning
@@ -277,6 +320,9 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/set_frame_limiter (SetBool)")
         #self.get_logger().info("  magician_vision_classifier/set_model (SetString)")
         self.get_logger().info("  magician_vision_classifier/set_majority_voting (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/locate_pattern (LocatePattern; "
+                               "marker-free camera pose vs. a prebuilt map, see "
+                               "analysis/extrinsics_from_pattern.py)")
 
 
         if USE_LASERS and self.publisher_m is not None:
@@ -830,6 +876,153 @@ class DefectPublisher(Node):
         # else:
         #     print("[Markers] No chessboard found.")
         self.get_logger().debug("Marker scan complete.")
+
+    # -------------------------
+    # Pattern-based extrinsics (analysis/extrinsics_from_pattern.py)
+    # -------------------------
+    @staticmethod
+    def _frame_to_mono(frame):
+        """Same pixel conversion as extrinsics_from_markers.png_mono, applied to an
+        in-memory frame instead of a file path: plain mean of the raw channels, NEVER a
+        BGR-luma cv2.cvtColor conversion. This has to match, not just resemble, how the
+        map was built -- extrinsics_from_pattern.py's own docstring is explicit that
+        matching must not depend on which channels a luma weighting favours, and a map
+        built from png_mono-processed frames would silently sit in a different
+        photometric domain than live descriptors taken through a different conversion."""
+        if frame.ndim == 2:
+            return frame
+        return frame.astype(np.float32).mean(axis=2).astype(np.uint8)
+
+    def _load_extrinsics_map(self, map_path):
+        """(points, descriptors, reference_marker) for `map_path`, cached after first
+        load -- a map can hold tens of thousands of points, not something to reload every
+        service call. Returns None if the file does not exist (not yet built)."""
+        if map_path in self._extrinsics_map_cache:
+            return self._extrinsics_map_cache[map_path]
+        if not os.path.isfile(map_path):
+            return None
+        data = np.load(map_path, allow_pickle=False)
+        entry = (data["points"].astype(np.float64), data["descriptors"].astype(np.float32),
+                 int(data["reference_marker"]))
+        self._extrinsics_map_cache[map_path] = entry
+        return entry
+
+    def _load_extrinsics_intrinsics(self, intrinsics_path):
+        """(K, dist) for `intrinsics_path`, cached after first load. Returns None if the
+        file does not exist. Deliberately NOT _get_camera_matrix's approximate
+        make_approx_camera_matrix(w, h) -- that is a resolution-only guess used for the
+        ArUco marker path above; a SIFT-map pose needs the real calibration
+        extrinsics_from_markers.py's own `calibrate` mode produces."""
+        if intrinsics_path in self._extrinsics_intrinsics_cache:
+            return self._extrinsics_intrinsics_cache[intrinsics_path]
+        if not os.path.isfile(intrinsics_path):
+            return None
+        entry = load_intrinsics(intrinsics_path)
+        self._extrinsics_intrinsics_cache[intrinsics_path] = entry
+        return entry
+
+    def _locate_pattern_cb(self, request, response):
+        """Marker-FREE camera pose against a prebuilt surface-pattern map.
+
+        Distinct from scan_markers/scan_and_publish_markers (ArUco-direct pose, needs a
+        marker visible in THIS frame, every time): this is analysis/extrinsics_from_pattern.py's
+        whole reason to exist -- "nobody will glue markers to customer vehicles" (its own
+        docstring) -- so no marker detection runs on the live frame at all here
+        (locate_single_frame is called with detector=None). A marker is only ever needed
+        OFFLINE, once, to bootstrap the map's coordinate frame during `build`.
+
+        Returns the pose in that REFERENCE MARKER's frame -- both extrinsics tools'
+        established convention in this codebase for "a fixed point on the car" (the
+        marker used to BUILD the map, baked into map.npz, not re-detected here; see
+        analysis/extrinsics_from_pattern.py's and extrinsics_from_markers.py's own
+        docstrings), since neither tool computes or stores a further offset to some
+        separately-defined chassis origin. response.message says this explicitly so a
+        caller does not assume a calibration step happened here that did not.
+
+        The map (map.npz) and a real camera calibration (intrinsics.json) must already
+        exist -- both are built OFFLINE, once per car/rig, via
+        `python analysis/extrinsics_from_pattern.py build ...` and
+        `extrinsics_from_markers.py calibrate`. This service does not build either, but
+        when the DEFAULT rig's paths are in use (map_path/intrinsics_path left empty) it
+        WILL auto-download them from the same server the model checkpoints live on if
+        they are not already present locally -- mirrors ClassifierPnm's own
+        ensure_model auto-fetch (see mvc.inference.extrinsics_download). An explicit
+        map_path/intrinsics_path is taken as a local file the caller already has and is
+        not auto-fetched.
+        """
+        using_default = not request.map_path and not request.intrinsics_path
+        if using_default:
+            # Best-effort: a fetch failure still falls through to the "no map" message
+            # below with a clear next step, rather than being surfaced as its own error.
+            ensure_extrinsics(_EXTRINSICS_DEFAULT_RIG)
+        map_path = request.map_path or DEFAULT_EXTRINSICS_MAP
+        intrinsics_path = request.intrinsics_path or DEFAULT_EXTRINSICS_INTRINSICS
+
+        with self._lock:
+            frame = self._last_frame
+
+        if frame is None:
+            response.success = False
+            response.message = "No frame available yet."
+            return response
+
+        map_data = self._load_extrinsics_map(map_path)
+        if map_data is None:
+            response.success = False
+            response.message = (f"No map at {map_path} (and none fetchable from the "
+                                f"server) -- build one first: "
+                                f"python analysis/extrinsics_from_pattern.py build "
+                                f"--folder <recording> --intrinsics <intrinsics.json> "
+                                f"--out {map_path}, then "
+                                f"scripts/uploadExtrinsics.sh to publish it.")
+            return response
+        map_points, map_desc, reference_marker = map_data
+
+        intrinsics = self._load_extrinsics_intrinsics(intrinsics_path)
+        if intrinsics is None:
+            response.success = False
+            response.message = (f"No camera calibration at {intrinsics_path} -- see "
+                                f"analysis/extrinsics_from_markers.py's calibrate mode.")
+            return response
+        K, dist = intrinsics
+
+        mono = self._frame_to_mono(frame)
+        # detector=None deliberately: this path must not depend on a marker being visible
+        # on the car (see locate_single_frame's docstring) -- that dependency belongs to
+        # scan_and_publish_markers/extrinsics_from_markers.py's ArUco-direct pose only.
+        result = locate_single_frame(
+            mono, K, dist, map_points, map_desc,
+            self._extrinsics_sift, self._extrinsics_matcher,
+            self._extrinsics_obj, reference_marker,
+            marker_length=EXTRINSICS_MARKER_LENGTH_M)
+
+        if result is None:
+            response.success = False
+            response.message = "Localisation failed (too few matches or RANSAC inliers this frame)."
+            return response
+
+        qx, qy, qz, qw = rvec_to_quaternion(result["rvec"])
+        tvec = result["tvec"].ravel()
+        pose = Pose()
+        pose.position.x = float(tvec[0])
+        pose.position.y = float(tvec[1])
+        pose.position.z = float(tvec[2])
+        pose.orientation.x = qx
+        pose.orientation.y = qy
+        pose.orientation.z = qz
+        pose.orientation.w = qw
+
+        response.success = True
+        response.pose = pose
+        response.inliers = int(result["inliers"])
+        response.reproj_rms_px = float(result["reproj_rms_px"])
+        response.message = (
+            f"Pose is w.r.t. reference marker {reference_marker}'s frame (this "
+            f"codebase's convention for \"a fixed point on the car\", not a separately "
+            f"calibrated chassis origin -- see analysis/extrinsics_from_pattern.py). "
+            f"inliers={response.inliers} reproj_rms_px={response.reproj_rms_px:.2f}")
+        self.get_logger().info(response.message)
+        return response
 
     def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z=0.0, ts=0):
         """Publish a Detection message with 2D box, type, class, and optional depth.
