@@ -42,10 +42,17 @@ zero new GPU inference. 5 models x 4 steps (16/18/24/32), 3,054 coverage frames 
 
 Usage:
     python -m analysis.eval.eval_frame_level_sweep [--solo] [--cascade] [--vote]
-        (no flags = all three)
+        (no flags among these three = all three)
+    python -m analysis.eval.eval_frame_level_sweep --html-report
+        writes a self-contained "confusion sweep" visualisation -- a confusion matrix
+        (ground-truth class x flagged/not-flagged) where every cell sparklines its rate
+        across the threshold sweep instead of showing one number at one threshold --
+        for the current best solo config at frame FA<=5%. Independent of --solo/
+        --cascade/--vote (those are not run unless also requested).
 """
 
 import argparse
+import datetime
 import itertools
 import json
 import os
@@ -477,14 +484,471 @@ def vote_report(is_defect, class_gt, top_n_class_breakdown=5):
     return rows
 
 
+# --------------------------------------------------------------------------- html report
+def find_best_solo(is_defect, fa_budget=0.05):
+    """Best (run, step) by pooled frame-detect% among solo configs holding frame
+    FA<=fa_budget -- same search solo_report() prints per-row, kept standalone so
+    --html-report works even when --solo wasn't also requested (cheap: 5 models x 4
+    steps of cached-pickle CPU work, no GPU)."""
+    best = None
+    for run in MODELS:
+        for step in STEPS:
+            mass3d = stacked_mass(load(run, step))
+            b = best_at_fa_budget(mass3d, is_defect, fa_budget)
+            if b is not None and (best is None or b[3] > best[1][3]):
+                best = ((run, step), b)
+    if best is None:
+        return None
+    (run, step), (t, kernel, min_votes, det, fa) = best
+    return {'run': run, 'step': step, 't': t, 'kernel': kernel, 'min_votes': min_votes,
+            'detect_pct': det * 100, 'fa_pct': fa * 100}
+
+
+def build_confusion_sweep_data(run, step, kernel, min_votes, op_t, is_defect, class_gt,
+                               n_points=60, floor=0.90):
+    """Threshold-swept per-class detect%/FA% payload for the --html-report confusion-
+    sweep visualisation: for up to n_points thresholds spanning this config's real
+    cached score range, record pooled FA% and every class's detect% at each one -- not
+    just at the single chosen operating point, so a reader can see how sensitive each
+    cell is to exactly where the threshold sits."""
+    mass3d = stacked_mass(load(run, step))
+    grid_full = fine_grid(mass3d, floor)
+    idx = np.unique(np.linspace(0, len(grid_full) - 1, min(n_points, len(grid_full))).astype(int))
+    grid = grid_full[idx]
+    classes = sorted(class_gt)
+    rows = []
+    for t in grid:
+        counts = batched_neighbor_counts(mass3d >= t, kernel)
+        flagged = (counts >= min_votes).any(axis=(1, 2))
+        row = {'t': float(t), 'fa_pct': 100.0 * float(flagged[~is_defect].mean())}
+        for c in classes:
+            row[c] = 100.0 * float(flagged[class_gt[c]].mean())
+        rows.append(row)
+    return {
+        'run': run, 'model': MODELS[run], 'step': step,
+        'kernel': kernel, 'min_votes': min_votes, 'operating_point_t': float(op_t),
+        'classes': classes,
+        'n_by_class': {c: int(class_gt[c].sum()) for c in classes},
+        'n_clean': int((~is_defect).sum()), 'n_defect_total': int(is_defect.sum()),
+        'sweep': rows,
+    }
+
+
+# Plain (non-f) string constants -- CSS/JS content is interpolated as-is into the f-string
+# in render_confusion_sweep_html() below, so their own literal { } characters never need
+# escaping. System font stack only (no Google Fonts import): this file gets scp'd/opened
+# on boxes with no guaranteed internet access, unlike a hosted artifact.
+_CONFUSION_SWEEP_CSS = """
+:root {
+  --bg: #f2f5f6;
+  --surface: #ffffff;
+  --surface-2: #eaeef0;
+  --text: #182028;
+  --text-dim: #5c6773;
+  --text-faint: #8a95a0;
+  --border: #d7dee2;
+  --detect: 31, 138, 112;
+  --fa: 193, 68, 60;
+  --op: 199, 138, 24;
+  --clean-row: rgba(193, 68, 60, 0.05);
+  --warn-bg: #fbeceb;
+  --warn-text: #9a3f37;
+  --font-display: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-display);
+  padding: 2.5rem 1.5rem 4rem;
+}
+.wrap { max-width: 1180px; margin: 0 auto; }
+
+header h1 { font-size: 1.7rem; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 0.3rem; }
+header p.sub { margin: 0; color: var(--text-dim); font-size: 0.95rem; max-width: 68ch; line-height: 1.5; }
+.config-line {
+  margin-top: 0.9rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--text-faint);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  display: inline-block;
+}
+.config-line b { color: var(--text-dim); font-weight: 600; }
+
+.legend {
+  display: flex; flex-wrap: wrap; gap: 1.4rem; align-items: center;
+  margin: 1.6rem 0 1.1rem; font-size: 0.82rem; color: var(--text-dim);
+}
+.legend .item { display: flex; align-items: center; gap: 0.45rem; }
+.swatch { width: 13px; height: 13px; border-radius: 3px; flex: none; }
+.swatch.line { width: 18px; height: 2px; border-radius: 0; }
+
+.scroller { overflow-x: auto; border-radius: 10px; border: 1px solid var(--border); }
+.matrix {
+  display: grid;
+  grid-template-columns: 236px minmax(300px, 1fr) minmax(300px, 1fr);
+  min-width: 900px;
+  background: var(--surface);
+}
+.cell {
+  padding: 0.7rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  display: flex; flex-direction: column; justify-content: center;
+}
+.matrix > .cell:nth-child(3n+1) { border-right: 1px solid var(--border); }
+.matrix > .cell:nth-child(3n+2) { border-right: 1px solid var(--border); }
+
+.col-head {
+  background: var(--surface-2);
+  font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-dim); padding-top: 0.9rem; padding-bottom: 0.9rem;
+}
+.col-head .sub { text-transform: none; letter-spacing: 0; font-weight: 400; font-size: 0.72rem; margin-top: 0.15rem; }
+
+.row-label { justify-content: center; }
+.row-label .name { font-size: 0.85rem; font-weight: 600; }
+.row-label .meta { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); margin-top: 0.2rem; }
+.row-label .lowN {
+  display: inline-block; margin-top: 0.35rem; font-size: 0.66rem; font-weight: 600;
+  color: var(--warn-text); background: var(--warn-bg); border-radius: 4px;
+  padding: 0.12rem 0.4rem; width: fit-content;
+}
+
+.chart-cell { position: relative; padding: 0.5rem 0.9rem 0.4rem; }
+.chart-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.15rem; }
+.chart-top .op-val { font-family: var(--font-mono); font-weight: 600; font-size: 1.05rem; }
+.chart-top .op-val .unit { font-size: 0.7rem; font-weight: 400; color: var(--text-faint); }
+.chart-top .range-val { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint); }
+svg.spark { display: block; width: 100%; height: 56px; overflow: visible; cursor: crosshair; }
+svg.spark .baseline { stroke: var(--border); stroke-width: 1; }
+svg.spark .opline { stroke: rgb(var(--op)); stroke-width: 1.3; stroke-dasharray: 3 2; }
+svg.spark .hoverline { stroke: var(--text-dim); stroke-width: 1; opacity: 0; }
+svg.spark .hoverdot { opacity: 0; }
+
+.axis-cell { padding-top: 0.3rem; padding-bottom: 0.9rem; border-bottom: none; }
+.axis-cell svg { width: 100%; height: 18px; display: block; }
+.axis-cell text { font-family: var(--font-mono); font-size: 9.5px; fill: var(--text-faint); }
+
+.divider { height: 1px; background: var(--border); grid-column: 1 / -1; }
+
+.tooltip {
+  position: fixed; pointer-events: none;
+  background: var(--text); color: var(--bg);
+  font-family: var(--font-mono); font-size: 0.72rem;
+  padding: 0.3rem 0.55rem; border-radius: 5px;
+  transform: translate(-50%, -130%); white-space: nowrap;
+  opacity: 0; transition: opacity 0.08s ease; z-index: 10;
+}
+
+footer { margin-top: 1.6rem; font-size: 0.78rem; color: var(--text-faint); line-height: 1.6; max-width: 78ch; }
+footer strong { color: var(--text-dim); }
+"""
+
+_CONFUSION_SWEEP_JS = """
+(function () {
+  var DATA = JSON.parse(document.getElementById('data-json').textContent);
+  var sweep = DATA.sweep;
+  var N = sweep.length;
+  var opIdx = 0, best = Infinity;
+  sweep.forEach(function (r, i) {
+    var d = Math.abs(r.t - DATA.operating_point_t);
+    if (d < best) { best = d; opIdx = i; }
+  });
+
+  var classes = DATA.classes.slice().sort(function (a, b) {
+    return DATA.n_by_class[b] - DATA.n_by_class[a];
+  });
+
+  var PLOT_W = 300, PLOT_H = 56, PAD_T = 4, PAD_B = 4;
+
+  function yOf(v) {
+    var h = PLOT_H - PAD_T - PAD_B;
+    return PAD_T + h - (v / 100) * h;
+  }
+  function xOf(i) { return (i / (N - 1)) * PLOT_W; }
+
+  function buildPath(values) {
+    var d = '';
+    for (var i = 0; i < values.length; i++) {
+      d += (i === 0 ? 'M' : 'L') + xOf(i).toFixed(1) + ',' + yOf(values[i]).toFixed(1) + ' ';
+    }
+    return d.trim();
+  }
+  function buildAreaPath(values) {
+    var line = buildPath(values);
+    return line + ' L' + xOf(values.length - 1).toFixed(1) + ',' + yOf(0).toFixed(1)
+      + ' L' + xOf(0).toFixed(1) + ',' + yOf(0).toFixed(1) + ' Z';
+  }
+
+  function svgNS(tag) { return document.createElementNS('http://www.w3.org/2000/svg', tag); }
+
+  function makeSpark(values, rgbVar, muted) {
+    var svg = svgNS('svg');
+    svg.setAttribute('class', 'spark');
+    svg.setAttribute('viewBox', '0 0 ' + PLOT_W + ' ' + PLOT_H);
+    svg.setAttribute('preserveAspectRatio', 'none');
+
+    var base = svgNS('line');
+    base.setAttribute('class', 'baseline');
+    base.setAttribute('x1', 0); base.setAttribute('x2', PLOT_W);
+    base.setAttribute('y1', yOf(0)); base.setAttribute('y2', yOf(0));
+    svg.appendChild(base);
+
+    var color = muted ? 'var(--text-faint)' : ('rgb(' + rgbVar + ')');
+    var fillColor = muted ? 'rgba(140,150,160,0.12)' : ('rgba(' + rgbVar + ',0.16)');
+
+    var area = svgNS('path');
+    area.setAttribute('d', buildAreaPath(values));
+    area.setAttribute('fill', fillColor);
+    area.setAttribute('stroke', 'none');
+    svg.appendChild(area);
+
+    var line = svgNS('path');
+    line.setAttribute('d', buildPath(values));
+    line.setAttribute('fill', 'none');
+    line.setAttribute('stroke', color);
+    line.setAttribute('stroke-width', muted ? 1.3 : 1.8);
+    line.setAttribute('stroke-linejoin', 'round');
+    line.setAttribute('stroke-linecap', 'round');
+    svg.appendChild(line);
+
+    var opX = xOf(opIdx);
+    var opLine = svgNS('line');
+    opLine.setAttribute('class', 'opline');
+    opLine.setAttribute('x1', opX); opLine.setAttribute('x2', opX);
+    opLine.setAttribute('y1', PAD_T); opLine.setAttribute('y2', PLOT_H - PAD_B);
+    svg.appendChild(opLine);
+
+    var opDot = svgNS('circle');
+    opDot.setAttribute('cx', opX);
+    opDot.setAttribute('cy', yOf(values[opIdx]));
+    opDot.setAttribute('r', 2.6);
+    opDot.setAttribute('fill', muted ? 'var(--text-dim)' : color);
+    svg.appendChild(opDot);
+
+    var hoverLine = svgNS('line');
+    hoverLine.setAttribute('class', 'hoverline');
+    hoverLine.setAttribute('y1', PAD_T); hoverLine.setAttribute('y2', PLOT_H - PAD_B);
+    svg.appendChild(hoverLine);
+
+    var hoverDot = svgNS('circle');
+    hoverDot.setAttribute('class', 'hoverdot');
+    hoverDot.setAttribute('r', 3);
+    hoverDot.setAttribute('fill', muted ? 'var(--text-dim)' : color);
+    svg.appendChild(hoverDot);
+
+    var tooltip = document.getElementById('tooltip');
+    svg.addEventListener('mousemove', function (ev) {
+      var rect = svg.getBoundingClientRect();
+      var frac = (ev.clientX - rect.left) / rect.width;
+      var idx = Math.max(0, Math.min(N - 1, Math.round(frac * (N - 1))));
+      var x = xOf(idx), y = yOf(values[idx]);
+      hoverLine.setAttribute('x1', x); hoverLine.setAttribute('x2', x);
+      hoverLine.style.opacity = 1;
+      hoverDot.setAttribute('cx', x); hoverDot.setAttribute('cy', y);
+      hoverDot.style.opacity = 1;
+      tooltip.style.left = ev.clientX + 'px';
+      tooltip.style.top = ev.clientY + 'px';
+      tooltip.style.opacity = 1;
+      tooltip.textContent = 't=' + sweep[idx].t.toFixed(4) + '  ->  ' + values[idx].toFixed(1) + '%';
+    });
+    svg.addEventListener('mouseleave', function () {
+      hoverLine.style.opacity = 0;
+      hoverDot.style.opacity = 0;
+      tooltip.style.opacity = 0;
+    });
+    return svg;
+  }
+
+  function chartCell(values, rgbVar, muted) {
+    var cell = document.createElement('div');
+    cell.className = 'cell chart-cell';
+    var top = document.createElement('div');
+    top.className = 'chart-top';
+    var opVal = document.createElement('div');
+    opVal.className = 'op-val';
+    opVal.style.color = muted ? 'var(--text-dim)' : ('rgb(' + rgbVar + ')');
+    opVal.innerHTML = values[opIdx].toFixed(1) + '<span class="unit">% at op.</span>';
+    var range = document.createElement('div');
+    range.className = 'range-val';
+    var mn = Math.min.apply(null, values), mx = Math.max.apply(null, values);
+    range.textContent = 'range ' + mn.toFixed(1) + '-' + mx.toFixed(1) + '%';
+    top.appendChild(opVal); top.appendChild(range);
+    cell.appendChild(top);
+    cell.appendChild(makeSpark(values, rgbVar, muted));
+    if (!muted) {
+      var alpha = Math.max(0.03, Math.min(0.30, (values[opIdx] / 100) * 0.30));
+      cell.style.background = 'rgba(' + rgbVar + ',' + alpha.toFixed(3) + ')';
+    }
+    return cell;
+  }
+
+  function labelCell(name, n, isClean, lowN) {
+    var cell = document.createElement('div');
+    cell.className = 'cell row-label';
+    var nm = document.createElement('div');
+    nm.className = 'name';
+    nm.textContent = isClean ? 'class_clean (false alarms)' : name;
+    if (isClean) { nm.style.color = 'rgb(var(--fa))'; cell.style.background = 'var(--clean-row)'; }
+    var meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = 'n=' + n.toLocaleString();
+    cell.appendChild(nm); cell.appendChild(meta);
+    if (lowN) {
+      var w = document.createElement('div');
+      w.className = 'lowN';
+      w.textContent = 'low n - noisy';
+      cell.appendChild(w);
+    }
+    return cell;
+  }
+
+  var matrix = document.getElementById('matrix');
+
+  var h1 = document.createElement('div'); h1.className = 'cell col-head';
+  h1.innerHTML = 'Ground-truth row';
+  var h2 = document.createElement('div'); h2.className = 'cell col-head';
+  h2.innerHTML = 'Flagged<div class="sub">detect % (classes) / FA % (clean)</div>';
+  var h3 = document.createElement('div'); h3.className = 'cell col-head';
+  h3.innerHTML = 'Not flagged<div class="sub">miss % (classes) / correct-reject % (clean)</div>';
+  matrix.appendChild(h1); matrix.appendChild(h2); matrix.appendChild(h3);
+
+  classes.forEach(function (cname) {
+    var vals = sweep.map(function (r) { return r[cname]; });
+    var inv = vals.map(function (v) { return 100 - v; });
+    matrix.appendChild(labelCell(cname, DATA.n_by_class[cname], false, DATA.n_by_class[cname] < 30));
+    matrix.appendChild(chartCell(vals, 'var(--detect)', false));
+    matrix.appendChild(chartCell(inv, 'var(--detect)', true));
+  });
+
+  var divider = document.createElement('div');
+  divider.className = 'divider';
+  matrix.appendChild(divider);
+
+  (function () {
+    var vals = sweep.map(function (r) { return r.fa_pct; });
+    var inv = vals.map(function (v) { return 100 - v; });
+    matrix.appendChild(labelCell('class_clean', DATA.n_clean, true, false));
+    matrix.appendChild(chartCell(vals, 'var(--fa)', false));
+    var mutedCell = chartCell(inv, 'var(--fa)', true);
+    mutedCell.style.background = 'var(--clean-row)';
+    matrix.appendChild(mutedCell);
+  })();
+
+  var axisEmpty = document.createElement('div');
+  axisEmpty.className = 'cell axis-cell';
+  matrix.appendChild(axisEmpty);
+  [0, 1].forEach(function () {
+    var cell = document.createElement('div');
+    cell.className = 'cell axis-cell';
+    var svg = svgNS('svg');
+    svg.setAttribute('viewBox', '0 0 ' + PLOT_W + ' 18');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    [0, Math.round((N - 1) / 2), N - 1].forEach(function (idx) {
+      var t = svgNS('text');
+      var x = xOf(idx);
+      t.setAttribute('x', x);
+      t.setAttribute('y', 9);
+      t.setAttribute('text-anchor', idx === 0 ? 'start' : (idx === N - 1 ? 'end' : 'middle'));
+      t.textContent = 't=' + sweep[idx].t.toFixed(3);
+      svg.appendChild(t);
+    });
+    var opTick = svgNS('text');
+    opTick.setAttribute('x', xOf(opIdx));
+    opTick.setAttribute('y', 9);
+    opTick.setAttribute('text-anchor', 'middle');
+    opTick.setAttribute('fill', 'rgb(var(--op))');
+    opTick.setAttribute('font-weight', '600');
+    opTick.textContent = '^ op';
+    svg.appendChild(opTick);
+    cell.appendChild(svg);
+    matrix.appendChild(cell);
+  });
+})();
+"""
+
+
+def render_confusion_sweep_html(data, fa_budget=0.05):
+    """Self-contained HTML: a confusion matrix (ground-truth class x flagged/not-
+    flagged) where every cell sparklines its rate across data['sweep'] instead of
+    showing one number at one threshold. Prototyped and validated interactively
+    (hover crosshair, background-tint-by-operating-point, muted complement column)
+    before wiring in here -- see knowledge/PLAN.md's confusion-sweep note."""
+    generated = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    cfg = (f"{data['run']} / {data['model']} &middot; step={data['step']} &middot; "
+          f"kernel={data['kernel']}, min_votes={data['min_votes']}")
+    n_points = len(data['sweep'])
+    t_lo, t_hi = data['sweep'][0]['t'], data['sweep'][-1]['t']
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Confusion Sweep -- {data['model']}</title>
+<style>{_CONFUSION_SWEEP_CSS}</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Confusion Sweep</h1>
+    <p class="sub">
+      A confusion matrix where every cell is a curve, not a number. Rows are ground-truth
+      classes; columns are the two outcomes a frame can get (flagged / not flagged). Each
+      cell sweeps the raw detection threshold across its real operating range, so you can
+      read both the rate at the chosen operating point (bold number, background tint) and
+      how sensitive that cell is to exactly where the threshold sits (the sparkline).
+    </p>
+    <div class="config-line">
+      <b>config</b> {cfg}
+      &nbsp;|&nbsp; <b>sweep</b> t &isin; [{t_lo:.3f}, {t_hi:.3f}], {n_points} real cached threshold levels
+      &nbsp;|&nbsp; <b>operating point</b> t={data['operating_point_t']:.4f} (best solo config at frame FA&le;{fa_budget*100:.0f}%)
+      &nbsp;|&nbsp; <b>frames</b> {data['n_defect_total'] + data['n_clean']:,} &middot; generated {generated}
+    </div>
+  </header>
+  <div class="legend">
+    <div class="item"><span class="swatch" style="background: rgba(31,138,112,0.85)"></span>defect class, flagged (detect rate)</div>
+    <div class="item"><span class="swatch" style="background: rgba(193,68,60,0.85)"></span>clean frames, flagged (false-alarm rate)</div>
+    <div class="item"><span class="swatch line" style="background: rgb(199,138,24)"></span>chosen operating threshold</div>
+    <div class="item"><span class="swatch" style="background: #eaeef0; border:1px solid #d7dee2"></span>"not flagged" column = 100 &minus; left column, muted</div>
+  </div>
+  <div class="scroller"><div class="matrix" id="matrix"></div></div>
+  <footer>
+    <strong>Reading it:</strong> background tint intensity in each chart cell mirrors the
+    bold number (the rate at the marked operating point) for a fast per-class scan; the
+    curve then shows every other threshold in the swept range, so a steep cell means small
+    threshold changes move that class's rate a lot -- worth knowing before nudging a
+    threshold in production. <strong>Scope:</strong> one config (the current best solo
+    pick at this FA budget), not a re-sweep of every model/step/cascade combo.
+  </footer>
+</div>
+<div class="tooltip" id="tooltip"></div>
+<script id="data-json" type="application/json">{json.dumps(data)}</script>
+<script>{_CONFUSION_SWEEP_JS}</script>
+</body>
+</html>
+"""
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--solo', action='store_true')
     ap.add_argument('--cascade', action='store_true')
     ap.add_argument('--vote', action='store_true')
+    ap.add_argument('--html-report', nargs='?', metavar='PATH',
+                    const=os.path.join(CACHE_DIR, 'confusion_sweep.html'), default=None,
+                    help='Write the confusion-sweep HTML visualisation for the best solo '
+                         'config at frame FA<=5%% (see module docstring). PATH is optional '
+                         '-- defaults to confusion_sweep.html next to the pkl cache.')
     args = ap.parse_args()
-    run_all = not (args.solo or args.cascade or args.vote)
+    run_all = not (args.solo or args.cascade or args.vote or args.html_report)
 
     is_defect = frame_ground_truth()
     class_gt = class_ground_truth()
@@ -501,9 +965,33 @@ def main():
     if args.vote or run_all:
         out['vote'] = vote_report(is_defect, class_gt)
 
-    path = os.path.join(CACHE_DIR, 'frame_level_sweep_results.json')
-    json.dump(out, open(path, 'w'), indent=1)
-    print(f'\nwrote {path}')
+    if args.html_report:
+        best = find_best_solo(is_defect, fa_budget=0.05)
+        if best is None:
+            print('[html-report] no solo config holds frame FA<=5% -- skipping.')
+        else:
+            data = build_confusion_sweep_data(best['run'], best['step'], best['kernel'],
+                                              best['min_votes'], best['t'], is_defect, class_gt)
+            html = render_confusion_sweep_html(data, fa_budget=0.05)
+            with open(args.html_report, 'w') as fh:
+                fh.write(html)
+            print(f"[html-report] best solo: {best['run']} ({MODELS[best['run']]}) "
+                  f"step={best['step']} detect%={best['detect_pct']:.2f} "
+                  f"FA%={best['fa_pct']:.2f} kernel={best['kernel']} "
+                  f"min_votes={best['min_votes']} -> wrote {args.html_report}")
+
+    if out:
+        # Merge into whatever's already on disk rather than clobbering it -- e.g. a
+        # `--html-report`-only run (or any other partial subset) must not blow away
+        # solo/cascade/vote rows an earlier full run already wrote.
+        path = os.path.join(CACHE_DIR, 'frame_level_sweep_results.json')
+        existing = {}
+        if os.path.exists(path):
+            with open(path) as fh:
+                existing = json.load(fh)
+        existing.update(out)
+        json.dump(existing, open(path, 'w'), indent=1)
+        print(f'\nwrote {path}')
 
 
 if __name__ == '__main__':
