@@ -147,7 +147,7 @@ cd SharedMemoryVideoBuffers && make && cd ..
 ln -s SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so .
 ```
 
-`SharedMemoryVideoBuffers/server --nokb &` starts the reference server, used to test the buffer without a camera.
+`SharedMemoryVideoBuffers/server` snapshots every stream to PNM files each time Enter is pressed, to check the buffer by hand; nothing needs it running.
 
 The runtime resolves `libSharedMemoryVideoBuffers.so` against the **repository root** (`loadLibrary` in `mvc/core/shared_memory.py`), so the runners work from any working directory.
 

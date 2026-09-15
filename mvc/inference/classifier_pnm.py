@@ -738,8 +738,8 @@ def generate_heatmap(predictions, confidences, class_id_to_name, class_id_to_col
 
     responses["background_avg_prob"] = bg_prob_sum / bg_count if bg_count > 0 else 0.0
 
-    print(f"{totalActivations}/{num_preds} activations")
-    print("Per-class activations:", activations.tolist())
+    #print(f"{totalActivations}/{num_preds} activations")
+    #print("Per-class activations:", activations.tolist())
     return heatmap.cpu().numpy(), occupancy.cpu().numpy(), responses
 
 
@@ -810,7 +810,7 @@ def process_predictions_erode(predictions, confidences, class_id_to_name, cleanC
     valid_mask = (predicted_classes >= 0) & (predicted_classes < num_classes)
     activated_flat = valid_mask & (predicted_classes != cleanClassID)
     totalActivations = int(activated_flat.sum())
-    print(f"{totalActivations}/{num_preds} activations (before erosion)")
+    #print(f"{totalActivations}/{num_preds} activations (before erosion)")
 
     occupancy = torch.full((tilesH, tilesW), 255, dtype=torch.uint8)
     occupied2d = torch.zeros(expected_tiles, dtype=torch.bool)
@@ -854,8 +854,8 @@ def process_predictions_erode(predictions, confidences, class_id_to_name, cleanC
     else:
         filtered_responses["background_avg_prob"] = 0.0
 
-    print(f"{int(filtered_activations.sum())}/{num_preds} activations (after erosion)")
-    print("Per-class activations:", filtered_activations.tolist())
+    #print(f"{int(filtered_activations.sum())}/{num_preds} activations (after erosion)")
+    #print("Per-class activations:", filtered_activations.tolist())
 
     return occupancy.cpu().numpy(), filtered_responses
 
@@ -1250,7 +1250,7 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
                                              assignBestDefectClass=assignBestDefectClass)
             low_activations += forced
 
-    print(f"Low-confidence tiles reassigned: {low_activations}")
+    #print(f"Low-confidence tiles reassigned: {low_activations}")
 
     # Spatial smoothing (optional) — must happen before optional CPU conversion
     if majorityVote:
@@ -1260,12 +1260,12 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
         predictions_np = majority_vote_2d_pytorch(
             predictions.cpu().numpy(), tilesHorizontally, tilesVertically, window_size=3)
         max_probs_np = max_probs.cpu().numpy().flatten()
-        print(f"classify_tiles done in {time.time() - start:.2f}s, got {predictions_np.size} tiles")
+        #print(f"classify_tiles done in {time.time() - start:.2f}s, got {predictions_np.size} tiles")
         if return_tiles:
             return predictions_np.flatten(), max_probs_np, npTiles
         return predictions_np.flatten(), max_probs_np
 
-    print(f"classify_tiles done in {time.time() - start:.2f}s, got {len(predictions)} tiles")
+    #print(f"classify_tiles done in {time.time() - start:.2f}s, got {len(predictions)} tiles")
 
     if return_torch:
         if return_tiles:
@@ -1302,7 +1302,7 @@ def runSingle(image,
     Full pipeline: read image, classify tiles, and generate heatmap.
     Uses integer IDs internally for performance.
     """
-    print(f"runSingle: image {image.shape}, tile={tile_size}, step={step}, classes={len(classes)} erosion_kernel={erosion_kernel} erosion_threshold={erosion_threshold}")
+    #print(f"runSingle: image {image.shape}, tile={tile_size}, step={step}, classes={len(classes)} erosion_kernel={erosion_kernel} erosion_threshold={erosion_threshold}")
 
     # 1. Read image. Upload as uint8 and let Classifier.build_input_features()
     #    do the /255 on the GPU — same numbers as normalising here, but 4x less
@@ -1328,12 +1328,12 @@ def runSingle(image,
                                               gateMode=gateMode,
                                               assignBestDefectClass=assignBestDefectClass,
                                              )
-    print(bcolors.OKGREEN)
+    #print(bcolors.OKGREEN)
     elapsed = time.time() - start + 1e-4
     hz = 1.0 / elapsed
     tiles_per_sec = len(predictions) / elapsed
-    print("%s / step=%u / inference @ %0.2f Hz  (%d tiles, %.0f tiles/sec)" % (name, step, hz, len(predictions), tiles_per_sec))
-    print(bcolors.ENDC)
+    print(bcolors.OKGREEN + "%s / step=%u / inference @ %0.2f Hz  (%d tiles, %.0f tiles/sec)" % (name, step, hz, len(predictions), tiles_per_sec) + bcolors.ENDC)
+    #print(bcolors.ENDC)
 
     if (log):
       log_performance("perf.csv", name, step, tile_size, majorityVote, maxProbabilityThreshold, len(predictions), hz)
@@ -1789,7 +1789,7 @@ class ClassifierPnm:
         return True
     
     @torch.no_grad()
-    def forward(self, image, majorityVote = False, legend=True, erosion_kernel=0, erosion_threshold=0):
+    def forward(self, image, majorityVote = False, legend=True, erosion_kernel=0, erosion_threshold=0, log=True):
         start      = time.time()    
    
         heatmap, occupancy, responses = runSingle(image, 
@@ -1805,7 +1805,8 @@ class ClassifierPnm:
                                                   assignBestDefectClass=self.assignBestDefectClass,
                                                   erosion_kernel=erosion_kernel,
                                                   erosion_threshold=erosion_threshold,
-                                                  name=self.name)
+                                                  name=self.name,
+                                                  log=log)   # log = append this frame's timing to perf.csv
 
         if legend:
             heatmap = self.add_legend(heatmap)
@@ -1817,7 +1818,7 @@ class ClassifierPnm:
 
     def add_legend(self, heatmap):
         """Overlay a class legend onto the heatmap using OpenCV."""
-        print("Overlaying legend")
+        #print("Overlaying legend")
         overlay = heatmap.copy()
         alpha = 0.7  # transparency
 

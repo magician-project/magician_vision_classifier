@@ -149,8 +149,8 @@ def classify_selected_tiles(name,
                                              assignBestDefectClass=assignBestDefectClass)
             low_activations += forced
 
-    print(f"Low-confidence tiles reassigned: {low_activations}")
-    print(f"classify_selected_tiles ({name}) done in {time.time() - start:.2f}s, on {len(predictions)} selected tiles")
+    #print(f"Low-confidence tiles reassigned: {low_activations}")
+    #print(f"classify_selected_tiles ({name}) done in {time.time() - start:.2f}s, on {len(predictions)} selected tiles")
 
     if return_torch:
         return predictions, max_probs
@@ -522,11 +522,11 @@ class EnsembleClassifierPnm:
         # --- Identify non-clean tiles ---
         non_clean_indices = (base_preds != self.firstCleanClassID).nonzero(as_tuple=True)[0]
         if len(non_clean_indices) == 0:
-            print("All tiles are clean — no ensemble voting needed!")
+            #print("All tiles are clean — no ensemble voting needed!")
             final_predictions = base_preds
             final_confidences = base_confidences
         else:
-            print(f"{len(non_clean_indices)} non-clean tiles for ensemble voting")
+            #print(f"{len(non_clean_indices)} non-clean tiles for ensemble voting")
 
             # --- Step 3: Ensemble inference ---
             # Reuse all_tiles from stage 1 — no second unfold over the full image
@@ -547,7 +547,7 @@ class EnsembleClassifierPnm:
             #     Serial execution of the nets is the fallback especially on low VRAM machines
             #===========================================================================================
             if multimodel:
-                print("Running ensemble via async CUDA streams")
+                #print("Running ensemble via async CUDA streams")
                 outputs = run_models_async([clf.model for clf in self.classifiers], npTiles)
                 # Models may have different class counts — process each separately
                 for o in outputs:
@@ -557,14 +557,14 @@ class EnsembleClassifierPnm:
                     conf_list.append(max_probs)
             elif parallel:
             #===========================================================================================
-                print("Running ensemble via CPU thread pool ( This runs all tiles, not just selected btw ) ")
+                #print("Running ensemble via CPU thread pool ( This runs all tiles, not just selected btw ) ")
                 ensemble_results = parallel_classify_tiles(self.classifiers, rgba_image, self.tile_size, self.step, majorityVote)
                 for preds, confs in ensemble_results:
                      preds_list.append(torch.tensor(preds, device=self.device))
                      conf_list.append(torch.tensor(confs, device=self.device))
             else:
             #===========================================================================================
-                print("Running ensemble serially")
+                #print("Running ensemble serially")
                 for clf in self.classifiers:
                     _t0 = time.time()
                     if (debugExecuteSecondStage):
