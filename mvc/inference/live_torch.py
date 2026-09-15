@@ -1178,7 +1178,6 @@ def bootstrap_shared_memory_library():
     os.system("git clone https://github.com/AmmarkoV/SharedMemoryVideoBuffers")
     os.system("cd SharedMemoryVideoBuffers && make && cd ..")
     os.system("ln -s SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so")
-    os.system("SharedMemoryVideoBuffers/server --nokb&")
 
 
 def parse_arguments(argv=None):

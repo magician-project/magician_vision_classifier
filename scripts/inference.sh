@@ -62,10 +62,7 @@ if [ ! -f libSharedMemoryVideoBuffers.so ]; then
   bash scripts/updateSharedMemoryMechanism.sh
 fi
 
-SERVER_LOG="/tmp/mvc_inference_server.log"
 STREAMER_LOG="/tmp/mvc_inference_streamer.log"
-STARTED_SERVER=0
-SERVER_PID=""
 STREAMER_PID=""
 
 cleanup() {
@@ -73,25 +70,12 @@ cleanup() {
     kill "$STREAMER_PID" 2>/dev/null
     wait "$STREAMER_PID" 2>/dev/null
   fi
-  if [ "$STARTED_SERVER" = "1" ] && [ -n "$SERVER_PID" ]; then
-    kill "$SERVER_PID" 2>/dev/null
-    wait "$SERVER_PID" 2>/dev/null
-  fi
 }
 trap cleanup EXIT INT TERM
 
-# ---- Shared memory server ----
-if pgrep -x server >/dev/null; then
-  echo "Shared memory server already running, reusing it."
-else
-  echo "Starting shared memory server (log: $SERVER_LOG)..."
-  SharedMemoryVideoBuffers/server --nokb >"$SERVER_LOG" 2>&1 &
-  SERVER_PID=$!
-  STARTED_SERVER=1
-  sleep 0.5
-fi
-
 # ---- Stream the dataset into shared memory ----
+# The streamer creates the shared memory context itself: no server process needed
+# (SharedMemoryVideoBuffers/server --nokb would also dump a PNM per stream every 100 ms)
 echo "Streaming $DATASET into shared memory stream 'stream1' (log: $STREAMER_LOG)..."
 python3 -u -m mvc.inference.folder_shared_memory_streamer "$DATASET" --stream stream1 --fps 0 \
   "${STREAMER_ARGS[@]}" >"$STREAMER_LOG" 2>&1 &
