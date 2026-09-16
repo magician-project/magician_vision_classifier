@@ -1233,7 +1233,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--laser-depths", default=None,
                         help="three fixed laser depths 'd1,d2,d3' standing in for the ROS laser topics")
     parser.add_argument("--quiet", action="store_true", help="do not print the per-frame summary")
-    parser.add_argument("--no-perf-log", action="store_true", help="do not append every frame's inference timing to perf.csv")
+    parser.add_argument("--perf-log", action="store_true", help="append every frame's inference timing to perf.csv (off by default -- the file grows unbounded, ~700k lines/day of continuous use, for a per-frame write cost that profiling shows is negligible either way)")
     parser.add_argument("--verbose-detections", action="store_true", help="print every single detection")
     parser.add_argument("--debug", action="store_true", help="print debug-level messages")
     parser.add_argument("--no-keyboard", action="store_true", help="do not put the terminal in cbreak mode")
@@ -1418,7 +1418,7 @@ def main(argv=None):
     else:
         runtime.logger.info("No interactive terminal — running with the command line settings")
 
-    perf_log                 = not args.no_perf_log   # append each frame's inference timing to perf.csv
+    perf_log                 = args.perf_log   # append each frame's inference timing to perf.csv (opt-in)
     last_processed_timestamp = None
     last_pushed_threshold    = None   # only log a gate change, never a per-frame no-op
     _warned_no_ensemble      = False  # log the two-stage fallback once, not every frame

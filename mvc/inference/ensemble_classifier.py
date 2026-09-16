@@ -205,19 +205,55 @@ def majority_vote_final(predictions, confidences, tilesW, tilesH, window_size=3)
     return smooth_preds.flatten().numpy(), smooth_confs.flatten().numpy()
 
 # -------------------------------------------------------------------------------------
+# Fixed batch-size buckets for the ensemble's stage-2 models
+# -------------------------------------------------------------------------------------
+# ClassifierPnm.compile()s every model (classifier_pnm.py), and live_torch.py turns on
+# torch.backends.cudnn.benchmark -- both assume a STABLE input shape and pay a one-off
+# multi-second re-trace/re-autotune cost the first time they see a new one. That's fine
+# for the single-classifier and stage-1 paths, which always batch the full, constant
+# tile grid (e.g. 5950 tiles). It is NOT fine for the stage-2 ensemble members: they only
+# run on the non_clean_indices subset, whose size is scene-dependent and changes on
+# nearly every frame, so nearly every frame paid that one-off cost -- measured at
+# 11-16s/call with a synthetic random-size repro (mirrored in production: 3-6 frames
+# processed in 45-60s instead of a steady ~12-23Hz). Rounding the batch up to the
+# nearest of a handful of fixed sizes below means only ~7 distinct shapes are ever
+# seen (well under torch._dynamo's default recompile_limit of 8), so the compile/
+# autotune cost is paid at most once per bucket instead of once per frame.
+_TILE_BATCH_BUCKETS = (64, 128, 256, 512, 1024, 2048, 4096)
+
+
+def _bucketed_batch_size(n, max_n):
+    """Round n up to the next fixed bucket in _TILE_BATCH_BUCKETS, or max_n if n is
+    larger than every bucket. max_n should be the total tile count available to pad
+    from (the full per-frame tile grid), which is also the shape the stage-1 model
+    already runs at every frame, so its compile/autotune cache is warm too."""
+    for b in _TILE_BATCH_BUCKETS:
+        if n <= b:
+            return min(b, max_n)
+    return max_n
+
+
+# -------------------------------------------------------------------------------------
 # Async multi-model helpers
 # -------------------------------------------------------------------------------------
-def run_models_async(models, x):
+def run_models_async(models, x, streams):
     """
-    Run all models in *models* concurrently on separate CUDA streams.
+    Run all models in *models* concurrently on the given *streams* (one per model).
+
+    *streams* must be persistent torch.cuda.Stream objects created once by the caller
+    (e.g. EnsembleClassifierPnm keeps one per model for its whole lifetime) and reused
+    across calls. Allocating a fresh torch.cuda.Stream() on every frame -- the previous
+    version of this function did -- let per-stream caching-allocator bookkeeping pile up
+    call after call: the per-call Hz timer (wall clock of just this function) stayed
+    fast, but the process as a whole showed multi-second, GPU-idle (0% utilization)
+    stalls between frames -- 6 frames processed in 60s instead of the ~700-1400 a
+    steady ~12-23Hz would give. Reusing the same streams every call removes that growth.
 
     Input *x* is converted to channels_last memory format (zero-copy stride update)
     before fanning out to streams. Uses FP16 autocast. Requires CUDA.
     """
     assert torch.cuda.is_available(), "CUDA required for async inference"
-    device = next(models[0].parameters()).device
-
-    streams = [torch.cuda.Stream(device=device) for _ in models]
+    assert len(streams) == len(models), "run_models_async needs one persistent stream per model"
     results = [None] * len(models)
 
     # Convert input once to channels-last before fanning out to streams.
@@ -230,7 +266,10 @@ def run_models_async(models, x):
             with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 results[i] = model(x)   # read-only input, no clone needed
 
-    torch.cuda.synchronize()
+    # Wait only on the streams this call actually used, not a whole-device
+    # torch.cuda.synchronize() (which also blocks on unrelated queued work).
+    for stream in streams:
+        stream.synchronize()
     return results
 # -------------------------------------------------------------------------------------
 # -------------------------------------------------------------------------------------
@@ -317,6 +356,17 @@ class EnsembleClassifierPnm:
         self.classes      = self._all_classifiers[0].classes
         self.class_colors = self._all_classifiers[0].class_colors
         self.device       = self._all_classifiers[0].device
+
+        # One persistent CUDA stream per ensemble model, created once here and reused by
+        # run_models_async() on every forward() call -- see that function's docstring for
+        # why creating fresh streams per-frame is not just wasteful but actively harmful.
+        # Keyed by name (not list position) so a later apply_min_hz() re-filter can look
+        # streams up for whatever subset is active without recreating anything.
+        self._streams_by_name = {}
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            self._streams_by_name = {
+                clf.name: torch.cuda.Stream(device=self.device) for clf in self._all_classifiers
+            }
 
         # Precompute clean class ID once
         def find_clean_id(cls_list):
@@ -548,7 +598,21 @@ class EnsembleClassifierPnm:
             #===========================================================================================
             if multimodel:
                 #print("Running ensemble via async CUDA streams")
-                outputs = run_models_async([clf.model for clf in self.classifiers], npTiles)
+                # Pad the selected-tile batch up to a fixed bucket size -- see
+                # _bucketed_batch_size()'s docstring for why a raw, scene-dependent
+                # batch size stalls torch.compile/cudnn.benchmark for 11-16s/frame.
+                n_selected = npTiles.shape[0]
+                bucket_n = _bucketed_batch_size(n_selected, all_tiles.shape[0])
+                if bucket_n > n_selected:
+                    pad_tiles = npTiles[:1].repeat(bucket_n - n_selected, 1, 1, 1)
+                    npTiles_batch = torch.cat([npTiles, pad_tiles], dim=0)
+                else:
+                    npTiles_batch = npTiles
+
+                streams = [self._streams_by_name[clf.name] for clf in self.classifiers]
+                outputs = run_models_async([clf.model for clf in self.classifiers], npTiles_batch, streams)
+                # Drop the padding rows before voting -- they were never real tiles.
+                outputs = [o[:n_selected] for o in outputs]
                 # Models may have different class counts — process each separately
                 for o in outputs:
                     probs = torch.nn.functional.softmax(o.float(), dim=1)
@@ -625,11 +689,15 @@ class EnsembleClassifierPnm:
         final_confidences = final_confidences.cpu().numpy()
 
         if (majorityVote):
-           # Compute tile grid dimensions — must match majority_vote_2d_pytorch
-           # which uses (dim - tile_size) // step (no +1), truncating raw unfold output.
+           # Compute tile grid dimensions — must match the unfold-based grid every
+           # other tile count in this pipeline uses (classify_tiles, generate_heatmap):
+           # (dim - tile_size) // step + 1. Omitting the +1 here used to undercount the
+           # grid by one row/column, so majority_vote_final() silently truncated
+           # final_predictions/final_confidences (~154 tiles on a 2048x2448 frame),
+           # dropping real tiles from the ensemble vote every frame.
            height, width, _ = rgba_image.shape
-           tilesW = (width  - self.tile_size) // self.step
-           tilesH = (height - self.tile_size) // self.step
+           tilesW = (width  - self.tile_size) // self.step + 1
+           tilesH = (height - self.tile_size) // self.step + 1
 
            # Apply majority vote smoothing
            final_predictions, final_confidences = majority_vote_final(final_predictions, final_confidences, tilesW, tilesH, window_size=3)

@@ -1123,8 +1123,9 @@ def main():
         i = sys.argv.index("--model-config")
         if i + 1 < len(sys.argv):
             model_config_path = sys.argv[i + 1]
-    # --no-perf-log stops appending every frame's inference timing to perf.csv
-    perf_log = "--no-perf-log" not in sys.argv
+    # --perf-log appends every frame's inference timing to perf.csv (off by default --
+    # the file grows unbounded otherwise)
+    perf_log = "--perf-log" in sys.argv
     preset = load_recommended_configuration(preset_name)
     model_name = preset["model"]
     ros_node.apply_preset(preset)
