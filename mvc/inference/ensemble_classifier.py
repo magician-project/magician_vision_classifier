@@ -727,7 +727,11 @@ class EnsembleClassifierPnm:
         self._last_tile_count = len(final_predictions)
         self._last_elapsed    = elapsed
 
-        self.print_perf()
+        # print_perf() is an on-demand diagnostic, not per-frame output. Calling it here
+        # printed a block every frame -- and since model_perf is only ever filled by the
+        # SERIAL branch, in the default async path that block was the literal line
+        # "[Ensemble] No performance data yet." at 20+ Hz. It also scrolled the live status
+        # line away. The same numbers now reach the status line through infer_stats.
 
         if (log):
           runid="ensemble"

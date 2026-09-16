@@ -1297,7 +1297,8 @@ def runSingle(image,
               erosion_threshold=0,
               name="Model",
               log=True,
-              draw=True):
+              draw=True,
+              stats=None):
     """
     Full pipeline: read image, classify tiles, and generate heatmap.
     Uses integer IDs internally for performance.
@@ -1328,12 +1329,17 @@ def runSingle(image,
                                               gateMode=gateMode,
                                               assignBestDefectClass=assignBestDefectClass,
                                              )
-    #print(bcolors.OKGREEN)
     elapsed = time.time() - start + 1e-4
     hz = 1.0 / elapsed
     tiles_per_sec = len(predictions) / elapsed
-    print(bcolors.OKGREEN + "%s / step=%u / inference @ %0.2f Hz  (%d tiles, %.0f tiles/sec)" % (name, step, hz, len(predictions), tiles_per_sec) + bcolors.ENDC)
-    #print(bcolors.ENDC)
+    # Hand the numbers to the caller when it asked for them, instead of printing a second
+    # line: the live runtime folds these into ONE self-overwriting status line, and a print
+    # here would scroll it away every frame. No sink -> keep the standalone behaviour.
+    if stats is not None:
+        stats.update(name=name, step=step, hz=hz,
+                     tiles=len(predictions), tiles_per_sec=tiles_per_sec)
+    else:
+        print(bcolors.OKGREEN + "%s / step=%u / inference @ %0.2f Hz  (%d tiles, %.0f tiles/sec)" % (name, step, hz, len(predictions), tiles_per_sec) + bcolors.ENDC)
 
     if (log):
       log_performance("perf.csv", name, step, tile_size, majorityVote, maxProbabilityThreshold, len(predictions), hz)
@@ -1830,10 +1836,11 @@ class ClassifierPnm:
         return True
     
     @torch.no_grad()
-    def forward(self, image, majorityVote = False, legend=True, erosion_kernel=0, erosion_threshold=0, log=True):
-        start      = time.time()    
-   
-        heatmap, occupancy, responses = runSingle(image, 
+    def forward(self, image, majorityVote = False, legend=True, erosion_kernel=0, erosion_threshold=0, log=True,
+                stats=None):
+        start      = time.time()
+
+        heatmap, occupancy, responses = runSingle(image,
                                                   self.model,
                                                   self.device,
                                                   self.classes,
@@ -1847,7 +1854,8 @@ class ClassifierPnm:
                                                   erosion_kernel=erosion_kernel,
                                                   erosion_threshold=erosion_threshold,
                                                   name=self.name,
-                                                  log=log)   # log = append this frame's timing to perf.csv
+                                                  log=log,   # log = append this frame's timing to perf.csv
+                                                  stats=stats)
 
         if legend:
             heatmap = self.add_legend(heatmap)

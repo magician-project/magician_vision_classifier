@@ -36,6 +36,7 @@ import sys
 import json
 import time
 import math
+import shutil
 import select
 import argparse
 import threading
@@ -1046,7 +1047,15 @@ class LiveClassifier:
         self._background_probability = 1.0 - float(avg_prob)
         self._background_timestamp   = int(ts)
 
-    def flush_frame(self, ts, tile_size, hz=0.0):
+    @staticmethod
+    def _compact(n):
+        """4588 -> '4.5K'. Keeps the status line inside one terminal row."""
+        n = float(n)
+        if n >= 1000.0:
+            return f"{n / 1000.0:.1f}K"
+        return f"{n:.0f}"
+
+    def flush_frame(self, ts, tile_size, hz=0.0, infer_stats=None):
         """Emit one frame's worth of detections: a console summary + optional JSONL line."""
         detections = self._frame_detections
         markers    = self._frame_markers
@@ -1055,12 +1064,59 @@ class LiveClassifier:
         if not self._quiet:
             per_type = {}
             for d in detections:
-                key = f"{d['type']}/{d['class_name']}"
+                # "PositiveDent/ClassA" -> "Pos/A". Generic (prefix + declassed suffix)
+                # rather than a lookup table, so a newly trained class shortens too.
+                key = f"{d['type'][:3]}/{d['class_name'].replace('Class', '')}"
                 per_type[key] = per_type.get(key, 0) + 1
-            breakdown = " ".join(f"{k}:{v}" for k, v in sorted(per_type.items())) or "-"
-            self.logger.info(
-                f"frame ts={ts} tile={tile_size} detections={len(detections)} [{breakdown}] "
-                f"background_probability={bg:.4f} inference={hz:.1f} Hz")
+            # Busiest classes first, and only the top few: a frame can activate all seven
+            # at once, and the full list alone ran past 150 characters and wrapped, which
+            # cost the colour its whole at-a-glance value.
+            ranked    = sorted(per_type.items(), key=lambda kv: -kv[1])
+            breakdown = " ".join(f"{k}:{v}" for k, v in ranked[:3])
+            if len(ranked) > 3:
+                breakdown += f" +{len(ranked) - 3}"
+            if breakdown:
+                breakdown = " " + breakdown
+            # Colour the whole line by verdict. At ~18 frames/sec this scrolls faster than
+            # anyone can read a count, so the operator needs a signal they can catch
+            # peripherally: solid green means this frame activated nothing, red means it did.
+            # Same raw-ANSI convention runSingle()'s timing line already uses.
+            if detections:
+                colour, verdict = bcolors.FAIL, f"DEFECT x{len(detections)}"
+            else:
+                colour, verdict = bcolors.OKGREEN, "CLEAN"
+
+            st    = infer_stats or {}
+            model = str(st.get("name", "model")).replace(".pth", "")
+            # None means no runtime override, i.e. the model's own calibrated gate is in
+            # force -- worth saying rather than printing a number that is not the one used.
+            thr   = self.get_max_probability_threshold()
+            thr_s = f"{thr:.3f}" if thr is not None else "model"
+            line  = (f"{model} | {verdict} | bg={bg:.3f} | T={thr_s} | "
+                     f"step={st.get('step', 0)} | "
+                     f"@ {st.get('hz', hz):5.2f} Hz | "
+                     f"({self._compact(st.get('tiles', 0))} tiles, "
+                     f"{self._compact(st.get('tiles_per_sec', 0))}tile/s){breakdown}")
+
+            # On a terminal this is ONE line that rewrites itself, so a 19 Hz stream stops
+            # scrolling everything else off screen. "\x1b[K" erases whatever the previous,
+            # possibly longer, frame left to the right of the cursor -- padding to a fixed
+            # width would do the same until the line outgrew a narrow terminal, and a
+            # wrapped line breaks '\r' (it only returns to the start of the last screen row).
+            # Redirected output keeps real newlines -- '\r' would collapse a whole run into
+            # a single unreadable, ungreppable line in the log file.
+            if sys.stdout.isatty():
+                # Truncate to the real terminal width. A busy frame's class breakdown pushes
+                # this past 140 columns, and a line that wraps defeats '\r' entirely -- the
+                # carriage return only rewinds to the start of the last screen row, so the
+                # earlier rows stay and the display scrolls after all. len() is the visible
+                # width here because `line` is assembled without any escape codes.
+                width = shutil.get_terminal_size(fallback=(120, 24)).columns
+                print(f"{colour}{bcolors.BOLD}{line[:width - 1]}{bcolors.ENDC}\x1b[K",
+                      end="\r", flush=True)
+                self._status_line_open = True
+            else:
+                print(f"{colour}{bcolors.BOLD}{line}{bcolors.ENDC}", flush=True)
 
         if self._jsonl_file is not None:
             payload = {
@@ -1081,6 +1137,11 @@ class LiveClassifier:
         self._frame_markers    = []
 
     def close(self):
+        # The status line is left without a newline so the next frame can overwrite it;
+        # close it off or the shutdown messages and the shell prompt land on top of it.
+        if getattr(self, "_status_line_open", False):
+            print(flush=True)
+            self._status_line_open = False
         if self._jsonl_file is not None:
             try:
                 self._jsonl_file.close()
@@ -1501,6 +1562,7 @@ def main(argv=None):
                             "falling back to the single classifier")
                         _warned_no_ensemble = True
 
+                infer_stats = {}   # filled by whichever branch runs; drives the status line
                 if runtime.cascade_enabled() and cascade_classifier is not None:
                     # No per-frame step/threshold push here, unlike the two branches below:
                     # a cascade's whole point is a jointly-tuned set of per-stage step/
@@ -1512,6 +1574,11 @@ def main(argv=None):
                         heatmap, occupancy, responses = cascade_classifier.forward(
                             frame, legend=True, log=perf_log)
                         inference_hz = getattr(cascade_classifier, "hz", 0.0)
+                        infer_stats = {"name": "cascade", "step": cascade_classifier.stages[-1].step,
+                                       "hz": inference_hz,
+                                       "tiles": getattr(cascade_classifier, "_last_tile_count", 0),
+                                       "tiles_per_sec": getattr(cascade_classifier, "_last_tile_count", 0)
+                                                        / max(getattr(cascade_classifier, "_last_elapsed", 1e-4), 1e-4)}
                 elif runtime.two_stage_enabled() and ensemble_classifier is not None:
                     with runtime._model_lock:
                         ensemble_classifier.step = runtime.get_step_size()
@@ -1528,6 +1595,11 @@ def main(argv=None):
                             log=perf_log,
                         )
                         inference_hz = getattr(ensemble_classifier, "hz", 0.0)
+                        infer_stats = {"name": "ensemble", "step": ensemble_classifier.step,
+                                       "hz": inference_hz,
+                                       "tiles": getattr(ensemble_classifier, "_last_tile_count", 0),
+                                       "tiles_per_sec": getattr(ensemble_classifier, "_last_tile_count", 0)
+                                                        / max(getattr(ensemble_classifier, "_last_elapsed", 1e-4), 1e-4)}
                 else:
                     with runtime._model_lock:
                         single_classifier.step = runtime.get_step_size()
@@ -1549,6 +1621,7 @@ def main(argv=None):
                             erosion_kernel=runtime.get_erosion_kernel(),
                             erosion_threshold=runtime.get_min_votes(),
                             log=perf_log,
+                            stats=infer_stats,
                         )
                         inference_hz = single_classifier.hz
 
@@ -1608,7 +1681,7 @@ def main(argv=None):
                 frameTimestamp,
             )
 
-            runtime.flush_frame(frameTimestamp, tile_size, inference_hz)
+            runtime.flush_frame(frameTimestamp, tile_size, inference_hz, infer_stats)
 
             # Visualization
             if runtime.visualization_enabled():
