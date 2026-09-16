@@ -94,8 +94,16 @@ def neighbor_counts(mask, kernel):
     return total
 
 
-def cache_frame(model, dev, rgba, points, step, clean_id):
-    """One inference pass at `step`; returns everything the vote sweep needs, or None."""
+def cache_frame(model, dev, rgba, points, step, clean_id, return_pred=False):
+    """One inference pass at `step`; returns everything the vote sweep needs, or None.
+
+    return_pred=True additionally computes and returns 'pred2d' (per-tile argmax class
+    index) from the same forward pass -- no extra GPU work, just one more reduction --
+    for callers that need the actual predicted class, not just the clean-vs-not mass
+    (e.g. analysis/datasets/mine_hard_tiles.py's false-negative mining, which needs to
+    know WHICH wrong class a tile was predicted as). Default False preserves the exact
+    prior return shape for every existing caller.
+    """
     h, w = rgba.shape[:2]
     xs, ys = grid_origins(w, step), grid_origins(h, step)
     if not len(xs) or not len(ys):
@@ -103,6 +111,7 @@ def cache_frame(model, dev, rgba, points, step, clean_id):
     tiles = tile_and_cast_data_torch(rgba, tile_size=TILE, step=step)
     tiles = tiles.permute(0, 3, 1, 2).contiguous().to(dev)
     mass = np.empty(len(tiles), np.float32)
+    pred = np.empty(len(tiles), np.int64) if return_pred else None
     CH = 2048
     with torch.no_grad():
         for s in range(0, len(tiles), CH):
@@ -112,6 +121,8 @@ def cache_frame(model, dev, rgba, points, step, clean_id):
                 logits = model(chunk)
             prob = torch.softmax(logits.float(), dim=1)
             mass[s:s + len(chunk)] = (1.0 - prob[:, clean_id]).cpu().numpy()
+            if return_pred:
+                pred[s:s + len(chunk)] = prob.argmax(dim=1).cpu().numpy()
     del tiles
     mass2d = mass.reshape(len(ys), len(xs))
 
@@ -130,8 +141,11 @@ def cache_frame(model, dev, rgba, points, step, clean_id):
             continue
         iy, ix = np.where(contains)
         point_cells.append((iy, ix, cls) if len(iy) else (None, None, cls))
-    return {'mass2d': mass2d, 'keep': keep, 'points': point_cells,
-            'tiles_per_frame': mass.size}
+    out = {'mass2d': mass2d, 'keep': keep, 'points': point_cells,
+          'tiles_per_frame': mass.size}
+    if return_pred:
+        out['pred2d'] = pred.reshape(len(ys), len(xs))
+    return out
 
 
 def parse_thresholds(spec):
