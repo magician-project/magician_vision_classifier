@@ -1457,11 +1457,14 @@ def main(argv=None):
                 continue
             last_processed_timestamp = frameTimestamp
 
-            if frame.ndim != 3 or frame.shape[2] != 4:
+            frame_is_raw_mosaic = frame.ndim == 2 or (frame.ndim == 3 and frame.shape[2] == 1)
+            frame_is_demosaiced = frame.ndim == 3 and frame.shape[2] == 4
+            if not (frame_is_raw_mosaic or frame_is_demosaiced):
                 if not _warned_channels:
                     runtime.logger.warning(
-                        f"Frame is {frame.shape}, the classifier expects HxWx4 RGBA tiles — "
-                        f"check the grabber's stream format")
+                        f"Frame is {frame.shape}, expected either a raw single-channel "
+                        f"polarization mosaic (auto-debayered downstream) or an already "
+                        f"HxWx4 RGBA array — check the grabber's stream format")
                     _warned_channels = True
 
             # read_from_shared_memory() already returned a private copy, and nothing below writes to it
