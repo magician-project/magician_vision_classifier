@@ -1425,7 +1425,8 @@ class ClassifierPnm:
                  tile_classes=['class_neg', 'class_pos', 'class_clean','class_unknown'],
                  tile_size=64,
                  step=16,
-                 precache=True):
+                 precache=True,
+                 compile_mode=None):
 
         # ------------------------------
         # Ensure model + config exist
@@ -1455,6 +1456,7 @@ class ClassifierPnm:
             sys.exit(1)
         #--------------------------------------------------------------
         self.step = step
+        self.compile_mode = compile_mode
         self.name = os.path.basename(model_path)
         self.model_path = model_path
         # Tile decision gate -- see gate_tiles(). Driven by an optional "gate"
@@ -1575,7 +1577,46 @@ class ClassifierPnm:
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
         print(f"Optimizing {self.model_path}")
-        model.compile()
+        # channels_last (NHWC) weights let cuDNN/cuBLAS pick the fp16 tensor-core conv
+        # kernels under the autocast in classify_tiles(). Measured on one real polarization
+        # frame (5950 tiles of 4x48x48, RTX 4090 laptop, idle GPU), contiguous -> NHWC:
+        #   resnext50      260.9 -> 132.4 ms  (-49%)      small_cnn      38.6 -> 30.0 ms (-22%)
+        #   resnet18        36.7 ->  29.5 ms  (-20%)      verysmall_cnn  23.1 -> 20.8 ms (-10%)
+        #   convnext_tiny  132.0 -> 126.6 / 84.0 -> 84.7 ms  (noise, both directions)
+        # End to end that is two-stage 20.2 -> 25.2 Hz (the cheap gate AND every ensemble
+        # member get faster), and single-classifier 11.30 -> 11.29 Hz, i.e. unchanged --
+        # that path is pure convnext_tiny, the one architecture this does not move. It is a
+        # memory-LAYOUT change only -- strides, not values, and not the logical channel
+        # order -- so the four polarization planes stay where readPolarPNMToRGBALive put
+        # them. Verified through the full debayer path on real shared-memory frames:
+        # 285,600 tile decisions (6 shipped architectures x 8 live frames) produced ZERO
+        # prediction changes. Confidences move by <=7e-3, which is fp16 accumulation
+        # order, not a layout error -- two runs of the UNCHANGED contiguous build already
+        # differ by ~6e-4 on the CustomCNNs for the same reason.
+        # MUST happen before compile(): converting an already-compiled module trips
+        # inductor's stride guards ("expected size 5==5, stride 1==16 at dim=1").
+        # run_models_async() converts its input to channels_last to match these weights.
+        model = model.to(memory_format=torch.channels_last)
+        # compile_mode is opt-in per model because inductor's autotuning is priced per INPUT
+        # SHAPE. The single classifier batches the whole tile grid, one constant shape
+        # (5950x4x48x48) forever, so autotuning it once buys ~19% on every later frame:
+        #   default 85.9 ms (11.64 Hz, 11 s compile) -> 67.7 ms (14.76 Hz, 30 s compile)
+        #   on ttcnxtiny_convnext_tiny, verified 0/5950 prediction changes on a real frame.
+        # The ensemble members are the opposite case: they run on the non-clean subset, which
+        # _bucketed_batch_size() rounds to one of 7 sizes, so they would pay that compile
+        # SEVEN times per model for a batch that is already small. Hence caller's choice.
+        #
+        # "-no-cudagraphs" is not a hedge, it is faster here (67.7 vs 69.5 ms) and compiles in
+        # half the time, because at this batch the kernels dwarf any launch overhead CUDA
+        # graphs would remove. Plain "max-autotune" ALSO crashes the ensemble outright --
+        # run_models_async() keeps several models' outputs alive across calls and the graphs'
+        # static output buffers get recycled underneath them:
+        #   "RuntimeError: accessing tensor output of CUDAGraphs that has been overwritten
+        #    by a subsequent run".
+        if self.compile_mode:
+            model.compile(mode=self.compile_mode)
+        else:
+            model.compile()
         print(f"Loaded {self.model_path}")
         print("Missing keys:", missing)
         print("Unexpected keys:", unexpected)

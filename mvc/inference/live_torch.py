@@ -1308,9 +1308,13 @@ def main(argv=None):
             runtime.close()
             return 1
 
+        # Only this path gets inductor's autotuner: it runs one constant batch (the whole
+        # tile grid) every frame, so the one-off compile amortises. The ensemble members
+        # deliberately do NOT -- see ClassifierPnm._load_model()'s compile_mode comment.
         single_classifier = ClassifierPnm(
             model_path=os.path.join(PATH, f"{model_name}.pth"),
             cfg_path=os.path.join(PATH, f"{model_name}.json"),
+            compile_mode="max-autotune-no-cudagraphs",
         )
     # The preset's gate wins over the model json's own calibration, since the preset is
     # the deployment decision. Mode too -- a threshold means nothing without its mode.
