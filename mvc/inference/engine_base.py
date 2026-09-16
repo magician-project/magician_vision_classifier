@@ -204,7 +204,7 @@ class EngineClassifier:
         return [], [], []
 
     # ------------------------------------------------------- runtime plumbing
-    def forward(self, image, majorityVote=False, legend=True, erosion_kernel=0, erosion_threshold=0):
+    def forward(self, image, majorityVote=False, legend=True, erosion_kernel=0, erosion_threshold=0, log=True):
         """Runtime entry point, called every frame by live_*.  Returns
         (heatmap, occupancy, responses) with the exact contract the loops
         consume (responses keys: points/classes/classIDs/confidences/
@@ -224,7 +224,8 @@ class EngineClassifier:
                 assignBestDefectClass=self.assignBestDefectClass,
                 erosion_kernel=erosion_kernel,
                 erosion_threshold=erosion_threshold,
-                name=self.name)
+                name=self.name,
+                log=log)   # log = append this frame's timing to perf.csv
         else:
             heatmap, occupancy, responses = self._forward_whole_image(image)
 

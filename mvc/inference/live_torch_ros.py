@@ -1123,6 +1123,8 @@ def main():
         i = sys.argv.index("--model-config")
         if i + 1 < len(sys.argv):
             model_config_path = sys.argv[i + 1]
+    # --no-perf-log stops appending every frame's inference timing to perf.csv
+    perf_log = "--no-perf-log" not in sys.argv
     preset = load_recommended_configuration(preset_name)
     model_name = preset["model"]
     ros_node.apply_preset(preset)
@@ -1250,6 +1252,7 @@ def main():
     last_processed_timestamp = None
     _warned_no_ensemble = False   # log the two-stage fallback once, not every frame
     _warned_no_cascade = False    # log the cascade fallback once, not every frame
+    _warned_no_frame = False      # log a missing frame once per outage, not every 100 ms
 
     try:
         while True:
@@ -1266,16 +1269,20 @@ def main():
 
             # Get image to work on
             if frame is None or smm.frame_size == 0:
-                ros_node.get_logger().warning("Couldn't read frame from Shared Memory")
+                if not _warned_no_frame:
+                    ros_node.get_logger().warning("Couldn't read frame from Shared Memory")
+                    _warned_no_frame = True
                 time.sleep(0.1)
                 continue
+            _warned_no_frame = False   # warn again the next time frames stop
 
             if ros_node.frame_limiter_enabled() and frameTimestamp == last_processed_timestamp:
                 time.sleep(0.001)
                 continue
             last_processed_timestamp = frameTimestamp
 
-            ros_node._last_frame = frame.copy()
+            # read_from_shared_memory() already returned a private copy, and nothing below writes to it
+            ros_node._last_frame = frame
             ros_node._last_frame_timestamp = frameTimestamp
 
             # Marker scanning (runs regardless of inference pause state)
@@ -1311,7 +1318,7 @@ def main():
                     with ros_node._model_lock:
                         tile_size = cascade_classifier.stages[-1].tile_size
                         heatmap, occupancy, responses = cascade_classifier.forward(
-                            frame, legend=True, log=True)
+                            frame, legend=True, log=perf_log)
                 elif ros_node.two_stage_enabled() and ensemble_classifier is not None:
                     with ros_node._model_lock:
                         ensemble_classifier.step = ros_node.get_step_size()
@@ -1325,6 +1332,7 @@ def main():
                             majorityVote=majority_voting,
                             parallel=True,
                             multimodel=True,
+                            log=perf_log,
                         )
                 else:
                     with ros_node._model_lock:
@@ -1344,6 +1352,7 @@ def main():
                             majorityVote=majority_voting,
                             erosion_kernel=ros_node.get_erosion_kernel(),
                             erosion_threshold=ros_node.get_min_votes(),
+                            log=perf_log,
                         )
 
             # Snapshot responses for _save_current_frame sidecar JSON

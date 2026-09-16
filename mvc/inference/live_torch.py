@@ -1178,7 +1178,6 @@ def bootstrap_shared_memory_library():
     os.system("git clone https://github.com/AmmarkoV/SharedMemoryVideoBuffers")
     os.system("cd SharedMemoryVideoBuffers && make && cd ..")
     os.system("ln -s SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so")
-    os.system("SharedMemoryVideoBuffers/server --nokb&")
 
 
 def parse_arguments(argv=None):
@@ -1234,6 +1233,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--laser-depths", default=None,
                         help="three fixed laser depths 'd1,d2,d3' standing in for the ROS laser topics")
     parser.add_argument("--quiet", action="store_true", help="do not print the per-frame summary")
+    parser.add_argument("--no-perf-log", action="store_true", help="do not append every frame's inference timing to perf.csv")
     parser.add_argument("--verbose-detections", action="store_true", help="print every single detection")
     parser.add_argument("--debug", action="store_true", help="print debug-level messages")
     parser.add_argument("--no-keyboard", action="store_true", help="do not put the terminal in cbreak mode")
@@ -1418,11 +1418,13 @@ def main(argv=None):
     else:
         runtime.logger.info("No interactive terminal — running with the command line settings")
 
+    perf_log                 = not args.no_perf_log   # append each frame's inference timing to perf.csv
     last_processed_timestamp = None
     last_pushed_threshold    = None   # only log a gate change, never a per-frame no-op
     _warned_no_ensemble      = False  # log the two-stage fallback once, not every frame
     _warned_no_cascade       = False  # log the cascade fallback once, not every frame
     _warned_channels         = False
+    _warned_no_frame         = False  # log a missing frame once per outage, not every 100 ms
 
     try:
         while True:
@@ -1443,9 +1445,12 @@ def main(argv=None):
 
             # Get image to work on
             if frame is None or smm.frame_size == 0:
-                runtime.logger.warning("Couldn't read frame from Shared Memory")
+                if not _warned_no_frame:
+                    runtime.logger.warning("Couldn't read frame from Shared Memory")
+                    _warned_no_frame = True
                 time.sleep(0.1)
                 continue
+            _warned_no_frame = False   # warn again the next time frames stop
 
             if runtime.frame_limiter_enabled() and frameTimestamp == last_processed_timestamp:
                 time.sleep(0.001)
@@ -1459,7 +1464,8 @@ def main(argv=None):
                         f"check the grabber's stream format")
                     _warned_channels = True
 
-            runtime._last_frame = frame.copy()
+            # read_from_shared_memory() already returned a private copy, and nothing below writes to it
+            runtime._last_frame = frame
             runtime._last_frame_timestamp = frameTimestamp
 
             # Marker scanning (runs regardless of inference pause state)
@@ -1497,7 +1503,7 @@ def main(argv=None):
                     with runtime._model_lock:
                         tile_size = cascade_classifier.stages[-1].tile_size
                         heatmap, occupancy, responses = cascade_classifier.forward(
-                            frame, legend=True, log=True)
+                            frame, legend=True, log=perf_log)
                         inference_hz = getattr(cascade_classifier, "hz", 0.0)
                 elif runtime.two_stage_enabled() and ensemble_classifier is not None:
                     with runtime._model_lock:
@@ -1512,6 +1518,7 @@ def main(argv=None):
                             majorityVote=majority_voting,
                             parallel=True,
                             multimodel=True,
+                            log=perf_log,
                         )
                         inference_hz = getattr(ensemble_classifier, "hz", 0.0)
                 else:
@@ -1534,6 +1541,7 @@ def main(argv=None):
                             majorityVote=majority_voting,
                             erosion_kernel=runtime.get_erosion_kernel(),
                             erosion_threshold=runtime.get_min_votes(),
+                            log=perf_log,
                         )
                         inference_hz = single_classifier.hz
 
