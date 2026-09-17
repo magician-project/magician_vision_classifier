@@ -454,6 +454,7 @@ class LiveClassifier:
         self._erosion_kernel = 1   # neighborhood radius for tile voting: (2k+1)^2 tiles
         self._min_votes = 2        # activated tiles (incl. itself) required in the neighborhood to accept a tile; 0/1 = voting off
         self._majority_voting = True
+        self._majority_window = 3  # odd side of the square tile window majority voting takes the mode over
 
         self._lock = threading.Lock()
 
@@ -552,6 +553,12 @@ class LiveClassifier:
             if args.erosion_kernel is not None:  self._erosion_kernel = max(0, min(5, int(args.erosion_kernel)))
             if args.min_votes is not None:       self._min_votes = max(0, int(args.min_votes))
             if args.majority_voting is not None: self._majority_voting = bool(args.majority_voting)
+            if args.majority_window is not None:
+                if args.majority_window >= 1 and args.majority_window % 2 == 1:
+                    self._majority_window = int(args.majority_window)
+                else:
+                    self.logger.warning(f"--majority-window must be an odd number >= 1 "
+                                        f"(got {args.majority_window}); keeping {self._majority_window}")
             if args.frame_limiter is not None:   self._frame_limiter = bool(args.frame_limiter)
             if args.two_stage is not None:       self._two_stage_enabled = bool(args.two_stage)
             if args.cascade is not None:          self._cascade_enabled = bool(args.cascade)
@@ -684,6 +691,16 @@ class LiveClassifier:
         with self._lock:
             self._majority_voting = bool(enabled)
         self.logger.info("Majority voting ENABLED" if enabled else "Majority voting DISABLED")
+
+    def set_majority_window(self, w):
+        """Set the side of the square tile window majority voting takes the mode over (odd, >=1)."""
+        w = int(w)
+        if w < 1 or w % 2 == 0:
+            self.logger.warning(f"Majority window must be an odd number >= 1 (got {w})")
+            return
+        with self._lock:
+            self._majority_window = w
+        self.logger.info(f"Majority window set to {w}x{w} tiles")
 
     def set_model(self, name):
         """Hot-swap the single classifier model at runtime. Returns (ok, message)."""
@@ -868,6 +885,11 @@ class LiveClassifier:
         """Thread-safe getter for the votes required to accept a tile."""
         with self._lock:
             return self._min_votes
+
+    def get_majority_window(self):
+        """Thread-safe getter for the majority voting window side."""
+        with self._lock:
+            return self._majority_window
 
     def get_target_fps(self):
         """Thread-safe getter for the target FPS limit."""
@@ -1180,6 +1202,7 @@ Keys (the standalone equivalent of the ROS services):
   t / T  gate threshold -/+ 0.01         0      clear threshold override (follow model gate)
   [ / ]  step size -/+ 1                 e / E  erosion kernel -/+ 1
   n / N  min votes -/+ 1                 , / .  target FPS -/+ 1  (0 = unlimited)
+  w / W  majority voting window -/+ 2  (odd, >= 1)
   - / +  visualization window scale -/+ 0.25    =      reset window scale to 1.0
   r      hot-swap to the next model found next to this script  (set_model)
 """
@@ -1418,6 +1441,7 @@ def render_ascii_view(runtime):
     fps   = runtime.get_target_fps()
     knobs = [f"thr={thr_s}", f"step={runtime.get_step_size()}",
              f"erosion={runtime.get_erosion_kernel()}", f"votes={runtime.get_min_votes()}",
+             f"window={runtime.get_majority_window()}",
              f"fps={'unlimited' if fps <= 0.0 else f'{fps:g}'}",
              f"scale={runtime.get_window_scale():.2f}"]
     out += wrap_segments("  knobs   ", [(k, k) for k in knobs], width)
@@ -1473,6 +1497,8 @@ def handle_key(key, runtime, model_names):
         runtime.set_erosion_kernel(runtime.get_erosion_kernel() + (1 if key == "E" else -1))
     elif key in ("n", "N"):
         runtime.set_min_votes(runtime.get_min_votes() + (1 if key == "N" else -1))
+    elif key in ("w", "W"):
+        runtime.set_majority_window(runtime.get_majority_window() + (2 if key == "W" else -2))
     elif key in (",", "."):
         runtime.set_fps(runtime.get_target_fps() + (1.0 if key == "." else -1.0))
     elif key in ("-", "_", "+"):
@@ -1527,6 +1553,8 @@ def parse_arguments(argv=None):
 
     parser.add_argument("--majority-voting", dest="majority_voting", action="store_true", default=None)
     parser.add_argument("--no-majority-voting", dest="majority_voting", action="store_false")
+    parser.add_argument("--majority-window", type=int, default=None,
+                        help="side of the square tile window majority voting uses (odd, >= 1; default 3)")
     parser.add_argument("--frame-limiter", dest="frame_limiter", action="store_true", default=None,
                         help="skip frames whose shared memory timestamp did not change")
     parser.add_argument("--no-frame-limiter", dest="frame_limiter", action="store_false")
@@ -1832,7 +1860,9 @@ def main(argv=None):
                     with runtime._model_lock:
                         tile_size = cascade_classifier.stages[-1].tile_size
                         heatmap, occupancy, responses = cascade_classifier.forward(
-                            frame, legend=True, log=perf_log)
+                            frame, legend=True, log=perf_log,
+                            erosion_kernel=runtime.get_erosion_kernel(),
+                            erosion_threshold=runtime.get_min_votes())
                         inference_hz = getattr(cascade_classifier, "hz", 0.0)
                         infer_stats = {"name": "cascade", "step": cascade_classifier.stages[-1].step,
                                        "hz": inference_hz,
@@ -1853,6 +1883,9 @@ def main(argv=None):
                             parallel=True,
                             multimodel=True,
                             log=perf_log,
+                            erosion_kernel=runtime.get_erosion_kernel(),
+                            erosion_threshold=runtime.get_min_votes(),
+                            majority_window=runtime.get_majority_window(),
                         )
                         inference_hz = getattr(ensemble_classifier, "hz", 0.0)
                         infer_stats = {"name": "ensemble", "step": ensemble_classifier.step,
@@ -1882,6 +1915,7 @@ def main(argv=None):
                             erosion_threshold=runtime.get_min_votes(),
                             log=perf_log,
                             stats=infer_stats,
+                            majority_window=runtime.get_majority_window(),
                         )
                         inference_hz = single_classifier.hz
 

@@ -1177,7 +1177,8 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
                    gateMode=GATE_DEFECT_MASS,
                    assignBestDefectClass=True,
                    return_torch=False,
-                   return_tiles=False):
+                   return_tiles=False,
+                   majority_window=3):
     """
     Classify tiles efficiently, returning integer class IDs.
 
@@ -1194,6 +1195,7 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
     return_tiles : if True, return the tile tensor (N, C, tile_size, tile_size) as
                   a third return value so the caller can reuse it for stage-2 without
                   re-running unfold.
+    majority_window : side of the (odd) square tile window majorityVote takes the mode over.
     """
     start = time.time()
 
@@ -1258,7 +1260,7 @@ def classify_tiles(model, rgba_image, tile_size=64, step=0,
         tilesHorizontally = (w - tile_size) // step + 1
         tilesVertically   = (h - tile_size) // step + 1
         predictions_np = majority_vote_2d_pytorch(
-            predictions.cpu().numpy(), tilesHorizontally, tilesVertically, window_size=3)
+            predictions.cpu().numpy(), tilesHorizontally, tilesVertically, window_size=majority_window)
         max_probs_np = max_probs.cpu().numpy().flatten()
         #print(f"classify_tiles done in {time.time() - start:.2f}s, got {predictions_np.size} tiles")
         if return_tiles:
@@ -1298,7 +1300,8 @@ def runSingle(image,
               name="Model",
               log=True,
               draw=True,
-              stats=None):
+              stats=None,
+              majority_window=3):
     """
     Full pipeline: read image, classify tiles, and generate heatmap.
     Uses integer IDs internally for performance.
@@ -1328,6 +1331,7 @@ def runSingle(image,
                                               forceLowMaxProbToThisClass=cleanClassID,
                                               gateMode=gateMode,
                                               assignBestDefectClass=assignBestDefectClass,
+                                              majority_window=majority_window,
                                              )
     elapsed = time.time() - start + 1e-4
     hz = 1.0 / elapsed
@@ -1355,6 +1359,22 @@ def runSingle(image,
     class_id_to_color = [torch.tensor(c, dtype=torch.uint8) for c in class_colors]
 
 
+    return render_predictions(predictions, confidences, class_id_to_name, class_id_to_color,
+                              cleanClassID, rgba_image, tile_size, step,
+                              erosion_kernel=erosion_kernel,
+                              erosion_threshold=erosion_threshold,
+                              draw=draw)
+
+
+@torch.no_grad()
+def render_predictions(predictions, confidences, class_id_to_name, class_id_to_color,
+                       cleanClassID, rgba_image, tile_size, step,
+                       erosion_kernel=0, erosion_threshold=0, draw=True):
+    """
+    Turn a full tile grid of predictions into (heatmap, occupancy, responses), applying the
+    neighbourhood vote (erosion_kernel/erosion_threshold) when both are non-zero. Shared by
+    runSingle and the ensemble/cascade classifiers so min_votes means the same everywhere.
+    """
     if (erosion_kernel==0) or (erosion_threshold==0):
     # 6. Generate heatmap safely
        heatmapRGBImage, occupancy, responses = generate_heatmap(
@@ -1837,7 +1857,7 @@ class ClassifierPnm:
     
     @torch.no_grad()
     def forward(self, image, majorityVote = False, legend=True, erosion_kernel=0, erosion_threshold=0, log=True,
-                stats=None):
+                stats=None, majority_window=3):
         start      = time.time()
 
         heatmap, occupancy, responses = runSingle(image,
@@ -1855,7 +1875,8 @@ class ClassifierPnm:
                                                   erosion_threshold=erosion_threshold,
                                                   name=self.name,
                                                   log=log,   # log = append this frame's timing to perf.csv
-                                                  stats=stats)
+                                                  stats=stats,
+                                                  majority_window=majority_window)
 
         if legend:
             heatmap = self.add_legend(heatmap)

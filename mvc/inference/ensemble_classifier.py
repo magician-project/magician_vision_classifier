@@ -9,7 +9,7 @@ from mvc.inference.live_torch import (
     readPolarPNMToRGBALive,
     tile_and_cast_data_torch,
     classify_tiles,
-    generate_heatmap,
+    render_predictions,
     runSingle,
     log_performance,
     gate_tiles,
@@ -273,7 +273,8 @@ def run_models_async(models, x, streams):
     return results
 # -------------------------------------------------------------------------------------
 # -------------------------------------------------------------------------------------
-def parallel_classify_tiles(classifiers, rgba_image, tile_size, step, majorityVote=False, max_workers=None):
+def parallel_classify_tiles(classifiers, rgba_image, tile_size, step, majorityVote=False, max_workers=None,
+                            majority_window=3):
     """
     Run classify_tiles() for each model in parallel CPU threads.
 
@@ -291,6 +292,7 @@ def parallel_classify_tiles(classifiers, rgba_image, tile_size, step, majorityVo
                 tile_size=tile_size,
                 step=step,
                 majorityVote=majorityVote,
+                majority_window=majority_window,
             ): i
             for i, clf in enumerate(classifiers)
         }
@@ -506,7 +508,8 @@ class EnsembleClassifierPnm:
 
     # -------------------------------------------------------------------------
     @torch.no_grad()
-    def forward(self, image, majorityVote=False, legend=True, strict=True, parallel=False, multimodel=True , debugExecuteSecondStage=False, log=True):
+    def forward(self, image, majorityVote=False, legend=True, strict=True, parallel=False, multimodel=True , debugExecuteSecondStage=False, log=True,
+                erosion_kernel=0, erosion_threshold=0, majority_window=3):
         """
         Two-stage ensemble inference: prefilter (binary clean/non-clean) then ensemble voting.
 
@@ -517,7 +520,9 @@ class EnsembleClassifierPnm:
              Supports three execution modes: async CUDA streams (multimodel=True, default),
              CPU thread pool (parallel=True), or serial (multimodel=False, parallel=False).
           4. Majority-vote across ensemble predictions and scatter into full-grid output.
-          5. Optionally apply spatial majority-vote smoothing and generate a heatmap.
+          5. Optionally apply spatial majority-vote smoothing (majority_window x majority_window)
+             and generate a heatmap, keeping only tiles that pass the neighbourhood vote
+             (erosion_kernel/erosion_threshold, same rule as ClassifierPnm.forward).
         """
         start = time.time()
 
@@ -549,6 +554,7 @@ class EnsembleClassifierPnm:
                                                           gateMode=self.gateMode,
                                                           assignBestDefectClass=self.assignBestDefectClass,
                                                           return_tiles=True,
+                                                          majority_window=majority_window,
                                                          )
             base_preds       = torch.tensor(base_preds_np, device=self.device, dtype=torch.int32)
             base_confidences = torch.tensor(base_confs_np, device=self.device, dtype=torch.float32)
@@ -622,7 +628,8 @@ class EnsembleClassifierPnm:
             elif parallel:
             #===========================================================================================
                 #print("Running ensemble via CPU thread pool ( This runs all tiles, not just selected btw ) ")
-                ensemble_results = parallel_classify_tiles(self.classifiers, rgba_image, self.tile_size, self.step, majorityVote)
+                ensemble_results = parallel_classify_tiles(self.classifiers, rgba_image, self.tile_size, self.step, majorityVote,
+                                                           majority_window=majority_window)
                 for preds, confs in ensemble_results:
                      preds_list.append(torch.tensor(preds, device=self.device))
                      conf_list.append(torch.tensor(confs, device=self.device))
@@ -643,6 +650,7 @@ class EnsembleClassifierPnm:
                                                      gateMode=self.gateMode,
                                                      assignBestDefectClass=self.assignBestDefectClass,
                                                      return_torch=not majorityVote,
+                                                     majority_window=majority_window,
                                                     )
                        if majorityVote:  # numpy path — wrap back
                            preds = torch.tensor(preds, device=self.device)
@@ -700,7 +708,7 @@ class EnsembleClassifierPnm:
            tilesH = (height - self.tile_size) // self.step + 1
 
            # Apply majority vote smoothing
-           final_predictions, final_confidences = majority_vote_final(final_predictions, final_confidences, tilesW, tilesH, window_size=3)
+           final_predictions, final_confidences = majority_vote_final(final_predictions, final_confidences, tilesW, tilesH, window_size=majority_window)
 
         # final_predictions should now be mostly 'self.cleanClassID' (e.g. 7),
         # with other ensemble class IDs only on non-clean tiles.
@@ -708,15 +716,17 @@ class EnsembleClassifierPnm:
         #global_votes = global_votes.cpu().numpy()  # (optional debugging)
 
         # --- Step 5: Generate heatmap using final voted results ---
-        heatmap, occupancy, responses = generate_heatmap(
+        heatmap, occupancy, responses = render_predictions(
                                                          final_predictions,
                                                          final_confidences,
                                                          self.classes,
                                                          self.class_id_to_color,
                                                          self.cleanClassID,
                                                          rgba_image,  # uint8, no scaling needed
-                                                         tile_size=self.tile_size,
-                                                         step=self.step,
+                                                         self.tile_size,
+                                                         self.step,
+                                                         erosion_kernel=erosion_kernel,
+                                                         erosion_threshold=erosion_threshold,
                                                         )
 
         if legend:
@@ -910,9 +920,11 @@ class CascadeClassifierPnm:
         return (size - tile_size) // step + 1   # matches unfold's window count exactly
 
     @torch.no_grad()
-    def forward(self, image, legend=True, log=True):
+    def forward(self, image, legend=True, log=True, erosion_kernel=0, erosion_threshold=0):
         """One frame through the full chain. Returns (heatmap, occupancy, responses),
         the same triple ClassifierPnm.forward()/EnsembleClassifierPnm.forward() return.
+        erosion_kernel/erosion_threshold apply the neighbourhood vote to the FINAL stage's
+        grid, same rule as ClassifierPnm.forward.
         """
         start = time.time()
 
@@ -984,10 +996,11 @@ class CascadeClassifierPnm:
         final_predictions_np = final_predictions.cpu().numpy()
         final_confidences_np = final_confidences.cpu().numpy()
 
-        heatmap, occupancy, responses = generate_heatmap(
+        heatmap, occupancy, responses = render_predictions(
             final_predictions_np, final_confidences_np, self.classes, self.class_id_to_color,
             self.clean_ids[-1], rgba_image,
-            tile_size=self.stages[-1].tile_size, step=self.stages[-1].step)
+            self.stages[-1].tile_size, self.stages[-1].step,
+            erosion_kernel=erosion_kernel, erosion_threshold=erosion_threshold)
 
         if legend:
             heatmap = self.stages[0].clf.add_legend(heatmap)

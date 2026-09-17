@@ -232,6 +232,7 @@ class DefectPublisher(Node):
         self._erosion_kernel = 1   # neighborhood radius for tile voting: (2k+1)^2 tiles
         self._min_votes = 6        # activated tiles (incl. itself) required in the neighborhood to accept a tile; 0/1 = voting off
         self._majority_voting = True
+        self._majority_window = 3  # odd side of the square tile window majority voting takes the mode over
 
         self._lock = threading.Lock()
 
@@ -297,6 +298,7 @@ class DefectPublisher(Node):
         self.create_service(SetBool,    "magician_vision_classifier/set_frame_limiter", self._set_frame_limiter_cb)
         #self.create_service(SetString,  "magician_vision_classifier/set_model", self._set_model_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_majority_voting", self._set_majority_voting_cb)
+        self.create_service(SetInt64,   "magician_vision_classifier/set_majority_window", self._set_majority_window_cb)
         self.create_service(LocatePattern, "magician_vision_classifier/locate_pattern", self._locate_pattern_cb)
 
         # ------------------------------------------------
@@ -320,6 +322,7 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/set_frame_limiter (SetBool)")
         #self.get_logger().info("  magician_vision_classifier/set_model (SetString)")
         self.get_logger().info("  magician_vision_classifier/set_majority_voting (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/set_majority_window (SetInt64, odd >=1; side of the square tile window majority voting uses)")
         self.get_logger().info("  magician_vision_classifier/locate_pattern (LocatePattern; "
                                "marker-free camera pose vs. a prebuilt map, see "
                                "analysis/extrinsics_from_pattern.py)")
@@ -630,6 +633,20 @@ class DefectPublisher(Node):
         self.get_logger().info(response.message)
         return response
 
+    def _set_majority_window_cb(self, request, response):
+        """Set the side of the square tile window majority voting takes the mode over (odd, >=1)."""
+        w = int(request.data)
+        if w < 1 or w % 2 == 0:
+            response.success = False
+            response.message = f"Majority window must be an odd number >= 1 (got {w})"
+        else:
+            with self._lock:
+                self._majority_window = w
+            response.success = True
+            response.message = f"Majority window set to {w}x{w} tiles"
+        self.get_logger().info(response.message)
+        return response
+
     def _set_model_cb(self, request, response):
         """Service callback to hot-swap the single classifier model at runtime."""
         name = request.data.strip()
@@ -724,6 +741,11 @@ class DefectPublisher(Node):
         """Thread-safe getter for the votes required to accept a tile."""
         with self._lock:
             return self._min_votes
+
+    def get_majority_window(self):
+        """Thread-safe getter for the majority voting window side."""
+        with self._lock:
+            return self._majority_window
 
     def get_target_fps(self):
         """Thread-safe getter for the target FPS limit."""
@@ -1322,7 +1344,9 @@ def main():
                     with ros_node._model_lock:
                         tile_size = cascade_classifier.stages[-1].tile_size
                         heatmap, occupancy, responses = cascade_classifier.forward(
-                            frame, legend=True, log=perf_log)
+                            frame, legend=True, log=perf_log,
+                            erosion_kernel=ros_node.get_erosion_kernel(),
+                            erosion_threshold=ros_node.get_min_votes())
                 elif ros_node.two_stage_enabled() and ensemble_classifier is not None:
                     with ros_node._model_lock:
                         ensemble_classifier.step = ros_node.get_step_size()
@@ -1337,6 +1361,9 @@ def main():
                             parallel=True,
                             multimodel=True,
                             log=perf_log,
+                            erosion_kernel=ros_node.get_erosion_kernel(),
+                            erosion_threshold=ros_node.get_min_votes(),
+                            majority_window=ros_node.get_majority_window(),
                         )
                 else:
                     with ros_node._model_lock:
@@ -1357,6 +1384,7 @@ def main():
                             erosion_kernel=ros_node.get_erosion_kernel(),
                             erosion_threshold=ros_node.get_min_votes(),
                             log=perf_log,
+                            majority_window=ros_node.get_majority_window(),
                         )
 
             # Snapshot responses for _save_current_frame sidecar JSON
