@@ -1,20 +1,52 @@
 {
   "engine": "yongatek",
-  "classes": ["class_clean", "class_bubble", "class_smoke"],
+  "classes": [
+    "class_clean",
+    "class_positive_dent",
+    "class_negative_dent",
+    "class_welding",
+    "class_seal",
+    "class_deformation"
+  ],
   "input": {
     "mode": "whole_image",
     "tile_size": 48,
     "step": 16,
     "resize": null,
-    "_comment_resize": "whole_image mode only: [W, H] fixed input size for designs that need one; null = the model receives the entire frame at full camera resolution"
+    "_comment_resize": "null: the detector letterboxes internally to yongatek.imgsz; tile_size only sets the drawn marker size in whole_image mode"
   },
   "gate": {
-    "mode": "defect_mass",
-    "threshold": 0.655,
+    "mode": "off",
+    "threshold": 0.0,
     "assign_best_defect_class": true
   },
   "yongatek": {
-    "_comment": "Engine-specific settings — weights path, arch params, anything the engine needs. Read from self.cfg in load_model().",
-    "model_weights": "engine/yongatek_weights.pt"
+    "_comment": "YOLO26m detector (ultralytics 8.4.71) on the 4-channel mean intensity image. yolo_class_map: model class id -> entry of 'classes'. publish_classes: classes reported downstream. class_conf: optional per-class confidence cuts overriding conf.",
+    "model_weights": "engine/yongatek_weights.pt",
+    "imgsz": 640,
+    "conf": 0.25,
+    "iou": 0.7,
+    "max_det": 300,
+    "half": true,
+    "yolo_class_map": {
+      "0": "class_positive_dent",
+      "1": "class_negative_dent",
+      "2": "class_welding",
+      "3": "class_seal",
+      "4": "class_deformation"
+    },
+    "publish_classes": [
+      "class_positive_dent",
+      "class_negative_dent",
+      "class_welding",
+      "class_seal",
+      "class_deformation"
+    ],
+    "class_conf": {},
+    "intensity": {
+      "brightness": 0,
+      "contrast": 0
+    },
+    "warmup": true
   }
 }

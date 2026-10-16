@@ -1,129 +1,188 @@
-"""Yongatek engine — template for a third-party classifier design.
+"""Yongatek engine — YOLO26m whole-image defect detector.
 
-This is a RUNNABLE SKELETON: as shipped it runs end-to-end with
-``python3 -m mvc.inference.live_torch --model yongatek``, powered by the tiny
-placeholder network below.  Replace the placeholder with the real design by
-following the numbered comments.
+Runs with ``python3 -m mvc.inference.live_torch --model yongatek`` (or
+live_torch_ros).  The design is a whole-image object detector, not a tile
+classifier:
 
-The plug-in contract lives in ``mvc/inference/engine_base.py`` — in short:
-  * ``build_classifier(cfg_path)`` is the entry point the loader imports.
-  * ``load_model()`` returns a module mapping uint8 (N, 4, tile, tile) tiles to
-    logits (N, num_classes)  [tile input mode].
-  * ``run_whole_image(frame)`` classifies the entire frame and returns
-    (points, classes, confidences)  [whole-image input mode].
-  * The input mode is switched in ``engine/yongatek.json`` under
-    ``"input": {"mode": "tiles" | "whole_image", "tile_size": X, "step": Z}``.
+  1. The polarization frame (HxWx4 RGBA, or a raw single-channel mosaic which
+     is debayered first) is collapsed to a single intensity image — the mean of
+     the four polarization channels, replicated to 3 channels.  This is exactly
+     the preprocessing the training set was generated with
+     (``convert_intensity``: 2x2 mosaic average, +brightness, clamp, uint8).
+  2. A YOLO26m detector (ultralytics, trained at imgsz 640) finds defects.
+  3. Box centres are returned as detection points; the boxes themselves are
+     drawn on the heatmap.
+
+Settings live under the ``"yongatek"`` key of engine/yongatek.json.  Requires
+``ultralytics==8.4.71`` (the version the checkpoint was produced with).
+
+The plug-in contract lives in ``mvc/inference/engine_base.py``.
 """
 
+import os
+import sys
+
 import cv2
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
+# Run as a script (python3 engine/yongatek.py): put the repo root on sys.path so
+# the mvc package resolves.  No-op when imported as engine.yongatek.
+if __name__ == "__main__" and not __package__:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from mvc.core.read_data import readPolarPNMToRGBALive
 from mvc.inference.engine_base import EngineClassifier
+from mvc.paths import repo_root
 
 
-# --------------------------------------------------------------------------
-# STEP 1 (REPLACE ME): the yongatek network itself.
-# --------------------------------------------------------------------------
-# Replace this class with the real yongatek architecture.  Its forward MUST
-# satisfy the tile-model contract: uint8 (N, 4, tile_size, tile_size) in,
-# logits (N, num_classes) out.  classifier_pnm feeds uint8 tiles by design, so
-# dequantise inside forward (x.float() / 255.0) — keep that even when you
-# replace the body.  num_classes and the tile size come from the engine's
-# .json config; read them (and any arch hyperparameters) from the config
-# inside load_model() below, not from hardcoded values.
-# --------------------------------------------------------------------------
-class _YongatekPlaceholder(nn.Module):
-    """Tiny stand-in network so the engine runs before the real design lands.
-    (Two stages + pooling to show where a deeper architecture goes.)"""
-
-    def __init__(self, num_classes, channels=4):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, 8, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool2d(2)
-        self.out = nn.Linear(16, num_classes)
-
-    def forward(self, x):
-        x = x.float() / 255.0
-        x = F.relu(self.conv1(x))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = F.adaptive_avg_pool2d(x, (1, 1)).flatten(1)
-        return self.out(x)
+# Keyword arguments EngineClassifier.forward accepts; anything else the live
+# loops pass (e.g. live_torch's ``stats=``) is handled/dropped by our override.
+_BASE_FORWARD_KWARGS = ("majorityVote", "legend", "erosion_kernel",
+                        "erosion_threshold", "log", "majority_window")
 
 
 class YongatekEngine(EngineClassifier):
-    """Yongatek plug-in.  All runtime plumbing (config loading, tiling,
-    gating, heatmap, responses, live_* interface) is inherited from
-    EngineClassifier — only the two hooks below are yongatek-specific."""
+    """Yongatek plug-in.  Runtime plumbing (config loading, legend, live_*
+    interface) is inherited from EngineClassifier; the detector, the intensity
+    preprocessing and the box drawing are yongatek-specific."""
 
     def load_model(self):
-        """HOOK — implement the real yongatek network here.
+        """Load the YOLO detector and validate its class mapping against the
+        engine config.  Returns the underlying torch module so the base class's
+        ``.to(device)`` / ``.eval()`` calls have something to act on; inference
+        itself goes through ``self.yolo.predict``."""
+        try:
+            from ultralytics import YOLO
+        except ImportError as e:
+            raise ImportError("engine 'yongatek' needs ultralytics: "
+                              "pip install ultralytics==8.4.71") from e
 
-        Instantiate your architecture and load its weights.  Everything this
-        engine needs at build time is in ``self.cfg``; engine-specific settings
-        belong under the ``"yongatek"`` key of engine/yongatek.json, e.g.::
+        cfg = self.cfg.get("yongatek", {})
+        weights = cfg.get("model_weights", "engine/yongatek_weights.pt")
+        if not os.path.isabs(weights):
+            weights = os.path.join(repo_root(), weights)
+        if not os.path.isfile(weights):
+            raise FileNotFoundError(f"[engine:{self.name}] weights not found: {weights}")
 
-            cfg = self.cfg.get("yongatek", {})
-            weights = cfg.get("model_weights")          # e.g. "engine/yongatek_weights.pt"
-            model = _YourRealNetwork(num_classes=len(self.classes), ...)
-            if weights:
-                model.load_state_dict(torch.load(weights, map_location=self.device,
-                                                 weights_only=False))
+        self.imgsz    = int(cfg.get("imgsz", 640))
+        self.conf     = float(cfg.get("conf", 0.25))
+        self.iou      = float(cfg.get("iou", 0.7))
+        self.max_det  = int(cfg.get("max_det", 300))
+        self.half     = bool(cfg.get("half", True)) and self.device == "cuda"
+        self.class_conf = {k: float(v) for k, v in cfg.get("class_conf", {}).items()}
+        intensity_cfg   = cfg.get("intensity", {})
+        self.brightness = float(intensity_cfg.get("brightness", 0))
+        self.contrast   = float(intensity_cfg.get("contrast", 0))
 
-        The returned module MUST map uint8 (N, 4, tile_size, tile_size) to
-        logits (N, len(self.classes)) for tile mode (see STEP 1 above); the
-        base class moves it to self.device and calls .eval() itself.
-        """
-        # TODO(yongatek): replace with the real network + weights (see above).
-        return _YongatekPlaceholder(len(self.classes))
+        self.yolo = YOLO(weights, task="detect")
+
+        # YOLO class id -> engine class name.  Validated up front: publishing a
+        # wrong class name is worse than refusing to start.
+        class_map = {int(k): v for k, v in cfg.get("yolo_class_map", {}).items()}
+        if set(class_map) != set(self.yolo.names):
+            raise ValueError(f"[engine:{self.name}] yolo_class_map ids {sorted(class_map)} "
+                             f"do not match the model's classes {self.yolo.names}")
+        unknown = [v for v in class_map.values() if v not in self.classes]
+        if unknown:
+            raise ValueError(f"[engine:{self.name}] yolo_class_map targets {unknown} "
+                             f"are not in 'classes' {self.classes}")
+        self.class_map = class_map
+
+        publish = cfg.get("publish_classes")
+        self.publish_classes = set(class_map.values() if publish is None else publish)
+
+        # Lowest per-class threshold goes to YOLO; per-class cuts are applied after.
+        self.predict_conf = min([self.conf] + list(self.class_conf.values()))
+        self._last_boxes = []
+
+        if cfg.get("warmup", True):
+            self._predict(np.zeros((1024, 1224, 3), dtype=np.uint8))
+
+        return self.yolo.model
+
+    def forward(self, image, **kwargs):
+        """Runtime entry point.  Wraps EngineClassifier.forward to (a) debayer a
+        raw single-channel mosaic frame to RGBA (the base whole-image path
+        assumes RGBA) and (b) accept live_torch's ``stats=`` dict, which the
+        base signature does not take, and fill it for the status line."""
+        image = readPolarPNMToRGBALive(image)
+        stats = kwargs.pop("stats", None)
+        out = super().forward(image, **{k: v for k, v in kwargs.items()
+                                         if k in _BASE_FORWARD_KWARGS})
+        if stats is not None:
+            stats.update({"name": self.name, "step": self.step, "hz": self.hz,
+                          "tiles": 0, "tiles_per_sec": 0.0})
+        return out
+
+    def _to_intensity(self, rgba):
+        """HxWx4 uint8 RGBA -> HxWx3 uint8 intensity, identical to the training
+        preprocessing (convert_intensity): float mean of the four polarization
+        channels, +10*brightness, clamp, uint8 truncation, replicate to 3ch."""
+        x = torch.from_numpy(rgba).to(self.device, non_blocking=True).float()
+        intensity = (x[:, :, 0] + x[:, :, 1] + x[:, :, 2] + x[:, :, 3]) / 4.0
+        intensity = torch.clamp(intensity + 10 * self.brightness, 0, 255).to(torch.uint8)
+        img = intensity.unsqueeze(-1).repeat(1, 1, 3).cpu().numpy()
+        if self.contrast != 0:
+            # NOTE: must match the adjust_contrast used when the training set was
+            # generated; trained with contrast=0, so this path is off by default.
+            img = cv2.convertScaleAbs(img, alpha=1.0 + self.contrast / 10, beta=0)
+        return img
+
+    def _predict(self, img):
+        return self.yolo.predict(img, imgsz=self.imgsz, conf=self.predict_conf,
+                                 iou=self.iou, max_det=self.max_det, half=self.half,
+                                 device=self.device, verbose=False)[0]
 
     def run_whole_image(self, frame):
-        """HOOK — implement the real yongatek whole-image design here.
+        """Detect defects on the whole frame.  ``frame`` is HxWx4 uint8 RGBA;
+        returns (points, classes, confidences) with points = box centres in the
+        frame's pixel coordinates (the intensity image has the frame's HxW and
+        ultralytics maps boxes back to the input size)."""
+        # Inference runs on the intensity image only: the 4 polarization channels
+        # are averaged into one grey image (see _to_intensity) before YOLO sees it.
+        intensity = self._to_intensity(frame)
+        result = self._predict(intensity)
+        boxes = result.boxes
+        xyxy = boxes.xyxy.cpu().numpy()
+        cls_ids = boxes.cls.cpu().numpy().astype(int)
+        confs = boxes.conf.cpu().numpy()
 
-        Only called when engine/yongatek.json sets ``"input": {"mode":
-        "whole_image"}``.  ``frame`` is the raw numpy HxWx4 uint8 RGBA frame
-        from shared memory (runs under torch.inference_mode()).  Return::
+        points, classes, confidences, kept_boxes = [], [], [], []
+        for (x1, y1, x2, y2), cid, conf in zip(xyxy, cls_ids, confs):
+            name = self.class_map[int(cid)]
+            if name not in self.publish_classes:
+                continue
+            if conf < self.class_conf.get(name, self.conf):
+                continue
+            points.append((int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2))))
+            classes.append(name)
+            confidences.append(float(conf))
+            kept_boxes.append((int(x1), int(y1), int(x2), int(y2)))
+        self._last_boxes = kept_boxes
+        return points, classes, confidences
 
-            (points, classes, confidences)
+    def _forward_whole_image(self, image):
+        """Same contract as EngineClassifier._forward_whole_image, but draws the
+        detection boxes with class/confidence labels instead of centre circles."""
+        with torch.inference_mode():
+            points, classes, confidences = self.run_whole_image(image)
 
-        points      = list of (x, y) pixel coordinates of detection centres,
-        classes     = class-name strings taken from self.classes,
-        confidences = float score per detection, one entry per detection.
+        heatmap = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
+        for (x1, y1, x2, y2), cls, conf in zip(self._last_boxes, classes, confidences):
+            color = self.class_colors[self.classes.index(cls)]
+            cv2.rectangle(heatmap, (x1, y1), (x2, y2), color, 2)
+            label = f"{cls.removeprefix('class_')} {conf:.2f}"
+            cv2.putText(heatmap, label, (x1, max(y1 - 4, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
 
-        Points must be in the ORIGINAL frame's pixel coordinates (the base
-        class draws them on the untouched frame).
-
-        The default below is a working stand-in: it feeds the ENTIRE frame —
-        at full camera resolution — to the model (the placeholder network is
-        fully convolutional, so it accepts any spatial size), and — if the top
-        class is not the clean class — reports a single detection at the frame
-        centre.  If the real design needs a fixed input size, set
-        ``"resize": [W, H]`` under ``"input"`` in engine/yongatek.json (read
-        as ``self.whole_image_resize``).  Replace this with the real design
-        (e.g. a detector or segmenter returning per-defect points/boxes).  For
-        detections you want to suppress, simply omit them from the lists — the
-        gate is a tile-mode concept and does not apply here.
-        """
-        # TODO(yongatek): replace with the real whole-image design (see above).
-        orig_h, orig_w = frame.shape[:2]
-
-        # Optional fixed input size for designs that need one; absent/None
-        # means the model receives the ENTIRE frame at full resolution.
-        if self.whole_image_resize is not None:
-            rw, rh = self.whole_image_resize
-            frame = cv2.resize(frame, (rw, rh), interpolation=cv2.INTER_AREA)
-
-        x = torch.as_tensor(frame, device=self.device, dtype=torch.uint8)
-        x = x.permute(2, 0, 1).unsqueeze(0)
-        probs = F.softmax(self.model(x).float(), dim=1)
-        conf, cls = torch.max(probs, dim=1)
-        cls, conf = int(cls.item()), float(conf.item())
-        if self.classes[cls].lower() in ("class_clean", "clean"):
-            return [], [], []
-        # Detection centre in the ORIGINAL frame's coordinates.
-        return [(orig_w // 2, orig_h // 2)], [self.classes[cls]], [conf]
+        occupancy = np.zeros((1, 1), dtype=np.uint8)
+        responses = {"points": list(points),
+                     "classes": list(classes),
+                     "classIDs": [self.classes.index(c) for c in classes],
+                     "confidences": [float(c) for c in confidences],
+                     "background_avg_prob": 0.0}
+        return heatmap, occupancy, responses
 
 
 def build_classifier(cfg_path):
@@ -131,3 +190,39 @@ def build_classifier(cfg_path):
     by name — KEEP this name and signature.  ``cfg_path`` is the engine's .json
     config (default engine/yongatek.json; override with --model-config)."""
     return YongatekEngine(cfg_path, name="yongatek")
+
+
+if __name__ == "__main__":
+    # Standalone test on a single raw polarization frame:
+    #   python3 engine/yongatek.py [image.pnm] [--config engine/yongatek.json] [--out out.png] [--show]
+    import argparse
+    import time
+
+    parser = argparse.ArgumentParser(description="Run the yongatek engine on one frame")
+    parser.add_argument("image", nargs="?",
+                        default="/home/cvteam/workplace/magician/magician_grabber/"
+                                "day3_neg_dent_6_1/colorFrame_0_00179.pnm",
+                        help="raw polarization mosaic (.pnm) or HxWx4 RGBA image")
+    parser.add_argument("--config", default=os.path.join(repo_root(), "engine", "yongatek.json"))
+    parser.add_argument("--out", default="yongatek_result.png", help="where to save the drawn result")
+    parser.add_argument("--show", action="store_true", help="also open an OpenCV window")
+    args = parser.parse_args()
+
+    frame = cv2.imread(args.image, cv2.IMREAD_UNCHANGED)
+    if frame is None:
+        sys.exit(f"Could not read image: {args.image}")
+
+    engine = build_classifier(args.config)
+    start = time.time()
+    heatmap, _, responses = engine.forward(frame, log=False)
+    print(f"inference {1000 * (time.time() - start):.1f} ms, {len(responses['points'])} detection(s)")
+    for (x, y), cls, conf, box in zip(responses["points"], responses["classes"],
+                                      responses["confidences"], engine._last_boxes):
+        print(f"  {cls:22s} conf={conf:.3f} centre=({x}, {y}) box={box}")
+
+    cv2.imwrite(args.out, heatmap)
+    print(f"saved {args.out}")
+    if args.show:
+        cv2.imshow("yongatek", heatmap)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
