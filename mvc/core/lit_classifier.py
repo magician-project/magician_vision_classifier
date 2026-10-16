@@ -8,6 +8,8 @@ Note for deployment: classifierPnm.py / liveClassifierTorch.py import Classifier
 its constructor signature is a public interface, not an internal detail.
 """
 
+import math
+
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -104,6 +106,12 @@ class Classifier(pl.LightningModule):
                       RangePolarization=False,
                       load_checkpoint=None,
                       penalize_false_clean=0.0,
+                      penalize_false_defect=0.0,
+                      rank_loss_weight=0.0,
+                      rank_hard_fraction=0.2,
+                      distill_teacher=None,
+                      distill_weight=0.0,
+                      distill_temperature=2.0,
                       base_channels=32,
                       final_dense_layer=512,
                       clean_class=0,
@@ -114,6 +122,7 @@ class Classifier(pl.LightningModule):
                       channel_jitter=0.0,
                       monochrome=False,
                       polar_rot=False,
+                      scale_jitter=0.0,
                       frozen_body_start_epochs=0,
                       frozen_body_end_epochs=0,
                       custom_early_convs=0,
@@ -123,7 +132,20 @@ class Classifier(pl.LightningModule):
                       custom_wavelet_stem=0,
                       pretrained=True,
                       seed_pretrained_stem=True,
-                      timm_stem_stride=None
+                      timm_stem_stride=None,
+                      hier_d=128,
+                      hier_n=2,
+                      hier_m=2,
+                      hier_tokens=8,
+                      hier_heads=1,
+                      hier_type_residual=False,
+                      hier_sev_weight=None,
+                      hier_hybrid=False,
+                      hier_aux_weight=1.0,
+                      hier_detach_branches=False,
+                      hier_sev_per_type=False,
+                      timm_pad_downsample=False,
+                      class_names=None
                  ):
         super(Classifier, self).__init__()
         # Persist every constructor argument into the checkpoint, so a model can be
@@ -151,6 +173,32 @@ class Classifier(pl.LightningModule):
         #-----------------------------------------
         self.clean_class  = clean_class
         self.penalize_false_clean = penalize_false_clean
+        self.penalize_false_defect = float(penalize_false_defect)
+        # Hard-negative ranking loss on the detection score (2026-10-08, kbach) -- see rank_loss().
+        # 0 (default) adds nothing.
+        if not 0.0 < float(rank_hard_fraction) <= 1.0:
+            raise ValueError(f'rank_hard_fraction={rank_hard_fraction} must be in (0, 1]')
+        self.rank_loss_weight = float(rank_loss_weight)
+        self.rank_hard_fraction = float(rank_hard_fraction)
+        # Knowledge distillation from a trained teacher checkpoint (2026-10-12, kbach) -- see
+        # distill_loss(). Motivation: plain convnext_tiny beats the pico hybrid on both factory
+        # miss@FA and coverage (3 paired seeds) at 3.3x the FLOPs; this tries to move some of that
+        # into the pico-sized student, which still ships alone. TRAINING ONLY: the teacher is
+        # loaded lazily on the first training step and kept OUT of the module tree (a plain list),
+        # so it is not in the state dict, not optimised, and load_for_eval() never touches it --
+        # the checkpoint is an ordinary student checkpoint. 0 (default) adds nothing.
+        # distill_teacher may also be a LIST of checkpoints (2026-10-13): their temperature-softened
+        # distributions are averaged into one target. The 3-seed convnext_tiny average beat every
+        # single tiny on factory (5.02 vs 6.53 miss@FA5) and coverage (81.37 vs 78.54) with no
+        # training (scripts/kbach_teacher_ensemble.py). A single path behaves exactly as before.
+        if float(distill_weight) > 0.0 and not distill_teacher:
+            raise ValueError('distill_weight > 0 needs distill_teacher (a .ckpt path or a list of them)')
+        if float(distill_temperature) <= 0.0:
+            raise ValueError(f'distill_temperature={distill_temperature} must be > 0')
+        self.distill_teacher = distill_teacher
+        self.distill_weight = float(distill_weight)
+        self.distill_temperature = float(distill_temperature)
+        self._teacher = []
         #-----------------------------------------
         self.noise_std  = noise_std
         self.noise_clip = noise_clip
@@ -158,6 +206,7 @@ class Classifier(pl.LightningModule):
         self.polar_flip  = polar_flip    # physics-consistent mirror augmentation
         self.channel_jitter = channel_jitter  # strobe-light-emulating per-channel jitter
         self.polar_rot = polar_rot       # physics-consistent +/-90deg rotations (0<->90, 45<->135 swap)
+        self.scale_jitter = float(scale_jitter)  # mild zoom-in scale jitter (polarization.augment_train_batch)
         # Freeze the pretrained backbone body for the first / last N epochs so a
         # freshly-initialized stem or head can align before the body co-adapts
         # (and for a clean head-only fine-tune at the end). 0 = never freeze.
@@ -174,6 +223,54 @@ class Classifier(pl.LightningModule):
         # Re-stride a timm patchify stem so the body sees a larger map (see
         # ModelZoo.retune_timm_stem_stride). None = leave the architecture alone.
         self.timm_stem_stride = timm_stem_stride
+        # Zero-pad odd inputs of 2x2/s2 downsamples (ModelZoo.pad_odd_downsamples, 2026-10-08):
+        # at 48px stage 3 otherwise sees only 4 of stage 2's 9 positions. No parameters.
+        self.timm_pad_downsample = bool(timm_pad_downsample)
+        # hier_* models (ModelZoo.HierConvNeXt): head widths, and the class list they
+        # factorise into type x severity. Saved with the other hparams, so a checkpoint
+        # rebuilds the same head without the caller having to supply the classes again.
+        self.hier_d, self.hier_n, self.hier_m = int(hier_d), int(hier_n), int(hier_m)
+        self.hier_tokens = int(hier_tokens)
+        self.hier_heads = int(hier_heads)
+        self.hier_type_residual = bool(hier_type_residual)
+        # Split loss for hier_* models (2026-10-05, kbach). None = the flat focal loss every
+        # model uses (unchanged). A float lambda replaces it, for TRAINING only, with
+        #     focal(P(type)) + lambda * CE(P(sev | type))   [CE term on graded tiles only]
+        # Under the flat focal loss a dent with the right type but an unsure grade has a
+        # low P(type, sev), so it is up-weighted as a "hard" example and its severity
+        # gradient pulls on the shared layers and the body -- yet a grade can never move
+        # defect_mass (clean is ungraded). lambda < 1 turns that pull down. Validation
+        # loss, the gate and inference are untouched.
+        if hier_sev_weight is not None and not str(model).startswith('hier_'):
+            raise ValueError(f"hier_sev_weight={hier_sev_weight} is set but model "
+                             f"'{model}' has no type/severity factorisation")
+        self.hier_sev_weight = None if hier_sev_weight is None else float(hier_sev_weight)
+        # Hybrid head (2026-10-06, kbach; ModelZoo.HierConvNeXt): P(clean) from a flat head,
+        # the defect split from the type/severity branches. Training loss:
+        #     focal(flat head, y) + hier_aux_weight * focal(hier output, y)
+        # (+ penalize_false_clean on the combined P(clean), which IS the flat head's).
+        # hier_aux_weight is inert unless hier_hybrid is on.
+        if hier_hybrid and not str(model).startswith('hier_'):
+            raise ValueError(f"hier_hybrid is set but model '{model}' has no "
+                             f"type/severity branches")
+        if hier_hybrid and hier_sev_weight is not None:
+            raise ValueError("hier_hybrid and hier_sev_weight are separate training losses; "
+                             "set one of them")
+        self.hier_hybrid = bool(hier_hybrid)
+        self.hier_aux_weight = float(hier_aux_weight)
+        # Gradient-isolated branches (2026-10-06): with hier_hybrid, the branches train on a
+        # detached pooled vector, so detection (body + flat head) is trained exactly like
+        # convnext_pico and the hierarchy only adds grading. Training-only: outputs are
+        # identical with or without it.
+        if hier_detach_branches and not hier_hybrid:
+            raise ValueError("hier_detach_branches needs hier_hybrid")
+        self.hier_detach_branches = bool(hier_detach_branches)
+        # Per-type grade logits (ModelZoo._HierHead, 2026-10-12): makes P(grade | type) actually
+        # depend on the type. hier_* models only; default off rebuilds the shared-grade head.
+        if hier_sev_per_type and not str(model).startswith('hier_'):
+            raise ValueError("hier_sev_per_type needs a hier_* model")
+        self.hier_sev_per_type = bool(hier_sev_per_type)
+        self.class_names = list(class_names) if class_names is not None else None
         self.frozen_body_start_epochs = int(frozen_body_start_epochs)
         self.frozen_body_end_epochs   = int(frozen_body_end_epochs)
         self._body_frozen_state = None   # cache to avoid redundant requires_grad churn
@@ -206,6 +303,7 @@ class Classifier(pl.LightningModule):
                                    pretrained=self.pretrained,
                                    seed_pretrained_stem=self.seed_pretrained_stem,
                                    timm_stem_stride=self.timm_stem_stride,
+                                   timm_pad_downsample=self.timm_pad_downsample,
                                    tile_size=tile_size,
                                    dropout_rate=dropout_rate,
                                    base_channels=self.base_channels,
@@ -215,6 +313,16 @@ class Classifier(pl.LightningModule):
                                    custom_res_blocks=getattr(self, 'custom_res_blocks', None),
                                    custom_wavelet_pools=getattr(self, 'custom_wavelet_pools', None),
                                    custom_wavelet_stem=getattr(self, 'custom_wavelet_stem', 0),
+                                   hier_d=self.hier_d,
+                                   hier_n=self.hier_n,
+                                   hier_m=self.hier_m,
+                                   hier_tokens=self.hier_tokens,
+                                   hier_heads=self.hier_heads,
+                                   hier_type_residual=self.hier_type_residual,
+                                   hier_hybrid=self.hier_hybrid,
+                                   hier_detach_branches=self.hier_detach_branches,
+                                   hier_sev_per_type=self.hier_sev_per_type,
+                                   class_names=self.class_names,
                                   )
 
         if load_checkpoint is not None:
@@ -255,6 +363,7 @@ class Classifier(pl.LightningModule):
             gain_jitter=self.gain_jitter,
             polar_flip=self.polar_flip,
             polar_rot=self.polar_rot,
+            scale_jitter=self.scale_jitter,
             channel_jitter=self.channel_jitter,
         )
 
@@ -305,10 +414,21 @@ class Classifier(pl.LightningModule):
 
         x = self.augment_train_batch(x)
         x = self.add_input_noise(x)
+        x_in = x                     # what the teacher sees: same augmented tile, its own features
         x = self.build_input_features(x)
 
-        y_hat = self.model(x)
-        base_loss  = self.criterion(y_hat, y)
+        if self.hier_hybrid:
+            y_hat, flat_logits, hier = self.model.hybrid_parts(x)
+            flat_loss = self.criterion(flat_logits, y)
+            hier_loss = self.criterion(hier, y)
+            self.log('train_flat_loss', flat_loss)
+            self.log('train_hier_loss', hier_loss)
+            base_loss = flat_loss + self.hier_aux_weight * hier_loss
+        elif self.hier_sev_weight is None:
+            y_hat = self.model(x)
+            base_loss  = self.criterion(y_hat, y)
+        else:
+            y_hat, base_loss = self.hier_split_loss(x, y)
 
         if self.penalize_false_clean > 0.0:
             pred_probs = F.softmax(y_hat, dim=1)
@@ -324,8 +444,128 @@ class Classifier(pl.LightningModule):
         else:
             loss = base_loss
 
+        # The mirror of penalize_false_clean (2026-10-06, kbach): -log P(clean) on CLEAN
+        # tiles, i.e. a clean tile scored as a defect -- the false alarm the KPI's fixed-FA
+        # operating point charges for. Mean over the batch's clean tiles, like the term above
+        # over its defects, so the two are on the same footing whatever the class mix.
+        # 0 (default) leaves the loss exactly as before.
+        if self.penalize_false_defect > 0.0:
+            clean_mask = (y == self.clean_class)
+            if clean_mask.any():
+                log_p_clean = F.log_softmax(y_hat.float(), dim=1)[clean_mask, self.clean_class]
+                false_defect_loss = -log_p_clean.mean()
+                self.log('train_false_defect_loss', false_defect_loss)
+                loss = loss + float(self.penalize_false_defect) * false_defect_loss
+
+        if self.rank_loss_weight > 0.0:
+            rl = self.rank_loss(y_hat, y)
+            if rl is not None:
+                self.log('train_rank_loss', rl)
+                loss = loss + self.rank_loss_weight * rl
+
+        if self.distill_weight > 0.0:
+            with torch.no_grad():
+                t_logits = [t(x_in) for t in self._get_teachers()]
+            kd = self.distill_loss(y_hat, t_logits)
+            self.log('train_distill_loss', kd)
+            loss = loss + self.distill_weight * kd
+
         self.log('train_loss', loss, prog_bar=True)
         return loss
+
+    def _teacher_paths(self):
+        t = self.distill_teacher
+        return [t] if isinstance(t, str) else list(t)
+
+    def _get_teachers(self):
+        """The frozen teacher(s), loaded on first use onto this module's device (see __init__)."""
+        if not self._teacher:
+            for path in self._teacher_paths():
+                t = Classifier.load_for_eval(path, map_location=self.device)
+                if t.num_classes != self.num_classes or t.clean_class != self.clean_class:
+                    raise ValueError(f'teacher {path} has num_classes={t.num_classes}, '
+                                     f'clean_class={t.clean_class}; student has {self.num_classes}, '
+                                     f'{self.clean_class} -- the class spaces must match')
+                if t.class_names and self.class_names and list(t.class_names) != list(self.class_names):
+                    raise ValueError(f'teacher {path} and student class lists differ')
+                for p in t.parameters():
+                    p.requires_grad_(False)
+                self._teacher.append(t.to(self.device).eval())
+                print(f'[distill] teacher {path} ({t.type})')
+            print(f'[distill] {len(self._teacher)} teacher(s), weight {self.distill_weight:g}, '
+                  f'T {self.distill_temperature:g}')
+        return self._teacher
+
+    def _get_teacher(self):
+        """The first teacher (single-teacher callers)."""
+        return self._get_teachers()[0]
+
+    def distill_loss(self, student_logits, teacher_logits):
+        """T^2 * KL(softmax(teacher / T) || softmax(student / T)), mean over the batch (Hinton
+        et al.). Works on logits or log-probs alike (softmax is shift-invariant), so the hybrid's
+        combined log-probs -- whose P(clean) is the flat head's -- are matched directly. The T^2
+        keeps the gradient scale independent of T. Gradient reaches the student only.
+
+        `teacher_logits` may be a list (one tensor per teacher): the target is then the MEAN of
+        the teachers' softened distributions, log(mean_k softmax(t_k / T)), computed in log space.
+        With one teacher that is exactly log_softmax(t / T)."""
+        T = self.distill_temperature
+        log_s = F.log_softmax(student_logits.float() / T, dim=1)
+        ts = teacher_logits if isinstance(teacher_logits, (list, tuple)) else [teacher_logits]
+        log_t = torch.logsumexp(torch.stack([F.log_softmax(t.detach().float() / T, dim=1) for t in ts]),
+                                dim=0) - math.log(len(ts))
+        return (T * T) * F.kl_div(log_s, log_t, log_target=True, reduction='batchmean')
+
+    def rank_loss(self, y_hat, y):
+        """Hard-negative pairwise ranking loss on the detection score (2026-10-08, kbach).
+
+        miss@FA reads only the hardest clean tiles (the top few % of clean defect-scores set the
+        threshold) and the defects scored below them; the per-tile losses spend most of their
+        gradient on tiles that are already right. This targets that region directly:
+
+            s       = log P(defect) - log P(clean)      (log-odds; the gate's 1 - P(clean))
+            H       = the top rank_hard_fraction of the batch's CLEAN tiles by s (hardest)
+            loss    = mean over (defect d, hard clean c) of softplus(s_c - s_d)
+
+        a partial-AUC surrogate over the low-false-alarm region. It is shift-invariant in s --
+        moving every score together changes nothing -- so it reorders without recalibrating
+        P(clean); calibration stays with the focal loss. Works on raw logits and on the hybrid's
+        log-probabilities alike (log_softmax is idempotent on those). None if the batch lacks
+        either clean or defect tiles.
+        """
+        lp = F.log_softmax(y_hat.float(), dim=1)
+        clean = int(self.clean_class)
+        others = [i for i in range(lp.shape[1]) if i != clean]
+        s = torch.logsumexp(lp[:, others], dim=1) - lp[:, clean]
+        is_clean = (y == clean)
+        if not is_clean.any() or is_clean.all():
+            return None
+        sc, sd = s[is_clean], s[~is_clean]
+        k = max(1, int(math.ceil(self.rank_hard_fraction * sc.numel())))
+        hard = torch.topk(sc, k).values
+        return F.softplus(hard[None, :] - sd[:, None]).mean()
+
+    def hier_split_loss(self, x, y):
+        """(flat logits, focal(type) + hier_sev_weight * CE(sev | type)) for a hier_* model.
+
+        Both terms are means over the WHOLE batch (the severity sum is divided by the
+        batch size, not the graded count), so at lambda = 1 with gamma = 0 this equals the
+        flat cross-entropy exactly: -log P(type, sev) = -log P(type) - graded*log P(sev|type).
+        The focusing factor (1 - p)^gamma uses P(type), so an unsure grade no longer makes
+        a correctly-typed tile look hard. gamma follows the configured loss (2 for focal,
+        0 for cross_entropy).
+        """
+        log_type, log_sev = self.model.log_parts(x)
+        net = self.model
+        y_hat = log_type[:, net.type_idx] + net.graded * log_sev
+        gamma = float(getattr(self.criterion, 'gamma', 0.0))
+        lt = log_type.gather(1, net.type_idx[y].unsqueeze(1)).squeeze(1)       # log P(type(y))
+        type_loss = ((1.0 - lt.exp()) ** gamma * -lt).mean()
+        ls = log_sev.gather(1, y.unsqueeze(1)).squeeze(1)                      # log P(sev(y)|type(y))
+        sev_loss = -(net.graded[y] * ls).sum() / y.shape[0]
+        self.log('train_type_loss', type_loss)
+        self.log('train_sev_loss', sev_loss)
+        return y_hat, type_loss + self.hier_sev_weight * sev_loss
 
     def validation_step(self, batch, _batch_idx):
         """
@@ -492,11 +732,15 @@ class Classifier(pl.LightningModule):
         'MaxPolarization', 'MinPolarization', 'RangePolarization',
         'base_channels', 'final_dense_layer',
         'noise_std', 'noise_clip',
-        'gain_jitter', 'polar_flip', 'channel_jitter', 'monochrome', 'polar_rot',
+        'gain_jitter', 'polar_flip', 'channel_jitter', 'monochrome', 'polar_rot', 'scale_jitter',
         'frozen_body_start_epochs', 'frozen_body_end_epochs',
         'custom_early_convs', 'custom_channels', 'custom_res_blocks',
         'custom_wavelet_pools', 'custom_wavelet_stem',
         'pretrained', 'seed_pretrained_stem', 'timm_stem_stride',
+        'hier_d', 'hier_n', 'hier_m', 'hier_tokens', 'hier_heads', 'hier_type_residual',
+        'hier_sev_weight', 'hier_hybrid', 'hier_aux_weight', 'hier_detach_branches',
+        'hier_sev_per_type',
+        'timm_pad_downsample',
     )
     # Historical spellings that must keep working; first match wins.
     _HPARAM_ALIASES = {'Unpolarized': ('Unpolarized', 'unpolarized')}
@@ -545,6 +789,12 @@ class Classifier(pl.LightningModule):
         # Top-level config keys, matching the trainer.
         kwargs['model'] = cfg['model']
         kwargs['penalize_false_clean'] = float(cfg.get('penalize_false_clean', 0.0))
+        kwargs['penalize_false_defect'] = float(cfg.get('penalize_false_defect', 0.0))
+        kwargs['rank_loss_weight'] = float(cfg.get('rank_loss_weight', 0.0))
+        kwargs['rank_hard_fraction'] = float(cfg.get('rank_hard_fraction', 0.2))
+        kwargs['distill_teacher'] = cfg.get('distill_teacher') or None
+        kwargs['distill_weight'] = float(cfg.get('distill_weight', 0.0))
+        kwargs['distill_temperature'] = float(cfg.get('distill_temperature', 2.0))
         kwargs['num_classes'] = num_classes
         kwargs['clean_class'] = clean_class
         kwargs['lr'] = (lr if lr is not None
@@ -556,12 +806,27 @@ class Classifier(pl.LightningModule):
                   'RangePolarization', 'polar_flip', 'monochrome', 'polar_rot',
                   'pretrained', 'seed_pretrained_stem'):
             kwargs[k] = bool(kwargs[k])
-        for k in ('gain_jitter', 'channel_jitter'):
+        for k in ('gain_jitter', 'channel_jitter', 'scale_jitter'):
             kwargs[k] = float(kwargs[k])
         for k in ('frozen_body_start_epochs', 'frozen_body_end_epochs',
                   'custom_early_convs'):
             kwargs[k] = int(kwargs[k])
         kwargs['custom_wavelet_stem'] = int(kwargs['custom_wavelet_stem'] or 0)
+        for k in ('hier_d', 'hier_n', 'hier_m', 'hier_tokens', 'hier_heads'):
+            kwargs[k] = int(kwargs[k])
+        kwargs['hier_type_residual'] = bool(kwargs['hier_type_residual'])
+        if kwargs['hier_sev_weight'] is not None:
+            kwargs['hier_sev_weight'] = float(kwargs['hier_sev_weight'])
+        kwargs['hier_hybrid'] = bool(kwargs['hier_hybrid'])
+        kwargs['hier_aux_weight'] = float(kwargs['hier_aux_weight'])
+        kwargs['hier_detach_branches'] = bool(kwargs['hier_detach_branches'])
+        kwargs['hier_sev_per_type'] = bool(kwargs['hier_sev_per_type'])
+        kwargs['timm_pad_downsample'] = bool(kwargs['timm_pad_downsample'])
+        # A hier_* model needs the flat class list. Callers that hold the resolved label
+        # space pass it as class_names=; otherwise fall back to the `classes` the trainer
+        # wrote back into a finished run's config. Other models are left byte-identical.
+        if str(cfg['model']).startswith('hier_') and cfg.get('classes'):
+            kwargs['class_names'] = list(cfg['classes'])
 
         kwargs.update(overrides)
         return kwargs

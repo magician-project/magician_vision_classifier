@@ -11,6 +11,76 @@ change is explained here — an undocumented transition should be treated as rea
 | `259fc61ae980` | campaign start | baseline for all 49-model map runs 1–24 | — |
 | `61a0a9ff1407` | 2026-08-18 08:25 | **export-only.** The trainer's inline `zip -r … check=False` archive block replaced by a call to `export_models.export_run()`. | **No.** |
 | `bdf296e227da` | 2026-08-19 05:30 | **refactor, behaviour-preserving.** The eleven hand-written config→kwargs blocks collapsed into `Classifier.from_config()`. | **No — proven, see below.** |
+| `0866656c6862` | 2026-10-05 | **opt-in knobs.** `hier_heads` / `hier_type_residual` added to `HierConvNeXt`'s head (kbach). Defaults (1 / false) rebuild the previous head exactly. | **No** for every existing config and checkpoint — see below. |
+| `6c7e9a7f164e` | 2026-10-05 | **opt-in loss.** `hier_sev_weight` (hier_* only): training loss `focal(P(type)) + λ·CE(P(sev\|type))` instead of focal on the flat logits. `HierConvNeXt.forward` refactored onto a new `log_parts()`. | **No** unless a config sets `hier_sev_weight` — default `null` keeps the flat focal loss; forward output unchanged (asserted). |
+| `d154bf417dc9` | 2026-10-06 | **opt-in head.** `hier_hybrid` / `hier_aux_weight` (hier_* only): a flat Linear 512→C head sets P(clean); the type/severity branches split the defect mass. `_HierHead.forward` split into pooling + `_branches`; `HierConvNeXt` gains `hybrid_parts()`. | **No** unless a config sets `hier_hybrid` — default off rebuilds the previous head and loss exactly (all prior tests unchanged). |
+| `bae570245a71` | 2026-10-06 | **resume support.** `mvc.train` accepts `--resume <ckpt>` / `--resume-epoch N` (new `mvc/core/resume.py`); `trainer.fit` gets `ckpt_path=`, and the TensorBoard wipe is skipped on a resume. | **No** for any run started without the flags (`ckpt_path=None` is Lightning's default). A resumed run is not bit-identical to an uninterrupted one — see below. |
+| `bd0dedb52d3e` | 2026-10-06 | **opt-in loss term.** `penalize_false_defect` (top-level config key, like `penalize_false_clean`): adds `−log P(clean)` averaged over a batch's clean tiles — the mirror of `penalize_false_clean`. | **No** unless a config sets it — default 0 adds nothing; the `penalize_false_clean` code path is untouched. Guarded in `test_hier_hybrid`. |
+| `e6218d2c757b` | 2026-10-06 | **opt-in training knob.** `hier_detach_branches` (needs `hier_hybrid`): the type/severity branches read a detached pooled vector, so only the flat loss trains the body, pooling and flat head — detection learns as in convnext_pico; the hierarchy adds grading only. | **No** unless set. Forward outputs are identical with or without it (asserted), so it changes training only. Guarded by `test_hier_detach_branches` (hier loss → zero body gradient; control without detach reaches the body). |
+| `3cd9dd717293` | 2026-10-07 | **output-only.** `eval_coverage.py` also writes `labels` and the full argmax `confusion` matrix (rows = true, columns = predicted) into `<run>_coverage.json`, so type/severity accuracy among defects can be scored. | **No.** Every existing field and number is unchanged; two keys are added. Coverage files written before this lack them — re-run `eval_coverage.py` on a run to add them. |
+| `29f4a9cae6d6` | 2026-10-08 | **opt-in architecture knob.** `timm_pad_downsample` (hparams; hier and plain timm models): a forward pre-hook zero-pads odd inputs of every 2×2/s2 downsample conv to even. At 48 px, stage 3 otherwise sees only the top-left 2×2 of stage 2's 3×3 map (5 of 9 positions dropped); with it, all 9, and stage 3 outputs 2×2. | **No** unless set. No parameters and no state-dict changes (pretrained weights load as-is); 114.49 → 143.10 MFLOPs/tile for the hybrid. Guarded by `test_pad_downsample` (9/9 positions reach stage 3, control 4/9). |
+| `50fc7be4e30e` | 2026-10-08 | **opt-in loss term.** `rank_loss_weight` / `rank_hard_fraction` (top-level config keys): hard-negative pairwise ranking loss on the detection score s = log P(defect) − log P(clean) — mean softplus(s_clean − s_defect) over every defect × the hardest `rank_hard_fraction` of the batch's clean tiles (a partial-AUC surrogate for the low-false-alarm region miss@FA reads). Shift-invariant in s, so it reorders without recalibrating P(clean). | **No** unless `rank_loss_weight` > 0 (default 0). Guarded by `test_rank_loss` (hand value, shift invariance, gradient only on the hardest cleans + defects). |
+| `8abdb92c6cf7` | 2026-10-09 | **opt-in augmentation.** `scale_jitter` (hparams; `polarization.augment_train_batch`, not itself fingerprinted): on half the batch, a random zoom-in crop of side s·48, s ~ U[1 − scale_jitter, 1], resampled bilinearly back to 48×48 with one affine map for all four channels. Motivation: camera distance (tile metadata) varies between recordings, so apparent defect size does too. | **No** unless set (default 0). Training-only; inference untouched. Guarded by `test_scale_jitter` (off/eval identity, uniform tile and DoLP preserved, identical map on all channels). |
+| `7752eda92873` | 2026-10-10 | **robustness + recovery.** `mvc.train` gains `--finalize <ckpt>` / `--finalize-epoch N` (restore the last epoch's checkpoint, train nothing, run the post-training steps) and, on Windows, a guard that logs instead of raising when `TerminateProcess` refuses to stop a DataLoader worker at teardown (`PermissionError [WinError 5]`, which killed `kbachpicoscj1eps7` after training, before any results were written; recovered with `--finalize-epoch 0`). | **No.** Training is untouched; the guard only affects teardown after the model is saved; a finalized run's outputs are those of the saved checkpoint (records `finalized_from`). Guarded by `tests/test_resume.py` (0 extra steps, no new checkpoint, weights unchanged, best checkpoint restored). |
+| `b5e05d1a92fc` | 2026-10-12 | **opt-in architecture knob.** `hier_sev_per_type` (hparams; `hier_*` models only): the severity branch's output layer emits one grade distribution per defect type (T×S logits, softmax per type) instead of a single S-vector shared by every type. With the shared head, P(grade | NegativeDent) and P(grade | PositiveDent) are identical by construction, so the hierarchy cannot express type-specific grading. Also: `tests/test_classifier_from_config.py` [5] now compares raw head logits (diff > 1e-6) instead of `allclose` on outputs, which sat at the tolerance edge at init. | **No** unless set (default False). +(T−1)(d+1)S parameters (+774 for the 10-class pico hybrid); a default checkpoint refuses to load into a per-type head and vice versa. Existing `kbachhybpenscj1ep*` checkpoints verified to load strictly, unchanged. Guarded by `test_sev_per_type`. |
+| `8b7c71b1bcd5` | 2026-10-12 | **opt-in loss term.** `distill_teacher` / `distill_weight` / `distill_temperature` (top-level config keys): knowledge distillation, T²·KL(softmax(teacher/T) ‖ softmax(student/T)) on the student's output (for the hybrid, the combined log-probs whose P(clean) is the flat head's), the teacher seeing the same augmented tile. The teacher is a trained checkpoint loaded lazily on the first training step and kept outside the module tree: not in the state dict, not optimised, never loaded by `load_for_eval`. Motivation: plain convnext_tiny beats the pico hybrid on factory and coverage (3 paired seeds) at 3.3× the FLOPs. | **No** unless `distill_weight` > 0 (default 0). Training slows by the teacher's forward pass; inference and checkpoints unchanged. Guarded by `test_distill`. A teacher must itself have been trained with the coverage frames excluded, or coverage leaks into the student. |
+| `ced7873055da` | 2026-10-13 | **opt-in extension.** `distill_teacher` may be a LIST of checkpoints: the target is the mean of the teachers' temperature-softened distributions, log(mean_k softmax(t_k/T)), in log space. Motivation: the 3-seed convnext_tiny average beat every single tiny with no training (factory miss@FA5 5.02 vs 6.53, coverage TIER_A @FA5 81.37 vs 78.54; `scripts/kbach_teacher_ensemble.py`). | **No** unless a list is given: a single path (or a one-element list) gives exactly the previous loss. Guarded by `test_distill` (2-teacher target matches hand, one-element list == single teacher, teachers outside the state dict). |
+
+## Detail on `bae570245a71`
+
+A resume restores weights, AdamW state, global step, loop progress and the ModelCheckpoint
+state (so best-epoch selection spans the resume), but not the Python/NumPy RNG that the
+BalancedBatchSampler and the augmentations draw from: epochs after the resume see a different
+sample order than an uninterrupted run would. `check_resume` refuses weights-only files, any
+architecture difference between checkpoint and config (including shape-silent knobs such as
+`monochrome` / `hier_heads`), and resumes with no epochs left. The resumed run's JSON records
+`resumed_from` / `resumed_after_epoch`. Guarded by `tests/test_resume.py`.
+
+## Detail on `d154bf417dc9`
+
+Replicates the "Hybrid Pico Head" design (kbach). Output, as normalised log-probabilities:
+`P(clean) = P_flat(clean)`, `P(defect c) = (1 − P_flat(clean)) · P_hier(c | defect)`, with
+`P_hier` the original type×severity distribution renormalised over the defect classes (both
+`log(1 − P(clean))` terms are logsumexps over the defects). Training loss:
+`focal(flat logits) + hier_aux_weight · focal(hier log-probs)` (+ `penalize_false_clean` on the
+combined P(clean), which is the flat head's). For 10 classes: 8,690,611 params (+5,130 over the
+original hier head, +150,761 / +1.77% over plain convnext_pico), 114.49 MFLOPs/tile — matches
+the design page. Guarded by `test_hier_hybrid` (normalisation, P(clean) identity, defect-split
+identity, loss composition, checkpoint round trip, refusals). Unlike `hier_heads`, the extra
+`flat_out` layer changes the state dict, so a hybrid checkpoint cannot load silently into a
+plain hier model.
+
+## Detail on `6c7e9a7f164e`
+
+`hier_sev_weight` replaces only the TRAINING loss of a `hier_*` model; `val_loss`, the
+checkpoint monitor (`val_detect_auroc`), the gate and inference are untouched. The terms are
+batch means (severity summed over graded tiles, divided by batch size), so at γ = 0, λ = 1
+the split loss equals flat cross-entropy exactly — asserted by `test_hier_sev_weight`
+(1.75898 vs 1.75898). At γ = 2 it differs from the flat focal loss by design: the focusing
+factor uses P(type) instead of P(type, sev). `penalize_false_clean` still applies on top. A
+non-hier model with the knob set raises. Runs trained with it log `train_type_loss` and
+`train_sev_loss` separately.
+
+## Detail on `0866656c6862`
+
+Two hparams for `hier_*` models, both defaulting to the head as it was:
+
+* `hier_heads` — `num_heads` of the type→severity cross-attention (was hard-coded 1). Must
+  divide `hier_d / hier_tokens`; an indivisible value raises rather than rounding.
+* `hier_type_residual` — `h_type = z + type_mlp(z)`.
+
+Neither changes a parameter shape or the FLOP count (8,685,481 params, 114.48 MFLOPs/tile
+for hier_convnext_pico in every combination, measured with `torch.utils.flop_counter`). That
+is the hazard: a non-default checkpoint loads `strict=True` into a default-built model and
+silently computes a different function. Both are persisted by `save_hyperparameters()`,
+read by `from_config()`, and guarded by `test_hier_knobs` in
+`tests/test_classifier_from_config.py` (knob reaches the module, survives a checkpoint round
+trip, and is NOT output-identical to the 1-head model on the same weights).
+
+Fingerprint computed on the Windows workstation; if that checkout's line endings differ from
+the Linux box's, the Linux hash of the same source will differ too.
+Also in this change, outside the fingerprinted set: `HDF5Dataset` pickling (Windows spawn
+workers) and a `/` arcname fix in `mvc/export.py` — packaging/IO only, no metric effect.
 
 ## Detail on `61a0a9ff1407`
 
