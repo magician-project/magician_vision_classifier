@@ -109,7 +109,8 @@ def main():
     # in eval(). Equivalence on all 167 real configs is asserted by
     # test_classifier_from_config.py, which is what makes this conversion a no-op.
     model = Classifier.from_config(cfg, num_classes=len(class_names),
-                                   clean_class=cleanID)
+                                   clean_class=cleanID,
+                                   class_names=list(class_names))
     model.load_state_dict(torch.load(ckpt, weights_only=False, map_location='cpu')['state_dict'])
     dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(dev).eval()
