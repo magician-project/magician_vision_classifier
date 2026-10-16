@@ -200,7 +200,13 @@ def main():
           '\ndrop is a regression.')
 
     out = out_path(f"{cfg['name']}_{cfg['model']}", '_coverage.json')
+    # 'labels' + 'confusion' (2026-10-07, kbach): the full argmax confusion over the coverage
+    # tiles, rows = true class, columns = predicted, in class_names order. Additive only --
+    # every number above is unchanged. Needed to score what a hierarchical head is for (type
+    # and severity accuracy among defects), which per-class recall + top_confusion cannot give.
     json.dump({'checkpoint': os.path.basename(ckpt),
+               'labels': list(class_names),
+               'confusion': confuse.tolist(),
                'fa_thresholds': {f'FA{int(f*100)}': (det_at[f][0] if det_at[f] else None)
                                  for f in (0.05, 0.10)},
                'rows': [{'class': n, 'tier': t, 'support': s, 'recall': r,
