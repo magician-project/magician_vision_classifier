@@ -9,6 +9,7 @@ its constructor signature is a public interface, not an internal detail.
 """
 
 import math
+import os
 
 import pytorch_lightning as pl
 import torch
@@ -112,6 +113,7 @@ class Classifier(pl.LightningModule):
                       distill_teacher=None,
                       distill_weight=0.0,
                       distill_temperature=2.0,
+                      ema_decay=0.0,
                       base_channels=32,
                       final_dense_layer=512,
                       clean_class=0,
@@ -199,6 +201,21 @@ class Classifier(pl.LightningModule):
         self.distill_weight = float(distill_weight)
         self.distill_temperature = float(distill_temperature)
         self._teacher = []
+        # Exponential moving average of the weights (2026-10-16, kbach). Training is unchanged:
+        # the optimizer keeps updating the real weights; after every optimizer step a float32
+        # shadow copy follows them, ema <- d * ema + (1 - d) * w, i.e. it averages roughly the
+        # last 1 / (1 - d) steps (0.9998 -> ~5,000 of an epoch's ~121k). Why: the campaign trains
+        # at a CONSTANT learning rate to the last step, so the shipped weights are wherever the
+        # final noisy steps left them; the average sits nearer the centre of that bounce. The
+        # shadow is kept OUT of the module tree (a plain dict), so the state dict, the normal
+        # checkpoints and every evaluation of the raw weights are byte-identical to before. At
+        # each epoch end the averaged weights are written as an ORDINARY checkpoint in
+        # <checkpoint_dir>_ema/ (see save_ema_checkpoint), which every eval tool loads as-is.
+        # Carried through resume checkpoints (on_save/on_load_checkpoint). 0 (default) = off.
+        if not 0.0 <= float(ema_decay) < 1.0:
+            raise ValueError(f'ema_decay={ema_decay} must be in [0, 1)')
+        self.ema_decay = float(ema_decay)
+        self._ema = {}
         #-----------------------------------------
         self.noise_std  = noise_std
         self.noise_clip = noise_clip
@@ -472,6 +489,64 @@ class Classifier(pl.LightningModule):
 
         self.log('train_loss', loss, prog_bar=True)
         return loss
+
+    # ------------------------------------------------------------------ weight EMA
+    def _ema_params(self):
+        return [(n, p) for n, p in self.named_parameters()]
+
+    def on_fit_start(self):
+        if self.ema_decay > 0.0 and not self._ema:
+            self._ema = {n: p.detach().float().clone() for n, p in self._ema_params()}
+            print(f'[ema] tracking {len(self._ema)} parameter tensors, decay {self.ema_decay:g} '
+                  f'(~{1.0 / (1.0 - self.ema_decay):,.0f}-step horizon)')
+
+    @torch.no_grad()
+    def ema_update(self):
+        """One EMA step over every parameter (called after each optimizer step)."""
+        if not self._ema:
+            return
+        names = [n for n, _ in self._ema_params()]
+        shadow = [self._ema[n] for n in names]
+        cur = [p.detach().float() for _, p in self._ema_params()]
+        torch._foreach_mul_(shadow, self.ema_decay)
+        torch._foreach_add_(shadow, cur, alpha=1.0 - self.ema_decay)
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        if self.ema_decay > 0.0:
+            self.ema_update()
+
+    def ema_state_dict(self):
+        """The module's state dict with every parameter replaced by its EMA (buffers as-is)."""
+        sd = self.state_dict()
+        for n, v in self._ema.items():
+            sd[n] = v.to(sd[n].dtype).clone()
+        return sd
+
+    def save_ema_checkpoint(self, path):
+        """An ordinary {state_dict, hyper_parameters, epoch, global_step} checkpoint of the EMA
+        weights: Classifier.load_for_eval, eval_coverage and score_checkpoints load it unchanged."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({'state_dict': {k: v.cpu() for k, v in self.ema_state_dict().items()},
+                    'hyper_parameters': dict(self.hparams), 'ema_decay': self.ema_decay,
+                    'epoch': int(self.current_epoch), 'global_step': int(self.global_step)}, path)
+        print(f'[ema] wrote {path}')
+
+    def on_train_epoch_end(self):
+        if self.ema_decay > 0.0 and self._ema and self.trainer is not None:
+            ck = getattr(self.trainer, 'checkpoint_callback', None)
+            base = getattr(ck, 'dirpath', None) if ck is not None else None
+            if base:
+                self.save_ema_checkpoint(os.path.join(
+                    str(base).rstrip('/\\') + '_ema',
+                    f'epoch={self.current_epoch}-step={self.global_step}-ema{self.ema_decay:g}.ckpt'))
+
+    def on_save_checkpoint(self, checkpoint):
+        if self._ema:
+            checkpoint['ema_state'] = {k: v.cpu() for k, v in self._ema.items()}
+
+    def on_load_checkpoint(self, checkpoint):
+        if self.ema_decay > 0.0 and 'ema_state' in checkpoint:
+            self._ema = {k: v.float().to(self.device) for k, v in checkpoint['ema_state'].items()}
 
     def _teacher_paths(self):
         t = self.distill_teacher
@@ -795,6 +870,7 @@ class Classifier(pl.LightningModule):
         kwargs['distill_teacher'] = cfg.get('distill_teacher') or None
         kwargs['distill_weight'] = float(cfg.get('distill_weight', 0.0))
         kwargs['distill_temperature'] = float(cfg.get('distill_temperature', 2.0))
+        kwargs['ema_decay'] = float(cfg.get('ema_decay', 0.0))
         kwargs['num_classes'] = num_classes
         kwargs['clean_class'] = clean_class
         kwargs['lr'] = (lr if lr is not None

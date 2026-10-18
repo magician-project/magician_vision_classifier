@@ -85,6 +85,7 @@ def trainer_kwargs(cfg, num_classes, clean_class):
         distill_teacher=cfg.get('distill_teacher') or None,
         distill_weight=float(cfg.get('distill_weight', 0.0)),
         distill_temperature=float(cfg.get('distill_temperature', 2.0)),
+        ema_decay=float(cfg.get('ema_decay', 0.0)),
         base_channels=h.get('base_channels', 32),
         final_dense_layer=h.get('final_dense_layer', 512),
         clean_class=clean_class,
@@ -787,6 +788,55 @@ def test_distill():
           'one-element list == single teacher, both loaded lazily and kept out of the state dict')
 
 
+# --------------------------------------------------------------- 14. weight EMA
+def test_ema():
+    """ema_decay: off by default (no shadow, no hook effect); the shadow follows the exact
+    recurrence ema <- d*ema + (1-d)*w over a sequence of weight changes; it is NOT in the state
+    dict; the written EMA checkpoint loads strictly through load_for_eval and holds the EMA
+    values; it survives a resume checkpoint; a decay outside [0, 1) is refused."""
+    import tempfile
+    torch.manual_seed(0)
+    hp = {'tile_size': 48, 'dropout_rate': 0.0, 'DoLP': True, 'pretrained': False}
+    off = Classifier.from_config({'model': 'convnext_pico', 'hparams': hp}, num_classes=5, clean_class=4)
+    off.on_fit_start(); off.on_train_batch_end(None, None, 0)
+    check(off.ema_decay == 0.0 and not off._ema, 'EMA active although ema_decay is off')
+
+    m = Classifier.from_config({'model': 'convnext_pico', 'hparams': hp, 'ema_decay': 0.9},
+                               num_classes=5, clean_class=4)
+    keys = set(m.state_dict())
+    m.on_fit_start()
+    name, p = next(iter(m.named_parameters()))
+    want = p.detach().float().clone()
+    for k in range(5):                                   # five fake optimizer steps
+        with torch.no_grad():
+            for q in m.parameters():
+                q.add_(0.01 * (k + 1))
+        m.on_train_batch_end(None, None, k)
+        want = 0.9 * want + 0.1 * p.detach().float()
+    check(torch.allclose(m._ema[name], want, atol=1e-6), 'EMA does not follow ema <- d*ema + (1-d)*w')
+    check(set(m.state_dict()) == keys, 'EMA leaked into the state dict')
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'ema', 'e.ckpt')
+        m.save_ema_checkpoint(path)
+        back = Classifier.load_for_eval(path)
+        bp = dict(back.named_parameters())[name]
+        check(torch.allclose(bp.float(), m._ema[name].cpu(), atol=1e-6), 'EMA checkpoint does not hold the EMA')
+        ck = {}
+        m.on_save_checkpoint(ck)
+        r = Classifier.from_config({'model': 'convnext_pico', 'hparams': hp, 'ema_decay': 0.9},
+                                   num_classes=5, clean_class=4)
+        r.on_load_checkpoint(ck)
+        check(torch.allclose(r._ema[name].cpu(), m._ema[name].cpu()), 'EMA lost across a resume checkpoint')
+    try:
+        Classifier.from_config({'model': 'convnext_pico', 'hparams': hp, 'ema_decay': 1.0},
+                               num_classes=5, clean_class=4)
+        failures.append('ema_decay=1.0 was accepted')
+    except ValueError:
+        pass
+    print('  [14] weight EMA: off by default, exact recurrence, outside the state dict, '
+          'EMA checkpoint loads strictly, survives resume, decay 1.0 refused')
+
+
 # --------------------------------------------------------------- 4. refusal
 def test_refuses_to_guess():
     try:
@@ -816,6 +866,7 @@ def main():
     test_scale_jitter()
     test_sev_per_type()
     test_distill()
+    test_ema()
     print()
     if failures:
         print(f'FAILED ({len(failures)}):')
