@@ -42,6 +42,37 @@ _BASE_FORWARD_KWARGS = ("majorityVote", "legend", "erosion_kernel",
                         "erosion_threshold", "log", "majority_window")
 
 
+def _fetch_weights(url, weights):
+    """Download a YongaTek training-run zip from ``url`` and extract its
+    ``weights/best.pt`` to ``weights``.  The zip (a whole ultralytics run dir,
+    epoch checkpoints included) is deleted afterwards; only best.pt is kept."""
+    import shutil
+    import urllib.parse
+    import zipfile
+    from mvc.inference.model_download import download_zip
+
+    # The server's run folders contain spaces/parentheses; quote(unquote()) works
+    # whether the config holds the readable or the already-%-encoded form.
+    url = urllib.parse.quote(urllib.parse.unquote(url), safe=":/")
+    base_url, zip_name = url.rsplit("/", 1)
+    dest_dir = os.path.dirname(weights)
+    print(f"[engine:yongatek] {os.path.basename(weights)} missing, fetching {url}")
+    local_zip = download_zip(zip_name, dest_dir, base_url + "/")
+    try:
+        with zipfile.ZipFile(local_zip) as z:
+            members = [n for n in z.namelist() if n.endswith("weights/best.pt")]
+            if len(members) != 1:
+                raise FileNotFoundError(f"[engine:yongatek] expected one weights/best.pt "
+                                        f"in {zip_name}, found {members}")
+            tmp = weights + ".part"
+            with z.open(members[0]) as src, open(tmp, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            os.replace(tmp, weights)  # never leave a truncated .pt at the real path
+    finally:
+        os.remove(local_zip)
+    print(f"[engine:yongatek] wrote {weights}")
+
+
 class YongatekEngine(EngineClassifier):
     """Yongatek plug-in.  Runtime plumbing (config loading, legend, live_*
     interface) is inherited from EngineClassifier; the detector, the intensity
@@ -63,7 +94,11 @@ class YongatekEngine(EngineClassifier):
         if not os.path.isabs(weights):
             weights = os.path.join(repo_root(), weights)
         if not os.path.isfile(weights):
-            raise FileNotFoundError(f"[engine:{self.name}] weights not found: {weights}")
+            url = cfg.get("model_url")
+            if not url:
+                raise FileNotFoundError(f"[engine:{self.name}] weights not found: {weights} "
+                                        f"(and no yongatek.model_url to fetch them from)")
+            _fetch_weights(url, weights)
 
         self.imgsz    = int(cfg.get("imgsz", 640))
         self.conf     = float(cfg.get("conf", 0.25))
