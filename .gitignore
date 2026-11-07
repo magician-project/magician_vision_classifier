@@ -83,3 +83,6 @@ tensorboard/
 /ancs27_*.json
 /ancs2_convnext_pico.json
 /zoo_inference_bench.json
+/extras
+*.png
+*.pt
