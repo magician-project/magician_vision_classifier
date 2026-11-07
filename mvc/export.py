@@ -235,7 +235,11 @@ def collect_members(model_name, include_tensorboard=True):
     if include_tensorboard:
         for p in sorted(glob.glob(f'tensorboard/{model_name}/**/*', recursive=True)):
             if os.path.isfile(p):
-                out.append((f'tensorboard/{run}/' + os.path.relpath(p, f'tensorboard/{model_name}'), p))
+                # Zip member names are always '/'-separated, but relpath uses os.sep: on
+                # Windows (2026-10-05) the '\' arcname was stored as '/' by zipfile and then
+                # failed _verify_archive's lookup as "missing". Normalise to '/' here.
+                rel = os.path.relpath(p, f'tensorboard/{model_name}').replace(os.sep, '/')
+                out.append((f'tensorboard/{run}/' + rel, p))
     return out, missing
 
 

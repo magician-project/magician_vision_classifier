@@ -86,3 +86,4 @@ tensorboard/
 /extras
 *.png
 *.pt
+.claude/settings.local.json

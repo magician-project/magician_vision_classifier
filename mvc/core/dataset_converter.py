@@ -31,11 +31,8 @@ class HDF5Dataset(Dataset):
     """
     def __init__(self, h5_path):
         """Open the HDF5 file in read-only mode and extract images, labels, metadata, and class names."""
-        self.file = h5py.File(h5_path, "r")
-        self.images = self.file["images"]
-        self.labels = self.file["labels"]
-
-        self.metadata = self.file["metadata"] if "metadata" in self.file else None
+        self.h5_path = h5_path
+        self._open()
 
         # Recover class names if stored as attribute
         if "class_names" in self.file.attrs:
@@ -57,6 +54,36 @@ class HDF5Dataset(Dataset):
         # Keep targets compatible with ImageFolder-like code
         self.targets = [int(x) for x in self.labels[:]]
         self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
+
+    def _open(self):
+        """(Re)open the HDF5 handle and the dataset views hanging off it."""
+        self.file = h5py.File(self.h5_path, "r")
+        self.images = self.file["images"]
+        self.labels = self.file["labels"]
+        self.metadata = self.file["metadata"] if "metadata" in self.file else None
+
+    # Pickling support (2026-10-05, Windows workstation). DataLoader workers on Windows
+    # are SPAWNED, so the dataset is pickled into each one -- and h5py handles refuse to
+    # pickle ("h5py objects cannot be pickled"), which killed any num_workers > 0 run.
+    # Linux forks workers and never pickles, so this changes nothing there. Each worker
+    # drops the parent's handle and opens its own (h5py handles must not be shared across
+    # processes anyway); label_map / indices / targets travel with the state as before.
+    # Callers switch metadata OFF after construction (datasets.py sets `.metadata = None`
+    # so batches stay (x, y)); the reopen must honour that rather than resurrect it, or
+    # every worker batch becomes (x, y, meta) and validation_step fails to unpack.
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_metadata_enabled"] = self.metadata is not None
+        for k in ("file", "images", "labels", "metadata"):
+            state.pop(k, None)
+        return state
+
+    def __setstate__(self, state):
+        metadata_enabled = state.pop("_metadata_enabled", True)
+        self.__dict__.update(state)
+        self._open()
+        if not metadata_enabled:
+            self.metadata = None
 
     def __len__(self):
         """Return the number of samples (respecting an optional row subset)."""

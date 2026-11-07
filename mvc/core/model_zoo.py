@@ -10,6 +10,7 @@ Contents:
   TIMM_BACKBONES / REPARAM_BACKBONES       - timm backbone registries
   NONBODY_PREFIXES                         - stem/head param prefixes (freeze logic)
   build_backbone(...)                      - name -> nn.Module, torchvision + timm + custom
+  HierConvNeXt                             - ConvNeXt body + factorised type/severity head
 """
 
 import math
@@ -272,6 +273,257 @@ class CustomCNN(nn.Module):
         return x
 
 
+def parse_type_severity(class_names):
+    """Split flat class names into (type, severity) pairs for HierConvNeXt.
+
+    'class_NegativeDentClassB' -> ('class_NegativeDent', 'B'); a name without a trailing
+    'Class<LETTER>' (class_clean, or a strip_severity run's base names) -> (name, None).
+    Same suffix rule as class_scheme.strip_severity_classes, so the two cannot disagree on
+    what counts as a severity.
+    """
+    import re
+    out = []
+    for c in class_names:
+        m = re.match(r'^(.*)Class([A-Z])$', c)
+        out.append((m.group(1), m.group(2)) if m else (c, None))
+    return out
+
+
+class _HierHead(nn.Module):
+    """The new layers on top of the pooled backbone vector. Everything here lives under
+    the `head.` prefix, so NONBODY_PREFIXES treats it as head (trainable while the body is
+    frozen), exactly like a plain timm model's classifier."""
+
+    def __init__(self, pool, feat_dim, d, n_type, n_sev, tokens, num_types, num_sevs,
+                 dropout_rate, heads=1, type_residual=False, num_flat=None,
+                 detach_branches=False, sev_per_type=False):
+        super().__init__()
+        if d % tokens != 0:
+            raise ValueError(f"hier_d={d} is not divisible by hier_tokens={tokens}")
+        if (d // tokens) % heads != 0:
+            raise ValueError(f"token width hier_d/hier_tokens={d // tokens} is not divisible "
+                             f"by hier_heads={heads}")
+        self.tokens = tokens
+        # 2026-10-05 (kbach), both default to the original head, so every existing
+        # config/checkpoint rebuilds byte-identically:
+        #   heads          attention heads over the d/tokens-wide tokens. nn.MultiheadAttention's
+        #                  projections are E x E whatever the head count, so this changes
+        #                  NO parameter shapes -- which is exactly why it must be persisted in
+        #                  the checkpoint hparams: a 2-head state dict loads cleanly into a
+        #                  1-head model and silently computes something else.
+        #   type_residual  h_type = z + type_mlp(z). The type logits -- and with them the
+        #                  gate's defect_mass, since clean has no severity term -- otherwise
+        #                  reach the shared vector only through n_type extra
+        #                  Linear/GELU/Dropout layers. Zero parameters, one add.
+        self.heads = int(heads)
+        self.type_residual = bool(type_residual)
+        self.pool = pool        # timm's own pooling head (global pool + pretrained LayerNorm)
+
+        def mlp(n):
+            return nn.Sequential(*[nn.Sequential(nn.Linear(d, d), nn.GELU(),
+                                                 nn.Dropout(dropout_rate))
+                                   for _ in range(n)])
+
+        self.shared = nn.Sequential(nn.Linear(feat_dim, d), nn.LayerNorm(d), nn.GELU(),
+                                    nn.Dropout(dropout_rate))
+        self.type_mlp = mlp(n_type)
+        self.type_out = nn.Linear(d, num_types)
+        self.sev_mlp = mlp(n_sev)
+        # A single query vector attending to a single key vector is a no-op (softmax over
+        # one score is always 1), so both branch outputs are viewed as `tokens` tokens of
+        # d/tokens dims: type-branch tokens are the queries, severity-branch tokens the
+        # keys/values.
+        self.attn = nn.MultiheadAttention(d // tokens, num_heads=self.heads, batch_first=True)
+        self.attn_norm = nn.LayerNorm(d // tokens)
+        self.post = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Dropout(dropout_rate))
+        # hier_sev_per_type (2026-10-12, kbach): one set of grade logits PER TYPE (T x S outputs)
+        # instead of a single S-vector shared by every type. With the shared vector, the per-type
+        # mask only hides grades a type lacks, so two types with the same grades (NegativeDent and
+        # PositiveDent, both A/B/C) always got IDENTICAL P(grade | type) -- conditional in name only.
+        # Changes the shape of sev_out, so a checkpoint of one kind can never load into the other.
+        self.sev_per_type = bool(sev_per_type)
+        self.num_types, self.num_sevs = num_types, num_sevs
+        self.sev_out = nn.Linear(d, num_sevs * num_types if self.sev_per_type else num_sevs)
+        # hier_hybrid (2026-10-06): the plain model's own classifier -- Linear on the pooled
+        # vector, no dropout -- added beside the branches. It sets P(clean) in the hybrid
+        # output; see HierConvNeXt.hybrid_parts. None = absent (the original head).
+        self.flat_out = nn.Linear(feat_dim, num_flat) if num_flat else None
+        self.detach_branches = bool(detach_branches)
+
+    def forward(self, feats, return_flat=False):
+        pooled = self.pool(feats)
+        # hier_detach_branches (2026-10-06): the type/severity branches read a DETACHED copy
+        # of the pooled vector, so their loss trains only the branches -- the body, the
+        # pooling LayerNorm and the flat head learn exactly as in plain convnext_pico.
+        # Values are unchanged (detach only cuts the gradient), so inference is identical.
+        out = self._branches(pooled.detach() if self.detach_branches else pooled)
+        if return_flat:
+            return out + (self.flat_out(pooled),)
+        return out
+
+    def _branches(self, pooled):
+        z = self.shared(pooled)
+        h_type = self.type_mlp(z)
+        if self.type_residual:
+            h_type = z + h_type
+        h_sev = self.sev_mlp(z)
+        B = z.shape[0]
+        q = h_type.reshape(B, self.tokens, -1)
+        kv = h_sev.reshape(B, self.tokens, -1)
+        a, _ = self.attn(q, kv, kv, need_weights=False)
+        a = self.attn_norm(q + a).reshape(B, -1)
+        return self.type_out(h_type), self.sev_out(self.post(a))
+
+
+class HierConvNeXt(nn.Module):
+    """A timm ConvNeXt body with a factorised type / severity head.
+
+        body -> pooled vector -> shared Linear -> type branch (hier_n MLPs) -> P(type)
+                                               -> sev branch  (hier_m MLPs)
+                                                  cross-attn(q=type, kv=sev) -> MLP -> P(sev | type)
+
+    The two heads are recombined into the FLAT class logits the rest of the codebase
+    expects:
+
+        logit[c] = log P(type(c)) + log P(sev(c) | type(c))
+
+    where the severity softmax is renormalised over the grades that exist for that type,
+    and a type with at most one grade in the data (class_clean, and e.g. a defect only
+    ever labelled ClassA) contributes no severity term. These are exact log-probabilities,
+    so softmax(logits) == P(type, sev): cross-entropy on them is the type loss plus the
+    severity-given-type loss, and 1 - P(clean) (the gate's defect_mass) is read straight
+    off the type head. The trainer, losses, gate, inference and evaluation therefore run
+    unchanged -- the model only needs `class_names` to know how flat classes factorise.
+    """
+
+    def __init__(self, backbone, in_channels, class_names, pretrained=True,
+                 timm_stem_stride=None, tile_size=48, dropout_rate=0.25,
+                 d=128, n_type=2, n_sev=2, tokens=8, heads=1, type_residual=False,
+                 hybrid=False, detach_branches=False, pad_downsample=False, sev_per_type=False):
+        super().__init__()
+        import timm
+        if not class_names:
+            raise ValueError(f"hier_{backbone} needs class_names to factorise the classes "
+                             f"into type x severity")
+        # hier_hybrid (2026-10-06, kbach): detection from a flat head, grading from the
+        # branches. Measured on the factory val, the plain hier head lost to convnext_pico on
+        # P(clean) (clean recall, miss@FA), not on grading -- and no change inside the
+        # branches (more heads, a residual type path, down-weighting the severity loss) fixed
+        # it. The hybrid takes P(clean) out of the branches' hands:
+        #     P(clean)    = P_flat(clean)
+        #     P(defect c) = (1 - P_flat(clean)) * P_hier(c | defect)
+        # where P_hier is the original type x severity distribution renormalised over the
+        # defect classes. The gate's 1 - P(clean) is then computed exactly as the plain model
+        # computes it. Training adds the hier output as an auxiliary loss (Classifier's
+        # hier_aux_weight). Needs an exact 'class_clean'.
+        self.hybrid = bool(hybrid)
+        if detach_branches and not self.hybrid:
+            raise ValueError("hier_detach_branches needs hier_hybrid: without the flat head "
+                             "nothing would train the body")
+        if self.hybrid and 'class_clean' not in class_names:
+            raise ValueError("hier_hybrid needs a 'class_clean' class to take P(clean) from "
+                             "the flat head")
+        pairs = parse_type_severity(class_names)
+        types = sorted({t for t, _ in pairs})
+        sevs = sorted({s for _, s in pairs if s is not None}) or ['A']
+        valid = {t: sorted({s for tt, s in pairs if tt == t and s is not None}) for t in types}
+        self.class_names = list(class_names)
+        self.type_names, self.sev_names = types, sevs
+        print(f"[hier] {len(class_names)} flat classes -> {len(types)} types {types} "
+              f"x severities {sevs}; graded types: "
+              f"{ {t: v for t, v in valid.items() if len(v) > 1} }")
+
+        body = timm.create_model(backbone, pretrained=pretrained, in_chans=in_channels,
+                                 num_classes=0)
+        if timm_stem_stride:
+            retune_timm_stem_stride(body, int(timm_stem_stride), tile_size=tile_size,
+                                    tag=f'hier/{backbone}')
+        if pad_downsample:
+            pad_odd_downsamples(body, tag=f'hier/{backbone}')
+        # Lift the body's children to the top level so their parameter names match a plain
+        # timm ConvNeXt (stem./stages./norm_pre./head.) and the freeze logic applies as-is.
+        self.stem, self.stages, self.norm_pre = body.stem, body.stages, body.norm_pre
+        self.head = _HierHead(body.head, body.num_features, d, n_type, n_sev, tokens,
+                              len(types), len(sevs), dropout_rate,
+                              heads=heads, type_residual=type_residual,
+                              num_flat=len(class_names) if self.hybrid else None,
+                              detach_branches=detach_branches,
+                              sev_per_type=sev_per_type)
+        if self.hybrid:
+            clean = class_names.index('class_clean')
+            self.clean_idx = clean
+            self.register_buffer('defect_idx',
+                                 torch.tensor([i for i in range(len(class_names)) if i != clean]),
+                                 persistent=False)
+
+        # Flat class -> (type index, severity index, has-severity-term). Derived from
+        # class_names, so they are rebuilt on load rather than stored in the state dict.
+        t_idx = [types.index(t) for t, _ in pairs]
+        s_idx = [sevs.index(s) if s is not None else 0 for _, s in pairs]
+        graded = [float(len(valid[t]) > 1 and s is not None) for t, s in pairs]
+        mask = torch.full((len(types), len(sevs)), -1e4)    # fp16-safe "-inf"
+        for t in types:
+            for s in valid[t]:
+                mask[types.index(t), sevs.index(s)] = 0.0
+        self.register_buffer('type_idx', torch.tensor(t_idx), persistent=False)
+        self.register_buffer('sev_idx', torch.tensor(s_idx), persistent=False)
+        self.register_buffer('graded', torch.tensor(graded), persistent=False)
+        self.register_buffer('sev_mask', mask, persistent=False)
+
+    def _features(self, x):
+        return self.norm_pre(self.stages(self.stem(x)))
+
+    def forward_heads(self, x):
+        """(type_logits, sev_logits) -- the two raw heads, for inspection/analysis."""
+        return self.head(self._features(x))
+
+    def _log_parts_from(self, type_logits, sev_logits):
+        log_type = F.log_softmax(type_logits.float(), dim=-1)                  # (B, T)
+        # P(sev | type): one severity distribution per type, restricted to its grades.
+        if self.head.sev_per_type:
+            # (B, T*S) -> (B, T, S): each type has its own grade logits
+            sev = sev_logits.float().view(sev_logits.shape[0], self.head.num_types, self.head.num_sevs)
+        else:
+            sev = sev_logits.float().unsqueeze(1)          # one S-vector broadcast to every type
+        log_sev = F.log_softmax(sev + self.sev_mask, dim=-1)
+        log_sev = log_sev[:, self.type_idx, self.sev_idx]                      # (B, C)
+        return log_type, log_sev
+
+    def log_parts(self, x):
+        """(log P(type) (B, T), log P(sev(c) | type(c)) per FLAT class (B, C)).
+
+        The two factors forward() adds. Exposed for the split loss (Classifier's
+        hier_sev_weight, 2026-10-05), which weights the type and severity terms separately;
+        forward() is built on this, so the two cannot drift apart.
+        """
+        return self._log_parts_from(*self.forward_heads(x))
+
+    def hybrid_parts(self, x):
+        """(combined log-probs, flat-head logits, hier log-probs), all (B, C). hier_hybrid only.
+
+        combined[clean]   = log P_flat(clean)
+        combined[defect c] = log(1 - P_flat(clean)) + log P_hier(c) - log(1 - P_hier(clean))
+        Both log(1 - P(clean)) terms are logsumexps over the defect classes, which stays
+        finite when P(clean) -> 1. exp(combined) sums to 1 over the classes.
+        """
+        type_logits, sev_logits, flat_logits = self.head(self._features(x), return_flat=True)
+        log_type, log_sev = self._log_parts_from(type_logits, sev_logits)
+        hier = log_type[:, self.type_idx] + self.graded * log_sev
+        flat_lp = F.log_softmax(flat_logits.float(), dim=-1)
+        d = self.defect_idx
+        combined = torch.empty_like(flat_lp)
+        combined[:, self.clean_idx] = flat_lp[:, self.clean_idx]
+        combined[:, d] = (torch.logsumexp(flat_lp[:, d], dim=-1, keepdim=True)
+                          + hier[:, d] - torch.logsumexp(hier[:, d], dim=-1, keepdim=True))
+        return combined, flat_logits, hier
+
+    def forward(self, x):
+        if self.hybrid:
+            return self.hybrid_parts(x)[0]
+        log_type, log_sev = self.log_parts(x)
+        return log_type[:, self.type_idx] + self.graded * log_sev
+
+
 # timm backbones usable as `model` in a config. All VERIFIED to build and run a
 # forward pass at 5ch x 48x48 with num_classes=12 on timm 1.0.28 -- most of these
 # ship a 224/256 default_cfg, and not all survive a 48px input.
@@ -358,6 +610,42 @@ def _stem_like(old_conv, in_channels, seed=True, tag=''):
     return new
 
 
+def pad_odd_downsamples(model, tag=''):
+    """Zero-pad odd-sized inputs of every 2x2 stride-2 downsample conv to an even size.
+
+    Why (2026-10-08, kbach). ConvNeXt downsamples between stages with Conv2d(k=2, s=2). On a
+    48px tile the map reaching stage 3 is 3x3, and a 2x2/s2 conv on 3x3 yields 1x1 from the
+    TOP-LEFT 2x2 block only: perturbing stage-2 positions (0,2), (2,0) or (2,2) leaves the
+    stage-3 output bit-identical, so 5 of 9 positions -- the right column and bottom row of
+    every tile -- never reach the head except through the overlapping receptive fields of the
+    4 kept positions. Padding the bottom/right by one zero row/column makes the conv cover all
+    9 (stage 3 then outputs 2x2, averaged by the usual pooling).
+
+    A forward PRE-HOOK, not a new layer: no parameters, no state-dict key changes, so pretrained
+    weights load as-is. Even-sized inputs (12x12 and 6x6 here) are untouched. Shape-silent at the
+    state-dict level, hence persisted as the `timm_pad_downsample` hparam.
+    """
+    import torch.nn.functional as F_
+
+    def _pad_even(_mod, args):
+        x = args[0]
+        ph, pw = x.shape[-2] % 2, x.shape[-1] % 2
+        if ph or pw:
+            return (F_.pad(x, (0, pw, 0, ph)),) + tuple(args[1:])
+        return None
+
+    n = 0
+    for mod in model.modules():
+        if (isinstance(mod, nn.Conv2d) and tuple(mod.kernel_size) == (2, 2)
+                and tuple(mod.stride) == (2, 2)):
+            mod.register_forward_pre_hook(_pad_even)
+            n += 1
+    print(f"[pad] {tag}: {n} 2x2/s2 downsample conv(s) now zero-pad odd inputs to even")
+    if not n:
+        raise ValueError(f"timm_pad_downsample: {tag} has no 2x2 stride-2 downsample convs")
+    return model
+
+
 def retune_timm_stem_stride(model, stride, tile_size=48, tag=''):
     """Re-stride a timm patchify stem WITHOUT touching its pretrained weights.
 
@@ -425,7 +713,18 @@ def build_backbone(model_type,
                    custom_channels=None,
                    custom_res_blocks=None,
                    custom_wavelet_pools=None,
-                   custom_wavelet_stem=0):
+                   custom_wavelet_stem=0,
+                   hier_d=128,
+                   hier_n=2,
+                   hier_m=2,
+                   hier_tokens=8,
+                   hier_heads=1,
+                   hier_type_residual=False,
+                   hier_hybrid=False,
+                   hier_detach_branches=False,
+                   hier_sev_per_type=False,
+                   timm_pad_downsample=False,
+                   class_names=None):
     """Build a backbone by name. Covers the torchvision zoo (stem/head surgery for
     the 4+ channel polarization input), the timm registry, and the from-scratch
     CustomCNN. Raises ValueError on an unknown name.
@@ -569,6 +868,24 @@ def build_backbone(model_type,
         model = mnasnet1_0(weights=_w(MNASNet1_0_Weights.DEFAULT))
         model.layers[0] = _stem_like(model.layers[0], in_channels, seed=_seed, tag='mnasnet1_0.layers.0')
         model.classifier[1] = nn.Linear(1280, num_classes)
+    elif model_type.startswith('hier_'):
+        # hier_<timm convnext name>, e.g. hier_convnext_pico. Checked BEFORE the
+        # 'custom'/'cnn' substring branch below, which would otherwise capture any name
+        # containing those letters.
+        model = HierConvNeXt(model_type[len('hier_'):],
+                             in_channels=in_channels,
+                             class_names=class_names,
+                             pretrained=pretrained,
+                             timm_stem_stride=timm_stem_stride,
+                             tile_size=tile_size,
+                             dropout_rate=dropout_rate,
+                             d=int(hier_d), n_type=int(hier_n), n_sev=int(hier_m),
+                             tokens=int(hier_tokens), heads=int(hier_heads),
+                             type_residual=bool(hier_type_residual),
+                             hybrid=bool(hier_hybrid),
+                             detach_branches=bool(hier_detach_branches),
+                             pad_downsample=bool(timm_pad_downsample),
+                             sev_per_type=bool(hier_sev_per_type))
     elif ('custom' in model_type) or ('cnn' in model_type):
         model = CustomCNN(
                                in_channels=in_channels,
@@ -600,6 +917,8 @@ def build_backbone(model_type,
         if timm_stem_stride:
             retune_timm_stem_stride(model, int(timm_stem_stride),
                                     tile_size=tile_size, tag=f'timm/{name}')
+        if timm_pad_downsample:
+            pad_odd_downsamples(model, tag=f'timm/{name}')
         if name in REPARAM_BACKBONES:
             print(f"[timm] NOTE {name} is reparameterizable: training runs the multi-branch "
                   f"graph, but deployment MUST call timm.utils.reparameterize_model() -- worth "
