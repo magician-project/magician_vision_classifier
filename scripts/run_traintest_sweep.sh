@@ -98,11 +98,13 @@ for CFG in "${CFGS[@]}"; do
 
     echo "=== $(date -Is) [$run] score_checkpoints"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$CFG" >> "$log" 2>&1
-    echo "=== $(date -Is) [$run] score rc=$?"
+    rc=$?
+    echo "=== $(date -Is) [$run] score rc=$rc"
 
     echo "=== $(date -Is) [$run] eval_traintest_split"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_traintest_split "$CFG" >> "$log" 2>&1
-    echo "=== $(date -Is) [$run] traintest_detect rc=$?"
+    rc=$?
+    echo "=== $(date -Is) [$run] traintest_detect rc=$rc"
 
     echo "--- [$run] ---"
     grep -aA 8 'epoch   val_loss' "$log" | tail -10

@@ -147,7 +147,7 @@ cd SharedMemoryVideoBuffers && make && cd ..
 ln -s SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so .
 ```
 
-`SharedMemoryVideoBuffers/server --nokb &` starts the reference server, used to test the buffer without a camera.
+`SharedMemoryVideoBuffers/server` snapshots every stream to PNM files each time Enter is pressed, to check the buffer by hand; nothing needs it running.
 
 The runtime resolves `libSharedMemoryVideoBuffers.so` against the **repository root** (`loadLibrary` in `mvc/core/shared_memory.py`), so the runners work from any working directory.
 
@@ -458,6 +458,7 @@ All services are prefixed with `/magician_vision_classifier/`.
 | `remember_clean` | `std_srvs/Trigger` | Save current frame as a clean sample to `data/` |
 | `snapshot` | `std_srvs/Trigger` | Save current frame to `snapshots/` on demand |
 | `scan_markers` | `std_srvs/Trigger` | Activate ArUco marker detection for 3 seconds |
+| `locate_pattern` | `LocatePattern` | Marker-free camera pose vs. a prebuilt surface-pattern map (`analysis/extrinsics_from_pattern.py`) |
 
 ### Service Definitions
 
@@ -473,6 +474,18 @@ bool success
 int64 value
 ---
 bool success
+```
+
+**LocatePattern:** localises the current frame against a map built offline by `analysis/extrinsics_from_pattern.py build` (map.npz + a real camera calibration, intrinsics.json — neither is built by this service). `map_path`/`intrinsics_path` empty = use the node's configured defaults. The returned pose is in the REFERENCE MARKER's frame — this codebase's established stand-in for "a fixed point on the car" (see that script's docstring) — not a separately calibrated chassis origin.
+```
+string map_path
+string intrinsics_path
+---
+bool success
+string message
+geometry_msgs/Pose pose
+int32 inliers
+float64 reproj_rms_px
 ```
 
 ### Detection JSON Sidecar

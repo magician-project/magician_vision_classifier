@@ -30,7 +30,7 @@ Usage:  python seed_replicates.py [--dry-run]
 import copy
 import json
 
-from mvc.core.artifact_paths import find_artifact
+from mvc.core.artifact_paths import find_config_with_classes
 import sys
 
 # (parent config, name prefix) -- the four challengers being replicated. Full relative
@@ -62,7 +62,10 @@ def main():
     written = []
 
     for parent_path, prefix in PARENTS:
-        with open(find_artifact(parent_path) or parent_path) as fh:
+        # find_config_with_classes(), not find_artifact(): the root copy of a tidied run's
+        # config is the pre-training template (no `classes`) -- see the same fix in
+        # eval_vote_curve.py / mono_frontier_sweep.py (2026-09-03).
+        with open(find_config_with_classes(parent_path) or parent_path) as fh:
             parent = json.load(fh)
 
         # The carve-out is what makes the coverage validation disjoint from train. A

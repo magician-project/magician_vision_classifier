@@ -44,14 +44,16 @@ run_cfg() {   # run_cfg <config.json> <tag>
     local log="$LOGDIR/${tag}_$(date +%Y%m%d_%H%M).log"
     echo "=== $(date -Is) [$tag] launching $cfg -> $log"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m mvc.train "$cfg" > "$log" 2>&1
-    echo "=== $(date -Is) [$tag] $cfg exited rc=$?"
+    local rc=$?
+    echo "=== $(date -Is) [$tag] $cfg exited rc=$rc"
 }
 score() {     # score <config.json> <tag>
     wait_for_gpu
     echo "=== $(date -Is) [$2] scoring every retained epoch"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$1" \
         > "$LOGDIR/${2}_score_$(date +%Y%m%d_%H%M).log" 2>&1
-    echo "=== $(date -Is) [$2] scoring exited rc=$?"
+    local rc=$?
+    echo "=== $(date -Is) [$2] scoring exited rc=$rc"
 }
 
 echo "############ A. SEED VARIANCE — the noise floor (4 samples incl. tz seed 42 = 8.92)"

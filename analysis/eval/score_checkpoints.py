@@ -95,7 +95,8 @@ def main():
         # in eval(). Equivalence on all 167 real configs is asserted by
         # test_classifier_from_config.py, which is what makes this conversion a no-op.
         model = Classifier.from_config(config_json, num_classes=len(class_names),
-                                      clean_class=cleanClassID)
+                                      clean_class=cleanClassID,
+                                      class_names=list(class_names))
         state = torch.load(ck, weights_only=False, map_location='cpu')
         model.load_state_dict(state['state_dict'])
         model.eval()

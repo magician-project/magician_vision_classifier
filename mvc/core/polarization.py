@@ -157,7 +157,8 @@ def build_input_features(x, *, in_channels, monochrome=False, AoLP=False, DoLP=F
         return x
 
 def augment_train_batch(x, *, training=True, gain_jitter=0.0, polar_flip=False,
-                        polar_rot=False, channel_jitter=0.0):
+                        polar_rot=False, channel_jitter=0.0, scale_jitter=0.0,
+                        scale_jitter_p=0.5):
         """
         Training-only augmentation on the raw 4-channel polarization batch.
 
@@ -177,7 +178,8 @@ def augment_train_batch(x, *, training=True, gain_jitter=0.0, polar_flip=False,
         build_input_features skips its own dequantization consistently).
         """
         if not training or (gain_jitter <= 0.0 and not polar_flip
-                                 and channel_jitter <= 0.0 and not polar_rot):
+                                 and channel_jitter <= 0.0 and not polar_rot
+                                 and scale_jitter <= 0.0):
             return x
         if x.dtype == torch.uint8:
             x = x.float() * (1.0 / 255.0)
@@ -199,6 +201,30 @@ def augment_train_batch(x, *, training=True, gain_jitter=0.0, polar_flip=False,
                 sel = torch.rand(x.shape[0], device=x.device) < 0.25
                 if sel.any():
                     x[sel] = torch.rot90(x[sel], k, dims=(-2, -1))[:, rot_swap, :, :]
+
+        if scale_jitter > 0.0:
+            # Mild zoom-in scale jitter (2026-10-09, kbach): on a random scale_jitter_p of the
+            # batch, crop a random window of side s*48 (s ~ U[1 - scale_jitter, 1]) and resample
+            # it back to 48x48 bilinearly. Why: the tile metadata's camera distance varies a lot
+            # between recordings, so a defect's APPARENT size does too, and the models latch on
+            # to recording-specific cues. Zoom-in only (no padding artefacts); at 0.15 the upscale
+            # is <= 1.18x, so the smoothing is mild. The same affine map is applied to all four
+            # channels, so the polarization ratios -- and DoLP / AoLP -- stay physically
+            # consistent; unlike a mirror, scaling does not change the polarization angle, so no
+            # channel permutation is needed.
+            import torch.nn.functional as F
+            sel = torch.rand(x.shape[0], device=x.device) < float(scale_jitter_p)
+            n = int(sel.sum())
+            if n:
+                s = 1.0 - float(scale_jitter) * torch.rand(n, device=x.device)
+                tx = (torch.rand(n, device=x.device) * 2 - 1) * (1 - s)
+                ty = (torch.rand(n, device=x.device) * 2 - 1) * (1 - s)
+                theta = torch.zeros(n, 2, 3, device=x.device, dtype=x.dtype)
+                theta[:, 0, 0], theta[:, 1, 1] = s, s
+                theta[:, 0, 2], theta[:, 1, 2] = tx, ty
+                grid = F.affine_grid(theta, list(x[sel].shape), align_corners=False)
+                x[sel] = F.grid_sample(x[sel], grid, mode='bilinear', padding_mode='border',
+                                       align_corners=False)
 
         if gain_jitter > 0.0:
             j = float(gain_jitter)

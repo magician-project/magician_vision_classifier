@@ -37,7 +37,7 @@ from mvc.core.config import (
 from mvc.core.datasets import (
     _human_bytes, _get_available_ram_bytes, _get_path_size_bytes, _estimate_dataset_ram_bytes,
     _dataset_source_frames, frame_disjoint_split, exclude_frames_indices,
-    build_train_val,
+    build_train_val, clean_class_index,
     load_rgba_image, load_rgba_image_pil,
     load_png_comment_metadata, metadata_collate_fn, RGBAImageFolder, RAMPreloadedDataset,
     CombinedDataset, BalancedBatchSampler,
@@ -83,16 +83,49 @@ def main():
     _run_started_at = datetime.datetime.now().isoformat()
     _run_t0 = time.perf_counter()
 
+    # --resume PATH / --resume-epoch N (2026-10-06): continue a run from a full epoch
+    # checkpoint instead of starting over -- see mvc/core/resume.py. Stripped from argv here
+    # so the positional arguments below keep their meaning.
+    from mvc.core.resume import (parse_resume_args, parse_finalize_args, find_epoch_checkpoint,
+                                 check_resume)
+    argv, resume_path, resume_epoch = parse_resume_args(sys.argv)
+    # --finalize PATH / --finalize-epoch N (2026-10-10): the last epoch's checkpoint exists but
+    # the post-training steps never ran. Same restore path as a resume, with nothing left to train.
+    argv, fin_path, fin_epoch = parse_finalize_args(argv)
+    finalize = fin_path is not None or fin_epoch is not None
+    if finalize and (resume_path is not None or resume_epoch is not None):
+        raise SystemExit('give --finalize or --resume, not both')
+    if finalize:
+        resume_path, resume_epoch = fin_path, fin_epoch
+
+    # Windows: at teardown Lightning terminates the DataLoader workers, and TerminateProcess can
+    # be refused (PermissionError [WinError 5]) for a worker that is already exiting. On
+    # 2026-10-10 that killed a finished run before it wrote any results (kbachpicoscj1eps7).
+    # The model is saved by then, so a refused termination is logged, not fatal.
+    if os.name == 'nt':
+        import multiprocessing.popen_spawn_win32 as _psw
+        if not getattr(_psw.Popen.terminate, '_mvc_guarded', False):
+            _orig_terminate = _psw.Popen.terminate
+
+            def _terminate(self):
+                try:
+                    _orig_terminate(self)
+                except PermissionError as e:
+                    print(f"[win] could not terminate DataLoader worker pid {self.pid} at "
+                          f"teardown ({e}); continuing -- training results are already saved")
+            _terminate._mvc_guarded = True
+            _psw.Popen.terminate = _terminate
+
     configuration_file = "config.json"
-    if len(sys.argv) > 1:
-        configuration_file = sys.argv[1]
+    if len(argv) > 1:
+        configuration_file = argv[1]
 
     print("Using ",configuration_file," configuration for training")
     config_json       = load_hyperparameters(os.path.join(repo_root(), configuration_file))
     print(config_json)
 
-    if len(sys.argv) > 2:
-        overwrite_model = sys.argv[2]
+    if len(argv) > 2:
+        overwrite_model = argv[2]
         config_json['model'] = overwrite_model
         print("Using model configuration provided by commandline parameter (",overwrite_model,")") 
 
@@ -100,7 +133,10 @@ def main():
     #-----------------------------------------------------------------
     batch_size        = config_json['hparams']['batch_size']
     seed              = config_json['hparams']['seed']
-    dropout_rate      = config_json['hparams']['dropout_rate']
+    # dropout_rate is dead here -- Classifier.from_config() re-derives it from hparams
+    # independently (see load_model()'s comment on why one translation replaced the old
+    # by-hand kwargs). Commented, not deleted, 2026-09-10 (knowledge/10-9-plan.md Phase 5).
+    # dropout_rate      = config_json['hparams']['dropout_rate']
     epochs            = config_json['hparams']['training_epochs']
     tile_size         = config_json['hparams']['tile_size']
     val_split         = config_json['dataloader']['validation_split']
@@ -147,18 +183,24 @@ def main():
     polar_rot = bool(config_json['hparams'].get('polar_rot', False))
     frozen_body_start_epochs = int(config_json['hparams'].get('frozen_body_start_epochs', 0))
     frozen_body_end_epochs   = int(config_json['hparams'].get('frozen_body_end_epochs', 0))
-    custom_early_convs       = int(config_json['hparams'].get('custom_early_convs', 0))
-    custom_channels          = config_json['hparams'].get('custom_channels', None)
-    custom_res_blocks        = config_json['hparams'].get('custom_res_blocks', None)
-    custom_wavelet_pools     = config_json['hparams'].get('custom_wavelet_pools', None)
-    custom_wavelet_stem      = int(config_json['hparams'].get('custom_wavelet_stem', 0) or 0)
-    pretrained_backbone      = bool(config_json['hparams'].get('pretrained', True))
-    # The torchvision branches used to build a FRESH random stem when widening RGB ->
-    # 4+ polarization channels, throwing away the pretrained first layer, while the timm
-    # branch adapts it via in_chans=. That made the two families incomparable. Default
-    # True seeds both the same way; set false to reproduce a pre-2026-08 torchvision run.
-    seed_pretrained_stem     = bool(config_json['hparams'].get('seed_pretrained_stem', True))
-    timm_stem_stride         = config_json['hparams'].get('timm_stem_stride', None)
+    # custom_early_convs/custom_channels/custom_res_blocks/custom_wavelet_pools/
+    # custom_wavelet_stem/pretrained_backbone/seed_pretrained_stem/timm_stem_stride are
+    # dead here -- parsed from hparams but never read again, because Classifier.from_config()
+    # re-derives every one of them from hparams independently (see load_model()'s comment:
+    # this file used to enumerate the knobs by hand, from_config() is now the single source
+    # of truth). Commented, not deleted, 2026-09-10 (knowledge/10-9-plan.md Phase 5).
+    # custom_early_convs       = int(config_json['hparams'].get('custom_early_convs', 0))
+    # custom_channels          = config_json['hparams'].get('custom_channels', None)
+    # custom_res_blocks        = config_json['hparams'].get('custom_res_blocks', None)
+    # custom_wavelet_pools     = config_json['hparams'].get('custom_wavelet_pools', None)
+    # custom_wavelet_stem      = int(config_json['hparams'].get('custom_wavelet_stem', 0) or 0)
+    # pretrained_backbone      = bool(config_json['hparams'].get('pretrained', True))
+    # # The torchvision branches used to build a FRESH random stem when widening RGB ->
+    # # 4+ polarization channels, throwing away the pretrained first layer, while the timm
+    # # branch adapts it via in_chans=. That made the two families incomparable. Default
+    # # True seeds both the same way; set false to reproduce a pre-2026-08 torchvision run.
+    # seed_pretrained_stem     = bool(config_json['hparams'].get('seed_pretrained_stem', True))
+    # timm_stem_stride         = config_json['hparams'].get('timm_stem_stride', None)
     print("Augmentation: gain_jitter ", gain_jitter, "/ polar_flip ", polar_flip,
           "/ channel_jitter ", channel_jitter, "/ monochrome ", monochrome,
           "/ polar_rot ", polar_rot)
@@ -345,10 +387,7 @@ def main():
     #Get clean class which could be needed for extra penalization. None when the
     #dataset has no clean class (e.g. an 'alldefect' run that dropped class_clean)
     #-- val_detect_auroc / penalize_false_clean / the threshold sweep all skip.
-    cleanClassID = None
-    for i in range(len(dataset.classes)):
-           if (dataset.classes[i] == "class_clean") or (dataset.classes[i] == "Clean"):
-              cleanClassID = i
+    cleanClassID = clean_class_index(dataset.classes)
     print(f"Clean class ID is : {cleanClassID}")
 
     # ---------------------------------------------------------------------
@@ -398,7 +437,8 @@ def main():
     # stops the eval tools drifting away from the trainer again.
     classifier = Classifier.from_config(config_json,
                                         num_classes=len(class_names),
-                                        clean_class=cleanClassID)
+                                        clean_class=cleanClassID,
+                                        class_names=list(class_names))
     print(f"Learning rate: {lr}")
     
     model_type = classifier.type
@@ -407,7 +447,8 @@ def main():
     if use_wandb:
         loggers = [TensorBoardLogger("lightning_logs", name="classifier"),  WandbLogger(project=config_json['wandb']['project'], log_model=True,name=config_json['wandb']['name']+model_type+loss)]
     else:
-        if checkIfPathExists("tensorboard/"):
+        # Not on a resume: that would delete the curves of the epochs being continued.
+        if checkIfPathExists("tensorboard/") and resume_path is None and resume_epoch is None:
             print("Removing previous tensorboard logs..")
             shutil.rmtree("tensorboard/", ignore_errors=True)
         loggers = [TensorBoardLogger("tensorboard", name=model_name)]
@@ -447,6 +488,23 @@ def main():
     print(f"Checkpoints: monitor={ckpt_monitor} mode={ckpt_mode} save_top_k={ckpt_top_k} "
           f"({'ALL epochs kept' if ckpt_top_k == -1 else 'best epoch(s) only'}) "
           f"dir={ckpt_dir or '<logger default>'}")
+
+    # Resume: locate the checkpoint and refuse anything that would not continue THIS run
+    # (weights-only file, different architecture, no epochs left). Validated before the
+    # Trainer exists, so a bad resume fails in seconds rather than after data loading.
+    if resume_epoch is not None:
+        resume_path = find_epoch_checkpoint(ckpt_dir, resume_epoch)
+    if resume_path is not None:
+        r_epoch, r_step = check_resume(resume_path, classifier, epochs, finalize=finalize)
+        if finalize:
+            print(f"FINALIZING: training finished at epoch {r_epoch} (global step {r_step}); "
+                  f"restoring {resume_path} and running only the post-training steps")
+            config_json['finalized_from'] = resume_path
+        else:
+            print(f"RESUMING after epoch {r_epoch} (global step {r_step}) from {resume_path}; "
+                  f"training epochs {r_epoch + 1}..{epochs - 1}")
+            config_json['resumed_from'] = resume_path
+            config_json['resumed_after_epoch'] = r_epoch
 
     # Deterministic cuDNN kernels are only worth their speed penalty if the run is
     # ACTUALLY reproducible. The old test looked at noise_std alone, but every
@@ -491,7 +549,7 @@ def main():
     #Train and log to console
     #------------------------------------------------------------------
     _fit_t0 = time.perf_counter()
-    trainer.fit(classifier, train_loader, val_loader)
+    trainer.fit(classifier, train_loader, val_loader, ckpt_path=resume_path)
     fit_seconds = time.perf_counter() - _fit_t0
 
     # Restore the best-val_loss epoch before saving/validating/confusion matrix

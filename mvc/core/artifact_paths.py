@@ -16,6 +16,7 @@ them afterwards, under an age guard so a running job's outputs are never moved m
 """
 
 import glob
+import json
 import os
 
 from mvc.paths import repo_root
@@ -93,6 +94,38 @@ def find_artifact(name):
 
 def exists(name):
     return find_artifact(name) is not None
+
+
+def find_config_with_classes(name):
+    """Path to config `name`, preferring a copy that actually has `classes` populated.
+
+    A CONFIG file (unlike every other artifact this module resolves) is not freshly
+    rewritten each run -- the copy at root is the PRE-training template a generator script
+    wrote once; `classes` is a training-time-resolved field that only ever gets added to
+    the copy filed alongside the run's checkpoints/results under experiments/. So for
+    config files specifically, find_artifact()'s "root wins, it's the freshest" rule is
+    backwards: root is always the stale one once a run has been tidied away.
+
+    Root-first via find_artifact() still comes first here, in case classes genuinely is
+    there (fresh run, not yet tidied) -- only falls through to a slower recursive search
+    under experiments/ when that copy lacks it. First candidate found there with a
+    populated `classes` wins; ties broken by whichever glob() returns first (arbitrary,
+    but every filed copy of a given run's config should agree on its own `classes`).
+    """
+    p = find_artifact(name)
+    if p and os.path.exists(p):
+        try:
+            if json.load(open(p)).get('classes'):
+                return p
+        except (OSError, ValueError):
+            pass
+    for alt in glob.glob(os.path.join(ARCHIVE, '**', os.path.basename(name)), recursive=True):
+        try:
+            if json.load(open(alt)).get('classes'):
+                return alt
+        except (OSError, ValueError):
+            continue
+    return p
 
 
 # ---------------------------------------------------------------------------------

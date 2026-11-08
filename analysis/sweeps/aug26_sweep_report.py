@@ -24,12 +24,11 @@ cost is reported as its own sign). This matches the dev box's convention. The le
 Usage:  python aug26_sweep_report.py
 """
 
-import json
-import os
 from statistics import mean, stdev
 
 from mvc.core.artifact_paths import find_artifact
 from mvc.core.metrics import miss_at_fa
+from . import report_common as rc
 
 SEEDS = (42, 1337, 7)
 ARMS = ['base', 'dolp', 'mono', 'stride2']
@@ -51,12 +50,7 @@ def factory(arm, seed):
 def coverage(arm, seed):
     """TIER_A macro DETECTION at FA5 -- the ship-rule column."""
     p = find_artifact(f's26{arm}{seed}_convnext_pico_coverage.json')
-    if not p:
-        return None
-    rows = [r for r in json.load(open(p))['rows']
-            if r['tier'] == 'TIER_A' and r['class'] != 'class_clean']
-    vals = [r['detect_at_fa5'] for r in rows if r.get('detect_at_fa5') is not None]
-    return mean(vals) if vals else None
+    return rc.tier_a_macro(p)
 
 
 def table(title, getter, lower_is_better, data):

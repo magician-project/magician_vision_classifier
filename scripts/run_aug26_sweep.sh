@@ -61,7 +61,8 @@ for seed in 42 1337 7; do
     # checkpoint, and these screens keep save_top_k=1, so there is no epoch sweep to do.
     echo "=== $(date -Is) [${arm}/${seed}] coverage"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$cfg" >> "$log" 2>&1
-    echo "=== $(date -Is) [${arm}/${seed}] coverage exited rc=$?"
+    rc=$?
+    echo "=== $(date -Is) [${arm}/${seed}] coverage exited rc=$rc"
   done
   echo "############ after seed $seed:"
   python -m analysis.sweeps.aug26_sweep_report 2>&1 | tail -40

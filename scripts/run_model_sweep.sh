@@ -64,9 +64,7 @@ gpu_wait
 # Added after the fact (2026-08-26): the real per-tile gate threshold is not what the live
 # node applies -- it also votes over a spatial neighbourhood (min_votes/erosion_kernel), and
 # nothing before this measured that. Checked via artifact_paths.exists() (root OR
-# experiments/, once tidied), same fix already applied to run_full_zoo_sweep.sh -- unlike
-# this file's pre-existing coverage check just below, which is a root-only `-f` and would
-# go blind on a tidied run; left as-is rather than fixed in passing.
+# experiments/, once tidied), same fix already applied to run_full_zoo_sweep.sh.
 vote_curve_exists() {
     local run="$1" model="$2"
     python3 -c "
@@ -76,11 +74,27 @@ sys.exit(0 if exists(sys.argv[1] + '_' + sys.argv[2] + '_vote_curve.json') else 
 " "$run" "$model"
 }
 
+# Fixed 2026-09-03: this used to be a root-only `-f` check, which went blind once a
+# finished run's _coverage.json was tidied into experiments/ -- caught live when this queue
+# tried to fully retrain msfemto (convnext_femto), already trained+scored weeks ago under
+# model_sweep/21-8-report.md, because its coverage file lives at
+# experiments/model_sweep/msfemto/msfemto_convnext_femto_coverage.json, not at repo root.
+# Same artifact_paths.exists() lookup as vote_curve_exists() above, so archival location
+# never matters for either check again.
+coverage_exists() {
+    local run="$1" model="$2"
+    python3 -c "
+from mvc.core.artifact_paths import exists
+import sys
+sys.exit(0 if exists(sys.argv[1] + '_' + sys.argv[2] + '_coverage.json') else 1)
+" "$run" "$model"
+}
+
 for entry in "${RUNS[@]}"; do
     run="${entry%%:*}"; model="${entry##*:}"
     CFG="${run}_${model}.json"
     [ -f "$CFG" ] || { echo "!!! missing $CFG, skipping"; continue; }
-    if [ -f "${run}_${model}_coverage.json" ]; then
+    if coverage_exists "$run" "$model"; then
         if vote_curve_exists "$run" "$model"; then
             echo "=== $(date -Is) $run already complete, skipping"
             continue
@@ -88,7 +102,8 @@ for entry in "${RUNS[@]}"; do
         echo "=== $(date -Is) [$run] already trained+scored, backfilling eval_vote_curve only"
         blog="$LOGDIR/${run}_votecurve_$(date +%Y%m%d_%H%M).log"
         CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_vote_curve "$CFG" > "$blog" 2>&1
-        echo "=== $(date -Is) [$run] vote_curve rc=$?"
+        vc_rc=$?
+        echo "=== $(date -Is) [$run] vote_curve rc=$vc_rc"
         continue
     fi
 
@@ -102,15 +117,18 @@ for entry in "${RUNS[@]}"; do
 
     echo "=== $(date -Is) [$run] score_checkpoints"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$CFG" >> "$log" 2>&1
-    echo "=== $(date -Is) [$run] score rc=$?"
+    sc_rc=$?
+    echo "=== $(date -Is) [$run] score rc=$sc_rc"
 
     echo "=== $(date -Is) [$run] eval_coverage"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$CFG" >> "$log" 2>&1
-    echo "=== $(date -Is) [$run] coverage rc=$?"
+    cov_rc=$?
+    echo "=== $(date -Is) [$run] coverage rc=$cov_rc"
 
     echo "=== $(date -Is) [$run] eval_vote_curve"
     CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_vote_curve "$CFG" >> "$log" 2>&1
-    echo "=== $(date -Is) [$run] vote_curve rc=$?"
+    vc_rc=$?
+    echo "=== $(date -Is) [$run] vote_curve rc=$vc_rc"
 
     echo "--- [$run] factory (incumbent convnext_pico: 9.24 s42 / 7.41 s1337 miss@FA5) ---"
     grep -aA 8 'epoch   val_loss' "$log" | tail -10

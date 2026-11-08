@@ -43,11 +43,13 @@ echo "=== $(date -Is) train exited rc=$rc"
 # val_loss would have cost +1.67, so the epoch choice has to be made on the KPI itself.
 echo "=== $(date -Is) scoring all checkpoints on the factory val"
 CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.score_checkpoints "$CFG" >> "$log" 2>&1
-echo "=== $(date -Is) score exited rc=$?"
+rc=$?
+echo "=== $(date -Is) score exited rc=$rc"
 
 echo "=== $(date -Is) coverage (picks the monitored-best checkpoint)"
 CUDA_VISIBLE_DEVICES="$GPU" python -u -m analysis.eval.eval_coverage "$CFG" >> "$log" 2>&1
-echo "=== $(date -Is) coverage exited rc=$?"
+rc=$?
+echo "=== $(date -Is) coverage exited rc=$rc"
 
 echo "############ $(date -Is) STRIDE2 FULL TRAIN COMPLETE"
 echo "--- factory, per epoch (anchor reference: 9.24 miss@FA5 / 4.93 miss@FA10) ---"

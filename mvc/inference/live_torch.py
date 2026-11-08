@@ -36,6 +36,7 @@ import sys
 import json
 import time
 import math
+import shutil
 import select
 import argparse
 import threading
@@ -417,6 +418,16 @@ class LiveClassifier:
         self._window_scale = 1.0
         self._inference_paused = False
         self._two_stage_enabled = False
+        # Ordered N-stage screen-then-recheck chain (CascadeClassifierPnm) -- a DIFFERENT
+        # mechanism from the two-stage ensemble above (which reuses stage 1's tiles verbatim
+        # and majority-votes with no per-member threshold; see mvc/inference/
+        # ensemble_classifier.py). Populated from the preset's "cascade" block, never from
+        # per-frame keystrokes: a cascade's value is a jointly-tuned set of per-stage
+        # step/threshold pairs, not a knob an operator free-runs one stage at a time --
+        # retuning means switching presets (or restarting with a different one), same as a
+        # model hot-swap.
+        self._cascade_enabled = False
+        self._cascade_stages = []
         self._autosave_defect_snapshots = False
         self._frame_limiter = True
 
@@ -443,6 +454,7 @@ class LiveClassifier:
         self._erosion_kernel = 1   # neighborhood radius for tile voting: (2k+1)^2 tiles
         self._min_votes = 2        # activated tiles (incl. itself) required in the neighborhood to accept a tile; 0/1 = voting off
         self._majority_voting = True
+        self._majority_window = 3  # odd side of the square tile window majority voting takes the mode over
 
         self._lock = threading.Lock()
 
@@ -455,6 +467,10 @@ class LiveClassifier:
         self._last_responses = None
         self._last_tile_size = 0
         self._last_frame_timestamp = 0
+        # What the terminal view ('V') redraws: the heatmap's resolution, which is the
+        # space detection x,y live in, and the same stats dict the status line prints.
+        self._last_view_shape  = None
+        self._last_infer_stats = None
 
         # Marker scanning state
         self._marker_scan_until = 0.0   # monotonic time until which scanning is active
@@ -498,6 +514,7 @@ class LiveClassifier:
         """
         rt = preset.get("runtime") or {}
         gate = preset.get("gate") or {}
+        cascade = preset.get("cascade") or {}
         with self._lock:
             self._step_size          = int(rt.get("step", self._step_size))
             self._target_fps         = float(rt.get("target_fps", self._target_fps))
@@ -508,12 +525,19 @@ class LiveClassifier:
             self._two_stage_enabled  = bool(rt.get("two_stage", self._two_stage_enabled))
             if gate.get("threshold") is not None:
                 self._threshold = float(gate["threshold"])
+            self._cascade_enabled = bool(cascade.get("enabled", False))
+            self._cascade_stages  = list(cascade.get("stages") or [])
         m = preset.get("measured") or {}
         self.logger.info(
             f"Preset '{preset.get('name','?')}': model={preset.get('model')} "
             f"gate={gate.get('mode')}@{gate.get('threshold')} step={self._step_size} "
             f"fps={self._target_fps} erosion_kernel={self._erosion_kernel} "
             f"min_votes={self._min_votes} majority_voting={self._majority_voting}")
+        if self._cascade_enabled:
+            chain = " -> ".join(f"{s.get('model')}(step={s.get('step')}, "
+                                f"thr={(s.get('gate') or {}).get('threshold')})"
+                                for s in self._cascade_stages)
+            self.logger.info(f"  cascade ENABLED: {chain}")
         if preset.get("description"):
             self.logger.info(f"  {preset['description']}")
         if "detected" in m and "false_alarm" in m:
@@ -529,8 +553,15 @@ class LiveClassifier:
             if args.erosion_kernel is not None:  self._erosion_kernel = max(0, min(5, int(args.erosion_kernel)))
             if args.min_votes is not None:       self._min_votes = max(0, int(args.min_votes))
             if args.majority_voting is not None: self._majority_voting = bool(args.majority_voting)
+            if args.majority_window is not None:
+                if args.majority_window >= 1 and args.majority_window % 2 == 1:
+                    self._majority_window = int(args.majority_window)
+                else:
+                    self.logger.warning(f"--majority-window must be an odd number >= 1 "
+                                        f"(got {args.majority_window}); keeping {self._majority_window}")
             if args.frame_limiter is not None:   self._frame_limiter = bool(args.frame_limiter)
             if args.two_stage is not None:       self._two_stage_enabled = bool(args.two_stage)
+            if args.cascade is not None:          self._cascade_enabled = bool(args.cascade)
             if args.visualization is not None:   self._visualization_enabled = bool(args.visualization)
             if args.window_scale is not None:
                 self._window_scale = max(WINDOW_SCALE_MIN, min(WINDOW_SCALE_MAX, float(args.window_scale)))
@@ -575,6 +606,14 @@ class LiveClassifier:
         with self._lock:
             self._two_stage_enabled = bool(enabled)
         self.logger.info("Two-stage execution ENABLED" if enabled else "Two-stage execution DISABLED")
+
+    def set_cascade(self, enabled):
+        """Toggle cascade mode on/off. Only takes effect if the active preset defined a
+        stage list at startup (this does not build a cascade out of thin air) -- see
+        CascadeClassifierPnm."""
+        with self._lock:
+            self._cascade_enabled = bool(enabled)
+        self.logger.info("Cascade execution ENABLED" if enabled else "Cascade execution DISABLED")
 
     def set_fps(self, fps):
         """Set target FPS (0 = no limiting)."""
@@ -652,6 +691,16 @@ class LiveClassifier:
         with self._lock:
             self._majority_voting = bool(enabled)
         self.logger.info("Majority voting ENABLED" if enabled else "Majority voting DISABLED")
+
+    def set_majority_window(self, w):
+        """Set the side of the square tile window majority voting takes the mode over (odd, >=1)."""
+        w = int(w)
+        if w < 1 or w % 2 == 0:
+            self.logger.warning(f"Majority window must be an odd number >= 1 (got {w})")
+            return
+        with self._lock:
+            self._majority_window = w
+        self.logger.info(f"Majority window set to {w}x{w} tiles")
 
     def set_model(self, name):
         """Hot-swap the single classifier model at runtime. Returns (ok, message)."""
@@ -837,6 +886,11 @@ class LiveClassifier:
         with self._lock:
             return self._min_votes
 
+    def get_majority_window(self):
+        """Thread-safe getter for the majority voting window side."""
+        with self._lock:
+            return self._majority_window
+
     def get_target_fps(self):
         """Thread-safe getter for the target FPS limit."""
         with self._lock:
@@ -861,6 +915,17 @@ class LiveClassifier:
         """Thread-safe getter for the two-stage ensemble mode."""
         with self._lock:
             return self._two_stage_enabled
+
+    def cascade_enabled(self):
+        """Thread-safe getter for the cascade mode."""
+        with self._lock:
+            return self._cascade_enabled
+
+    def get_cascade_stages(self):
+        """Thread-safe getter for the active preset's ordered stage list (list of dicts,
+        each at least {'model', 'step', 'gate': {'mode', 'threshold', ...}})."""
+        with self._lock:
+            return list(self._cascade_stages)
 
     def autosave_defect_snapshots_enabled(self):
         """Thread-safe getter for the autosave defect snapshots toggle."""
@@ -1008,7 +1073,15 @@ class LiveClassifier:
         self._background_probability = 1.0 - float(avg_prob)
         self._background_timestamp   = int(ts)
 
-    def flush_frame(self, ts, tile_size, hz=0.0):
+    @staticmethod
+    def _compact(n):
+        """4588 -> '4.5K'. Keeps the status line inside one terminal row."""
+        n = float(n)
+        if n >= 1000.0:
+            return f"{n / 1000.0:.1f}K"
+        return f"{n:.0f}"
+
+    def flush_frame(self, ts, tile_size, hz=0.0, infer_stats=None):
         """Emit one frame's worth of detections: a console summary + optional JSONL line."""
         detections = self._frame_detections
         markers    = self._frame_markers
@@ -1017,12 +1090,59 @@ class LiveClassifier:
         if not self._quiet:
             per_type = {}
             for d in detections:
-                key = f"{d['type']}/{d['class_name']}"
+                # "PositiveDent/ClassA" -> "Pos/A". Generic (prefix + declassed suffix)
+                # rather than a lookup table, so a newly trained class shortens too.
+                key = f"{d['type'][:3]}/{d['class_name'].replace('Class', '')}"
                 per_type[key] = per_type.get(key, 0) + 1
-            breakdown = " ".join(f"{k}:{v}" for k, v in sorted(per_type.items())) or "-"
-            self.logger.info(
-                f"frame ts={ts} tile={tile_size} detections={len(detections)} [{breakdown}] "
-                f"background_probability={bg:.4f} inference={hz:.1f} Hz")
+            # Busiest classes first, and only the top few: a frame can activate all seven
+            # at once, and the full list alone ran past 150 characters and wrapped, which
+            # cost the colour its whole at-a-glance value.
+            ranked    = sorted(per_type.items(), key=lambda kv: -kv[1])
+            breakdown = " ".join(f"{k}:{v}" for k, v in ranked[:3])
+            if len(ranked) > 3:
+                breakdown += f" +{len(ranked) - 3}"
+            if breakdown:
+                breakdown = " " + breakdown
+            # Colour the whole line by verdict. At ~18 frames/sec this scrolls faster than
+            # anyone can read a count, so the operator needs a signal they can catch
+            # peripherally: solid green means this frame activated nothing, red means it did.
+            # Same raw-ANSI convention runSingle()'s timing line already uses.
+            if detections:
+                colour, verdict = bcolors.FAIL, f"DEFECT x{len(detections)}"
+            else:
+                colour, verdict = bcolors.OKGREEN, "CLEAN"
+
+            st    = infer_stats or {}
+            model = str(st.get("name", "model")).replace(".pth", "")
+            # None means no runtime override, i.e. the model's own calibrated gate is in
+            # force -- worth saying rather than printing a number that is not the one used.
+            thr   = self.get_max_probability_threshold()
+            thr_s = f"{thr:.3f}" if thr is not None else "model"
+            line  = (f"{model} | {verdict} | bg={bg:.3f} | T={thr_s} | "
+                     f"step={st.get('step', 0)} | "
+                     f"@ {st.get('hz', hz):5.2f} Hz | "
+                     f"({self._compact(st.get('tiles', 0))} tiles, "
+                     f"{self._compact(st.get('tiles_per_sec', 0))}tile/s){breakdown}")
+
+            # On a terminal this is ONE line that rewrites itself, so a 19 Hz stream stops
+            # scrolling everything else off screen. "\x1b[K" erases whatever the previous,
+            # possibly longer, frame left to the right of the cursor -- padding to a fixed
+            # width would do the same until the line outgrew a narrow terminal, and a
+            # wrapped line breaks '\r' (it only returns to the start of the last screen row).
+            # Redirected output keeps real newlines -- '\r' would collapse a whole run into
+            # a single unreadable, ungreppable line in the log file.
+            if sys.stdout.isatty():
+                # Truncate to the real terminal width. A busy frame's class breakdown pushes
+                # this past 140 columns, and a line that wraps defeats '\r' entirely -- the
+                # carriage return only rewinds to the start of the last screen row, so the
+                # earlier rows stay and the display scrolls after all. len() is the visible
+                # width here because `line` is assembled without any escape codes.
+                width = shutil.get_terminal_size(fallback=(120, 24)).columns
+                print(f"{colour}{bcolors.BOLD}{line[:width - 1]}{bcolors.ENDC}\x1b[K",
+                      end="\r", flush=True)
+                self._status_line_open = True
+            else:
+                print(f"{colour}{bcolors.BOLD}{line}{bcolors.ENDC}", flush=True)
 
         if self._jsonl_file is not None:
             payload = {
@@ -1042,7 +1162,20 @@ class LiveClassifier:
         self._frame_detections = []
         self._frame_markers    = []
 
+    def end_status_line(self):
+        """Finish the rewriting one-line status so a block can be printed under it.
+
+        The status line is left without a newline so the next frame can overwrite it.
+        Anything multi-line printed on top of it -- the key help, the terminal view,
+        the shutdown messages, the shell prompt -- lands on that half-written row
+        instead, so every such caller closes it off first.
+        """
+        if getattr(self, "_status_line_open", False):
+            print(flush=True)
+            self._status_line_open = False
+
     def close(self):
+        self.end_status_line()
         if self._jsonl_file is not None:
             try:
                 self._jsonl_file.close()
@@ -1057,8 +1190,10 @@ class LiveClassifier:
 KEY_HELP = """
 Keys (the standalone equivalent of the ROS services):
   h / ?  this help                       q      quit
+  V      draw the visualization window in the terminal (works with no X display)
   v      toggle visualization            p      toggle pause  (set_visualization / pause)
   2      toggle two-stage ensemble       m      toggle majority voting
+  3      toggle cascade (needs a preset with a "cascade" stage list; see recommended_configuration.json)
   f      toggle frame limiter            a      toggle autosave of defect frames
   d      remember current frame as DEFECT  (remember_defect)
   c      remember current frame as CLEAN   (remember_clean)
@@ -1067,9 +1202,254 @@ Keys (the standalone equivalent of the ROS services):
   t / T  gate threshold -/+ 0.01         0      clear threshold override (follow model gate)
   [ / ]  step size -/+ 1                 e / E  erosion kernel -/+ 1
   n / N  min votes -/+ 1                 , / .  target FPS -/+ 1  (0 = unlimited)
+  w / W  majority voting window -/+ 2  (odd, >= 1)
   - / +  visualization window scale -/+ 0.25    =      reset window scale to 1.0
   r      hot-swap to the next model found next to this script  (set_model)
 """
+
+
+# ========================================================
+# Terminal ("ASCII") view of the visualization window
+# ========================================================
+# The OpenCV window needs an X display a deployment box reached over ssh does not
+# have, and 'v' switches it off anyway whenever the frame time it costs is wanted
+# back for inference. This redraws what that window shows -- WHERE on the frame the
+# classifier activated, and in which class colour -- as one screenful of text, so
+# the operator keeps the spatial shape of a frame instead of only the running status
+# line's counts. It is printed on demand ('V'), not per frame: at ~19 Hz a block
+# this size would be unreadable and would scroll everything else off screen.
+
+VIEW_CELL_ASPECT = 2.0    # a terminal cell is roughly twice as tall as it is wide
+VIEW_MAX_COLS    = 110
+VIEW_MIN_COLS    = 24
+VIEW_CLASS_CHARS = "abcdefghijklmnopqrstuvwxyz"
+VIEW_DIM         = "\033[2m"
+
+
+def ansi_fg(colour):
+    """One class colour from the window, as a 24-bit ANSI foreground escape.
+
+    class_colors entries are written straight into the heatmap buffer, which
+    generate_heatmap has already converted to BGR for cv2.imshow -- so a tuple's
+    FIRST channel is the blue the operator actually sees. Reversing it here is what
+    makes a class the same colour in this view as it is in the window; taking the
+    tuples at their (R,G,B) word would paint every class a different colour from
+    the one it has on screen, which defeats the point of colouring them at all.
+    """
+    b, g, r = (int(max(0, min(255, round(c)))) for c in colour[:3])
+    return f"\033[38;2;{r};{g};{b}m"
+
+
+def view_glyphs():
+    """Box-drawing characters, or ASCII stand-ins on a terminal that cannot encode them."""
+    enc = (getattr(sys.stdout, "encoding", "") or "").lower()
+    if "utf" in enc:
+        return {"tl": "┌", "tr": "┐", "bl": "└", "br": "┘",
+                "h": "─", "v": "│", "empty": "·"}
+    return {"tl": "+", "tr": "+", "bl": "+", "br": "+",
+            "h": "-", "v": "|", "empty": "."}
+
+
+def view_geometry(runtime):
+    """(height, width) of the coordinate space detections are reported in.
+
+    Detection x,y are demosaiced (half-res) pixels -- i.e. the heatmap's own
+    resolution, which is why the last heatmap's shape is what the character grid is
+    scaled against. Before the first inference there is no heatmap, so a raw mosaic
+    frame is halved by hand to land in the same space.
+    """
+    shape = getattr(runtime, "_last_view_shape", None)
+    if shape:
+        return int(shape[0]), int(shape[1])
+    frame = getattr(runtime, "_last_frame", None)
+    if frame is None:
+        return 0, 0
+    h, w = frame.shape[:2]
+    if frame.ndim == 3 and frame.shape[2] == 4:
+        return h, w
+    return h // 2, w // 2
+
+
+def wrap_segments(prefix, segments, width):
+    """Lay out (plain, painted) segments into lines no wider than `width`.
+
+    The painted twin carries ANSI escapes, so its len() is not its printed width;
+    the plain twin is what the budget is measured against. Continuation lines are
+    indented to the prefix so the labels stay in one column.
+    """
+    pad, lines = " " * len(prefix), []
+    cur_plain, cur_painted, first = prefix, prefix, True
+    for plain, painted in segments:
+        sep = "" if first else "  "
+        if not first and len(cur_plain) + len(sep) + len(plain) > width:
+            lines.append(cur_painted)
+            cur_plain, cur_painted, first, sep = pad, pad, True, ""
+        cur_plain   += sep + plain
+        cur_painted += sep + painted
+        first = False
+    if not first:
+        lines.append(cur_painted)
+    return lines
+
+
+def render_ascii_view(runtime):
+    """Draw the visualization window as a block of coloured text. Returns the block."""
+    g       = view_glyphs()
+    term    = shutil.get_terminal_size(fallback=(120, 24))
+    # Redirected output gets the same drawing without escapes: a log file keeps a
+    # readable map, rather than a map wrapped in codes nothing will interpret.
+    colour  = sys.stdout.isatty()
+    width   = max(40, term.columns - 1)
+
+    def paint(text, *codes):
+        return f"{''.join(codes)}{text}{bcolors.ENDC}" if colour and codes else text
+
+    h_px, w_px = view_geometry(runtime)
+    if w_px <= 0 or h_px <= 0:
+        return paint("No frame has been classified yet - nothing to draw.", bcolors.WARNING)
+
+    # One consistent snapshot of the last frame's results, taken the way
+    # _save_current_frame takes it. No getter may be called while the lock is held.
+    with runtime._lock:
+        responses  = runtime._last_responses
+        tile_size  = runtime._last_tile_size
+        stats      = dict(getattr(runtime, "_last_infer_stats", None) or {})
+    points = list(responses.get("points",      [])) if responses else []
+    ids    = list(responses.get("classIDs",    [])) if responses else []
+    names  = list(responses.get("classes",     [])) if responses else []
+    confs  = list(responses.get("confidences", [])) if responses else []
+
+    # Keep the drawing in proportion with the frame: a 16:9 frame has to look 16:9
+    # here too, or a defect's position is read off the wrong part of the plate. So the
+    # terminal's height is spent by NARROWING the map, not by squashing it -- 12 lines
+    # are left under it for the summary, the legend and the state.
+    cols = max(VIEW_MIN_COLS, min(VIEW_MAX_COLS, term.columns - 4))
+    aspect   = (h_px / w_px) / VIEW_CELL_ASPECT
+    max_rows = max(3, term.lines - 12)
+    rows     = int(round(cols * aspect))
+    if rows > max_rows:
+        rows = max_rows
+        cols = max(VIEW_MIN_COLS, int(round(rows / aspect)))
+
+    # One cell holds however many tiles fall inside it -- at step 8 on a 960px-wide
+    # frame that is about a dozen -- so the most confident activation is what it shows.
+    cells = {}
+    for i, (x, y) in enumerate(points):
+        c = min(cols - 1, max(0, int(float(x) * cols / w_px)))
+        r = min(rows - 1, max(0, int(float(y) * rows / h_px)))
+        cells.setdefault((r, c), []).append(
+            (float(confs[i]) if i < len(confs) else 0.0,
+             int(ids[i])     if i < len(ids)   else -1))
+
+    palette = list(getattr(runtime._single_classifier, "class_colors", []) or [])
+
+    def class_style(cid):
+        return ansi_fg(palette[cid]) if colour and 0 <= cid < len(palette) else ""
+
+    def class_char(cid):
+        return VIEW_CLASS_CHARS[cid % len(VIEW_CLASS_CHARS)] if cid >= 0 else "?"
+
+    crowded = False
+    body    = []
+    for r in range(rows):
+        parts = [VIEW_DIM] if colour else []
+        for c in range(cols):
+            hits = cells.get((r, c))
+            if not hits:
+                parts.append(g["empty"])
+                continue
+            _, cid = max(hits)
+            char   = class_char(cid)
+            if len(hits) > 1:
+                char    = char.upper()
+                crowded = True
+            if colour:
+                parts.append(f"{bcolors.ENDC}{class_style(cid)}{bcolors.BOLD}{char}"
+                             f"{bcolors.ENDC}{VIEW_DIM}")
+            else:
+                parts.append(char)
+        if colour:
+            parts.append(bcolors.ENDC)
+        body.append("".join(parts))
+
+    # ---- frame -------------------------------------------------------------
+    model  = str(stats.get("name", "model")).replace(".pth", "")
+    header = (f"{g['h']} {model}  {w_px}x{h_px}px  tile {tile_size}  "
+              f"step {stats.get('step', runtime.get_step_size())} ")[:cols]
+    out = [paint(g["tl"] + header + g["h"] * (cols - len(header)) + g["tr"], VIEW_DIM),
+           *[paint(g["v"], VIEW_DIM) + line + paint(g["v"], VIEW_DIM) for line in body],
+           paint(g["bl"] + g["h"] * cols + g["br"], VIEW_DIM)]
+
+    # ---- summary, same numbers and the same verdict colour as the status line ----
+    thr   = runtime.get_max_probability_threshold()
+    thr_s = f"{thr:.3f}" if thr is not None else "model"
+    bg    = getattr(runtime, "_background_probability", 0.0)
+    if points:
+        verdict, tint = f"DEFECT x{len(points)}", bcolors.FAIL
+    else:
+        verdict, tint = "CLEAN", bcolors.OKGREEN
+    summary = [(verdict, paint(verdict, tint, bcolors.BOLD)),
+               *[(s, s) for s in (
+                   f"bg={bg:.3f}",
+                   f"T={thr_s}",
+                   f"@ {stats.get('hz', 0.0):.2f} Hz",
+                   f"{LiveClassifier._compact(stats.get('tiles', 0))} tiles",
+                   f"{LiveClassifier._compact(stats.get('tiles_per_sec', 0))} tile/s")]]
+    out += wrap_segments("  ", summary, width)
+
+    # ---- legend ------------------------------------------------------------
+    per_class = {}
+    for i in range(len(points)):
+        cid   = int(ids[i]) if i < len(ids) else -1
+        entry = per_class.setdefault(cid, {"name": names[i] if i < len(names) else "?",
+                                           "count": 0})
+        entry["count"] += 1
+    if per_class:
+        legend = []
+        for cid, e in sorted(per_class.items(), key=lambda kv: -kv[1]["count"]):
+            det_type, det_class = filter_type(e["name"])
+            char  = class_char(cid)
+            plain = f"{char} {det_type}/{det_class} x{e['count']}"
+            legend.append((plain, f"{class_style(cid)}{bcolors.BOLD}{char}{bcolors.ENDC} "
+                                  f"{det_type}/{det_class} x{e['count']}" if colour else plain))
+        out += wrap_segments("  classes ", legend, width)
+        if crowded:
+            note = "(a CAPITAL letter = 2+ activations in one cell)"
+            out.append(paint(" " * 10 + note[:width - 10], VIEW_DIM))
+    else:
+        out.append(paint("  classes  none activated this frame", VIEW_DIM))
+
+    # ---- the state the keys change -----------------------------------------
+    def flag(label, on):
+        text = f"{label}={'ON' if on else 'off'}"
+        if not colour:
+            return (text, text)
+        tint = bcolors.OKGREEN if on else VIEW_DIM
+        return (text, f"{label}={tint}{'ON' if on else 'off'}{bcolors.ENDC}")
+
+    out += wrap_segments("  toggles ", [
+        flag("window",   runtime.visualization_enabled()),
+        flag("paused",   runtime.inference_paused()),
+        flag("2-stage",  runtime.two_stage_enabled()),
+        flag("cascade",  runtime.cascade_enabled()),
+        flag("voting",   runtime.majority_voting_enabled()),
+        flag("limiter",  runtime.frame_limiter_enabled()),
+        flag("autosave", runtime.autosave_defect_snapshots_enabled()),
+        flag("lasers",   runtime.lasers_enabled()),
+    ], width)
+
+    fps   = runtime.get_target_fps()
+    knobs = [f"thr={thr_s}", f"step={runtime.get_step_size()}",
+             f"erosion={runtime.get_erosion_kernel()}", f"votes={runtime.get_min_votes()}",
+             f"window={runtime.get_majority_window()}",
+             f"fps={'unlimited' if fps <= 0.0 else f'{fps:g}'}",
+             f"scale={runtime.get_window_scale():.2f}"]
+    out += wrap_segments("  knobs   ", [(k, k) for k in knobs], width)
+    out += wrap_segments("  keys    ",
+                         [(k, paint(k, VIEW_DIM)) for k in
+                          ("V redraw", "h all keys", "v window", "p pause", "s snapshot", "q quit")],
+                         width)
+    return "\n".join(out)
 
 
 def handle_key(key, runtime, model_names):
@@ -1078,13 +1458,19 @@ def handle_key(key, runtime, model_names):
         return False
 
     if key in ("h", "?"):
+        runtime.end_status_line()
         print(KEY_HELP, flush=True)
+    elif key == "V":
+        runtime.end_status_line()
+        print(render_ascii_view(runtime), flush=True)
     elif key == "v":
         runtime.set_visualization(not runtime.visualization_enabled())
     elif key in ("p", " "):
         runtime.pause_inference(not runtime.inference_paused())
     elif key == "2":
         runtime.set_two_stage(not runtime.two_stage_enabled())
+    elif key == "3":
+        runtime.set_cascade(not runtime.cascade_enabled())
     elif key == "m":
         runtime.set_majority_voting(not runtime.majority_voting_enabled())
     elif key == "f":
@@ -1111,6 +1497,8 @@ def handle_key(key, runtime, model_names):
         runtime.set_erosion_kernel(runtime.get_erosion_kernel() + (1 if key == "E" else -1))
     elif key in ("n", "N"):
         runtime.set_min_votes(runtime.get_min_votes() + (1 if key == "N" else -1))
+    elif key in ("w", "W"):
+        runtime.set_majority_window(runtime.get_majority_window() + (2 if key == "W" else -2))
     elif key in (",", "."):
         runtime.set_fps(runtime.get_target_fps() + (1.0 if key == "." else -1.0))
     elif key in ("-", "_", "+"):
@@ -1137,7 +1525,6 @@ def bootstrap_shared_memory_library():
     os.system("git clone https://github.com/AmmarkoV/SharedMemoryVideoBuffers")
     os.system("cd SharedMemoryVideoBuffers && make && cd ..")
     os.system("ln -s SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so")
-    os.system("SharedMemoryVideoBuffers/server --nokb&")
 
 
 def parse_arguments(argv=None):
@@ -1166,12 +1553,18 @@ def parse_arguments(argv=None):
 
     parser.add_argument("--majority-voting", dest="majority_voting", action="store_true", default=None)
     parser.add_argument("--no-majority-voting", dest="majority_voting", action="store_false")
+    parser.add_argument("--majority-window", type=int, default=None,
+                        help="side of the square tile window majority voting uses (odd, >= 1; default 3)")
     parser.add_argument("--frame-limiter", dest="frame_limiter", action="store_true", default=None,
                         help="skip frames whose shared memory timestamp did not change")
     parser.add_argument("--no-frame-limiter", dest="frame_limiter", action="store_false")
     parser.add_argument("--two-stage", dest="two_stage", action="store_true", default=None,
                         help="start in two-stage ensemble mode")
     parser.add_argument("--no-two-stage", dest="two_stage", action="store_false")
+    parser.add_argument("--cascade", dest="cascade", action="store_true", default=None,
+                        help="start in cascade mode (needs the active preset's \"cascade\" "
+                             "stage list -- see recommended_configuration.json)")
+    parser.add_argument("--no-cascade", dest="cascade", action="store_false")
     parser.add_argument("--visualization", dest="visualization", action="store_true", default=None,
                         help="show the live heatmap window (default on)")
     parser.add_argument("--no-visualization", dest="visualization", action="store_false")
@@ -1189,6 +1582,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--laser-depths", default=None,
                         help="three fixed laser depths 'd1,d2,d3' standing in for the ROS laser topics")
     parser.add_argument("--quiet", action="store_true", help="do not print the per-frame summary")
+    parser.add_argument("--perf-log", action="store_true", help="append every frame's inference timing to perf.csv (off by default -- the file grows unbounded, ~700k lines/day of continuous use, for a per-frame write cost that profiling shows is negligible either way)")
     parser.add_argument("--verbose-detections", action="store_true", help="print every single detection")
     parser.add_argument("--debug", action="store_true", help="print debug-level messages")
     parser.add_argument("--no-keyboard", action="store_true", help="do not put the terminal in cbreak mode")
@@ -1263,9 +1657,13 @@ def main(argv=None):
             runtime.close()
             return 1
 
+        # Only this path gets inductor's autotuner: it runs one constant batch (the whole
+        # tile grid) every frame, so the one-off compile amortises. The ensemble members
+        # deliberately do NOT -- see ClassifierPnm._load_model()'s compile_mode comment.
         single_classifier = ClassifierPnm(
             model_path=os.path.join(PATH, f"{model_name}.pth"),
             cfg_path=os.path.join(PATH, f"{model_name}.json"),
+            compile_mode="max-autotune-no-cudagraphs",
         )
     # The preset's gate wins over the model json's own calibration, since the preset is
     # the deployment decision. Mode too -- a threshold means nothing without its mode.
@@ -1312,6 +1710,49 @@ def main(argv=None):
             runtime.logger.warning(f"Two-stage ensemble DISABLED — build failed: {e!r}")
             ensemble_classifier = None
 
+    # Cascade is OPTIONAL, same non-fatal-missing-model pattern as the ensemble above.
+    # Built only if the active preset actually requested it (runtime.cascade_enabled())
+    # -- an unpopulated "cascade" block (the common case) means no stages to resolve, no
+    # download attempt, no warning.
+    cascade_classifier = None
+    _cascade_stages_cfg = runtime.get_cascade_stages()
+    if runtime.cascade_enabled():
+        if len(_cascade_stages_cfg) < 2:
+            runtime.logger.warning(
+                f"Cascade requested but the active preset defines "
+                f"{len(_cascade_stages_cfg)} stage(s) (need >= 2) — cascade DISABLED")
+        else:
+            _cascade_needed = [s["model"] for s in _cascade_stages_cfg]
+            _cascade_missing = [m for m in _cascade_needed
+                                if not (os.path.isfile(os.path.join(PATH, m + ".pth"))
+                                        and os.path.isfile(os.path.join(PATH, m + ".json")))]
+            if _cascade_missing:
+                runtime.logger.warning(
+                    f"Cascade DISABLED — missing models: {_cascade_missing}. "
+                    f"Fetch them with: python3 -m mvc.inference.model_download "
+                    f"{' '.join(_cascade_missing)}")
+            else:
+                try:
+                    from mvc.inference.ensemble_classifier import CascadeClassifierPnm
+                    cascade_classifier = CascadeClassifierPnm(stage_cfgs=[
+                        dict(model_path=os.path.join(PATH, s["model"] + ".pth"),
+                             cfg_path=os.path.join(PATH, s["model"] + ".json"),
+                             step=int(s.get("step", 16)),
+                             threshold=float((s.get("gate") or {}).get("threshold", 0.0)),
+                             gate_mode=(s.get("gate") or {}).get("mode", GATE_DEFECT_MASS),
+                             assign_best_defect_class=bool(
+                                 (s.get("gate") or {}).get("assign_best_defect_class", True)))
+                        for s in _cascade_stages_cfg
+                    ])
+                    runtime.logger.info(
+                        "Cascade built: " + " -> ".join(
+                            f"{s['model']}(step={s.get('step', 16)}, "
+                            f"thr={(s.get('gate') or {}).get('threshold', 0.0)})"
+                            for s in _cascade_stages_cfg))
+                except Exception as e:
+                    runtime.logger.warning(f"Cascade DISABLED — build failed: {e!r}")
+                    cascade_classifier = None
+
     tile_size = 0  # updated inside the inference block each iteration
 
     # Shared memory frame source
@@ -1330,10 +1771,13 @@ def main(argv=None):
     else:
         runtime.logger.info("No interactive terminal — running with the command line settings")
 
+    perf_log                 = args.perf_log   # append each frame's inference timing to perf.csv (opt-in)
     last_processed_timestamp = None
     last_pushed_threshold    = None   # only log a gate change, never a per-frame no-op
     _warned_no_ensemble      = False  # log the two-stage fallback once, not every frame
+    _warned_no_cascade       = False  # log the cascade fallback once, not every frame
     _warned_channels         = False
+    _warned_no_frame         = False  # log a missing frame once per outage, not every 100 ms
 
     try:
         while True:
@@ -1354,23 +1798,30 @@ def main(argv=None):
 
             # Get image to work on
             if frame is None or smm.frame_size == 0:
-                runtime.logger.warning("Couldn't read frame from Shared Memory")
+                if not _warned_no_frame:
+                    runtime.logger.warning("Couldn't read frame from Shared Memory")
+                    _warned_no_frame = True
                 time.sleep(0.1)
                 continue
+            _warned_no_frame = False   # warn again the next time frames stop
 
             if runtime.frame_limiter_enabled() and frameTimestamp == last_processed_timestamp:
                 time.sleep(0.001)
                 continue
             last_processed_timestamp = frameTimestamp
 
-            if frame.ndim != 3 or frame.shape[2] != 4:
+            frame_is_raw_mosaic = frame.ndim == 2 or (frame.ndim == 3 and frame.shape[2] == 1)
+            frame_is_demosaiced = frame.ndim == 3 and frame.shape[2] == 4
+            if not (frame_is_raw_mosaic or frame_is_demosaiced):
                 if not _warned_channels:
                     runtime.logger.warning(
-                        f"Frame is {frame.shape}, the classifier expects HxWx4 RGBA tiles — "
-                        f"check the grabber's stream format")
+                        f"Frame is {frame.shape}, expected either a raw single-channel "
+                        f"polarization mosaic (auto-debayered downstream) or an already "
+                        f"HxWx4 RGBA array — check the grabber's stream format")
                     _warned_channels = True
 
-            runtime._last_frame = frame.copy()
+            # read_from_shared_memory() already returned a private copy, and nothing below writes to it
+            runtime._last_frame = frame
             runtime._last_frame_timestamp = frameTimestamp
 
             # Marker scanning (runs regardless of inference pause state)
@@ -1385,6 +1836,13 @@ def main(argv=None):
             # Run the neural network
             majority_voting = runtime.majority_voting_enabled()
             with torch.inference_mode():
+                if runtime.cascade_enabled() and cascade_classifier is None:
+                    if not _warned_no_cascade:
+                        runtime.logger.warning(
+                            "cascade requested but unavailable (see the DISABLED warning "
+                            "at startup) — falling back to two-stage/single classifier")
+                        _warned_no_cascade = True
+
                 if runtime.two_stage_enabled() and ensemble_classifier is None:
                     if not _warned_no_ensemble:
                         runtime.logger.warning(
@@ -1392,7 +1850,26 @@ def main(argv=None):
                             "falling back to the single classifier")
                         _warned_no_ensemble = True
 
-                if runtime.two_stage_enabled() and ensemble_classifier is not None:
+                infer_stats = {}   # filled by whichever branch runs; drives the status line
+                if runtime.cascade_enabled() and cascade_classifier is not None:
+                    # No per-frame step/threshold push here, unlike the two branches below:
+                    # a cascade's whole point is a jointly-tuned set of per-stage step/
+                    # threshold pairs (chosen offline, see knowledge/7-9-report.md §8.4-
+                    # §8.7), not a single knob an operator free-runs live. Retuning means
+                    # switching presets, same as a model hot-swap.
+                    with runtime._model_lock:
+                        tile_size = cascade_classifier.stages[-1].tile_size
+                        heatmap, occupancy, responses = cascade_classifier.forward(
+                            frame, legend=True, log=perf_log,
+                            erosion_kernel=runtime.get_erosion_kernel(),
+                            erosion_threshold=runtime.get_min_votes())
+                        inference_hz = getattr(cascade_classifier, "hz", 0.0)
+                        infer_stats = {"name": "cascade", "step": cascade_classifier.stages[-1].step,
+                                       "hz": inference_hz,
+                                       "tiles": getattr(cascade_classifier, "_last_tile_count", 0),
+                                       "tiles_per_sec": getattr(cascade_classifier, "_last_tile_count", 0)
+                                                        / max(getattr(cascade_classifier, "_last_elapsed", 1e-4), 1e-4)}
+                elif runtime.two_stage_enabled() and ensemble_classifier is not None:
                     with runtime._model_lock:
                         ensemble_classifier.step = runtime.get_step_size()
                         thr = runtime.get_max_probability_threshold()
@@ -1405,8 +1882,17 @@ def main(argv=None):
                             majorityVote=majority_voting,
                             parallel=True,
                             multimodel=True,
+                            log=perf_log,
+                            erosion_kernel=runtime.get_erosion_kernel(),
+                            erosion_threshold=runtime.get_min_votes(),
+                            majority_window=runtime.get_majority_window(),
                         )
                         inference_hz = getattr(ensemble_classifier, "hz", 0.0)
+                        infer_stats = {"name": "ensemble", "step": ensemble_classifier.step,
+                                       "hz": inference_hz,
+                                       "tiles": getattr(ensemble_classifier, "_last_tile_count", 0),
+                                       "tiles_per_sec": getattr(ensemble_classifier, "_last_tile_count", 0)
+                                                        / max(getattr(ensemble_classifier, "_last_elapsed", 1e-4), 1e-4)}
                 else:
                     with runtime._model_lock:
                         single_classifier.step = runtime.get_step_size()
@@ -1427,12 +1913,19 @@ def main(argv=None):
                             majorityVote=majority_voting,
                             erosion_kernel=runtime.get_erosion_kernel(),
                             erosion_threshold=runtime.get_min_votes(),
+                            log=perf_log,
+                            stats=infer_stats,
+                            majority_window=runtime.get_majority_window(),
                         )
                         inference_hz = single_classifier.hz
 
             # Snapshot responses for _save_current_frame sidecar JSON
             runtime._last_responses = responses
             runtime._last_tile_size = tile_size
+            # The heatmap is the window's own image, so its shape is the coordinate
+            # space responses["points"] are in -- what the terminal view scales against.
+            runtime._last_view_shape  = heatmap.shape[:2] if heatmap is not None else None
+            runtime._last_infer_stats = dict(infer_stats)
 
             # Publish detections
             points      = responses.get("points",      [])
@@ -1486,7 +1979,7 @@ def main(argv=None):
                 frameTimestamp,
             )
 
-            runtime.flush_frame(frameTimestamp, tile_size, inference_hz)
+            runtime.flush_frame(frameTimestamp, tile_size, inference_hz, infer_stats)
 
             # Visualization
             if runtime.visualization_enabled():

@@ -1,0 +1,8 @@
+string map_path
+string intrinsics_path
+---
+bool success
+string message
+geometry_msgs/Pose pose
+int32 inliers
+float64 reproj_rms_px

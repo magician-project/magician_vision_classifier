@@ -60,17 +60,22 @@ def _get_available_ram_bytes() -> int:
 
     return 0
 
-def _get_path_size_bytes(path: str) -> int:
+def _get_path_size_bytes(path) -> int:
     """
-    Calculate the total size in bytes of all files under a path (directory or file).
-    Skips files that raise OSError on access (permission issues, etc.).
+    Calculate the total size in bytes of all files under a path (directory or file),
+    or the sum across a list of such paths -- 'training_dataset' in a config can
+    legitimately be either (see load_training_dataset's isinstance(directory, list)
+    branch), and callers pass it through unnormalized.
+    Skips files/paths that raise OSError on access (permission issues, etc.).
 
     Args:
-        path: File or directory path.
+        path: File or directory path, or a list of them.
 
     Returns:
         Total size in bytes, or 0 if calculation fails.
     """
+    if isinstance(path, (list, tuple)):
+        return sum(_get_path_size_bytes(p) for p in path)
     try:
         if os.path.isfile(path):
             return os.path.getsize(path)
@@ -158,10 +163,26 @@ def _dataset_source_frames(dataset):
             m = m.decode() if isinstance(m, bytes) else m
             out.append(_json.loads(m)["source"].rsplit("(", 1)[0])
         return out
+    def _unknown_frames(ds):
+        # Not H5 -- no per-sample 'source' frame metadata exists (e.g. a PNG
+        # ImageFolder bolt-on dataset, such as a hard-example-mining directory
+        # explicitly built from frames outside both the main dump and the
+        # coverage set -- see analysis/datasets/mine_hard_tiles.py). Each sample
+        # gets a distinct sentinel that can never match a real frame path, so
+        # exclude_frames_indices() correctly never excludes any of them -- this
+        # constituent is exclude_frames-inert BY CONSTRUCTION, not silently
+        # assumed safe. Correct only if this constituent's own frames are
+        # already known to be disjoint from the coverage set (the caller's
+        # responsibility -- this function has no way to verify that itself).
+        print(f"[exclude_frames] {len(ds):,} samples from a non-H5 constituent "
+             f"({type(ds).__name__}) have no frame metadata -- treated as "
+             f"outside the coverage set (never excluded).")
+        return [f'<no-source-frame:{id(ds)}:{i}>' for i in range(len(ds))]
+
     if hasattr(dataset, "datasets"):          # CombinedDataset
         out = []
         for ds in dataset.datasets:
-            out.extend(_h5_frames(ds))
+            out.extend(_h5_frames(ds) if hasattr(ds, "file") else _unknown_frames(ds))
         return out
     if hasattr(dataset, "file"):              # HDF5Dataset
         return _h5_frames(dataset)
@@ -189,6 +210,10 @@ def exclude_frames_indices(dataset, exclude_frames):
         frames = list(exclude_frames)
     frames = set(frames)
     srcs = _np.array(_dataset_source_frames(dataset))
+    # NOT np.isin here -- measured SLOWER (5-10x) than the plain Python-set membership
+    # loop on this dataset's string arrays (7.1M tiles): numpy has no hash-based fast path
+    # for unicode dtype, so np.isin falls back to a sort/searchsorted strategy that loses
+    # to Python's O(1) set lookup at this scale. See knowledge/10-9-plan.md Phase 6.
     drop = _np.array([s in frames for s in srcs])
     present = len(set(srcs.tolist()) & frames)
     keep = _np.where(~drop)[0].tolist()
@@ -265,6 +290,8 @@ def frame_disjoint_split(dataset, val_split, seed, frozen_val_frames=None):
         else:
             frozen = list(frozen_val_frames)
         frozen = set(frozen)
+        # NOT np.isin -- see the same note in exclude_frames_indices: measured slower
+        # than this loop for string membership tests at this dataset's scale.
         is_val = _np.array([s in frozen for s in srcs])
         present = set(srcs.tolist())
         found = frozen & present
@@ -293,7 +320,7 @@ def frame_disjoint_split(dataset, val_split, seed, frozen_val_frames=None):
     rng = _np.random.default_rng(seed)
     n_val = max(1, int(round(len(uf) * val_split)))
     val_frames = set(rng.choice(uf, n_val, replace=False).tolist())
-    is_val = _np.array([fr in val_frames for fr in frame_id])
+    is_val = _np.isin(frame_id, list(val_frames))
     train_idx = _np.where(~is_val)[0].tolist()
     val_idx = _np.where(is_val)[0].tolist()
     print(f"[frame_disjoint_split] {len(uf)} frames -> {len(uf)-n_val} train / {n_val} val "
@@ -462,15 +489,34 @@ class RGBAImageFolder(datasets.DatasetFolder):
 
         Returns:
             (sample, target) or (sample, target, metadata) if return_metadata is True.
+            sample/target are always torch tensors -- matching HDF5Dataset.__getitem__'s
+            contract exactly (uint8 image tensor, long scalar label tensor) -- so this
+            dataset combines correctly with an HDF5Dataset constituent under
+            CombinedDataset/default_collate. Without this, a torchvision DatasetFolder
+            without a transform returns a raw numpy array + a bare Python int, which
+            silently crashes default_collate ('int' object has no attribute 'numel')
+            the moment a batch happens to mix samples from both constituent types --
+            confirmed live 2026-09-16 wiring analysis/datasets/mine_hard_tiles.py's
+            output into a combined training_dataset list.
         """
         path, target = self.samples[index]
 
         sample = self.loader(path)
         if self.transform is not None:
             sample = self.transform(sample)
+        elif isinstance(sample, np.ndarray):
+            # HDF5Dataset stores samples CHW (H5DatasetWriter's own HWC->CHW write
+            # convention); the raw loader here returns HWC. Permute to match, or a
+            # CombinedDataset batch silently mixes [C,H,W] and [H,W,C] tensors --
+            # confirmed live 2026-09-16, same investigation as the tensor/int fix
+            # just above (torch.stack raised "expects each tensor to be equal
+            # size... [4,48,48]... vs [48,48,4]" on a batch straddling both).
+            sample = torch.from_numpy(sample.astype(np.uint8)).permute(2, 0, 1).contiguous()
 
         if self.target_transform is not None:
             target = self.target_transform(target)
+        elif not torch.is_tensor(target):
+            target = torch.tensor(target, dtype=torch.long)
 
         if self.return_metadata:
             metadata = load_png_comment_metadata(path)

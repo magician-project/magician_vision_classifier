@@ -32,9 +32,18 @@ from mvc.inference.live_torch import (
     estimatePoseSingleMarkers, make_approx_camera_matrix, rvec_to_quaternion,
     resize_to_fit_screen, filter_type, class_to_severity,
 )
-from mvc.inference.ensemble_classifier import EnsembleClassifierPnm
+from mvc.inference.ensemble_classifier import EnsembleClassifierPnm, CascadeClassifierPnm
 from mvc.core.shared_memory import SharedMemoryManager
 from mvc.paths import repo_root
+
+# Marker-FREE camera localisation against the car's own surface pattern -- a DIFFERENT
+# mechanism from scan_and_publish_markers' ArUco-only pose above: that needs a marker in
+# view every time, this needs one only to have BUILT the map (offline, see
+# analysis/extrinsics_from_pattern.py's own docstring/measured numbers). locate_single_frame
+# is the one place the per-frame localisation logic lives; the CLI's own locate() has its
+# own loop, deliberately not refactored onto this to avoid touching a validated tool
+# (see locate_single_frame's docstring).
+from analysis.extrinsics_from_pattern import locate_single_frame, marker_object_points, load_intrinsics
 
 # --------------------------------------------------------
 import rclpy
@@ -57,6 +66,7 @@ from datetime import datetime
 from magician_vision_classifier.srv import SetInt64
 from magician_vision_classifier.srv import SetFloat64
 #from magician_vision_classifier.srv import SetString
+from magician_vision_classifier.srv import LocatePattern
 
 
 from std_msgs.msg import Float32, Header
@@ -93,7 +103,7 @@ def unix_ns_to_ros_time(ns):
 # The loader lives in classifierPnm so the ROS node, wxAnnotator and any other consumer
 # share ONE definition rather than hand-copied variants that drift apart.
 from mvc.inference.classifier_pnm import (load_recommended_configuration, FALLBACK_PRESET,
-                           RECOMMENDED_CONFIG_FILE)
+                           RECOMMENDED_CONFIG_FILE, GATE_DEFECT_MASS)
 
 
 # Two-stage ensemble members. This path is OPTIONAL: if any member cannot be resolved the
@@ -123,6 +133,27 @@ LASER_TOPICS = [
 # LASER_XY_PIXELS (the laser positions in the classifier's 2D image plane) and
 # LASER_IDW_POWER are imported from liveClassifierTorch so both runners fuse depth
 # identically; only the ROS topics that feed them are node-specific.
+
+
+# ========================================================
+# Pattern-based extrinsics (analysis/extrinsics_from_pattern.py)
+# ========================================================
+# The map (map.npz) and a real calibration (intrinsics.json, camera_matrix+dist_coeffs)
+# are built OFFLINE beforehand -- `python analysis/extrinsics_from_pattern.py build ...`
+# against a marker-bearing recording, once per car/rig -- and are NOT rebuilt by this
+# node. Neither is committed to git (they are distributed the same way model
+# checkpoints are, off the same server: scripts/uploadExtrinsics.sh /
+# mvc.inference.extrinsics_download) -- see that module for the on-disk naming
+# convention this reuses. These are just the DEFAULT rig/paths; set_locate_pattern's
+# request can override map_path/intrinsics_path per call, and if neither the local
+# files nor a server copy exist yet the service reports that clearly instead of
+# crashing the node.
+from mvc.inference.extrinsics_download import (DEFAULT_RIG as _EXTRINSICS_DEFAULT_RIG,
+                                                local_paths as _extrinsics_local_paths,
+                                                ensure_extrinsics)
+DEFAULT_EXTRINSICS_MAP, DEFAULT_EXTRINSICS_INTRINSICS = _extrinsics_local_paths(
+    _EXTRINSICS_DEFAULT_RIG)
+EXTRINSICS_MARKER_LENGTH_M = DEFAULT_MARKER_LENGTH_M  # same printed marker as the ArUco path
 
 
 # ========================================================
@@ -168,6 +199,12 @@ class DefectPublisher(Node):
         self._visualization_enabled = False
         self._inference_paused = False
         self._two_stage_enabled = False
+        # Ordered N-stage screen-then-recheck chain (CascadeClassifierPnm) -- a DIFFERENT
+        # mechanism from the two-stage ensemble above; see live_torch.py's identical
+        # attribute for the full rationale. Populated from the preset's "cascade" block,
+        # never from a service call: retuning means switching presets.
+        self._cascade_enabled = False
+        self._cascade_stages = []
         self._autosave_defect_snapshots = False
         self._frame_limiter = True
 
@@ -195,6 +232,7 @@ class DefectPublisher(Node):
         self._erosion_kernel = 1   # neighborhood radius for tile voting: (2k+1)^2 tiles
         self._min_votes = 6        # activated tiles (incl. itself) required in the neighborhood to accept a tile; 0/1 = voting off
         self._majority_voting = True
+        self._majority_window = 3  # odd side of the square tile window majority voting takes the mode over
 
         self._lock = threading.Lock()
 
@@ -219,6 +257,17 @@ class DefectPublisher(Node):
         self._cb_criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4)
         self._cam_matrix_cache = {}   # (h, w) -> (K, dist)
 
+        # Pattern-based extrinsics (marker-FREE localisation against a prebuilt map) --
+        # see analysis/extrinsics_from_pattern.py. The SIFT detector/matcher are built once
+        # here, same as the CLI tool's own build()/locate() do; the map+intrinsics are
+        # lazy-loaded on first request and cached by path, since loading a map is not free
+        # and most deployments only ever use one.
+        self._extrinsics_sift = cv2.SIFT_create(nfeatures=2000)
+        self._extrinsics_matcher = cv2.BFMatcher(cv2.NORM_L2)
+        self._extrinsics_obj = marker_object_points(EXTRINSICS_MARKER_LENGTH_M)
+        self._extrinsics_map_cache = {}         # map_path -> (points, descriptors, reference_marker)
+        self._extrinsics_intrinsics_cache = {}  # intrinsics_path -> (K, dist)
+
         # Laser state (latest samples)
         self._laser_depths = [float("nan"), float("nan"), float("nan")]
         if USE_LASERS:
@@ -235,6 +284,7 @@ class DefectPublisher(Node):
         self.create_service(SetBool,    "magician_vision_classifier/set_visualization", self._set_visualization_cb)
         self.create_service(SetBool,    "magician_vision_classifier/pause", self._pause_inference_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_two_stage", self._set_two_stage_cb)
+        self.create_service(SetBool,    "magician_vision_classifier/set_cascade", self._set_cascade_cb)
         self.create_service(SetFloat64, "magician_vision_classifier/set_fps", self._set_fps_cb)
         self.create_service(SetInt64,   "magician_vision_classifier/set_step", self._set_step_cb)
         self.create_service(SetFloat64, "magician_vision_classifier/set_threshold", self._set_threshold_cb)
@@ -248,6 +298,8 @@ class DefectPublisher(Node):
         self.create_service(SetBool,    "magician_vision_classifier/set_frame_limiter", self._set_frame_limiter_cb)
         #self.create_service(SetString,  "magician_vision_classifier/set_model", self._set_model_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_majority_voting", self._set_majority_voting_cb)
+        self.create_service(SetInt64,   "magician_vision_classifier/set_majority_window", self._set_majority_window_cb)
+        self.create_service(LocatePattern, "magician_vision_classifier/locate_pattern", self._locate_pattern_cb)
 
         # ------------------------------------------------
         # Services (NEW): runtime tuning
@@ -256,6 +308,8 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/set_visualization (SetBool)")
         self.get_logger().info("  magician_vision_classifier/pause (SetBool)")
         self.get_logger().info("  magician_vision_classifier/set_two_stage (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/set_cascade (SetBool; needs the "
+                               "active preset's \"cascade\" stage list)")
         self.get_logger().info("  magician_vision_classifier/set_fps (SetFloat64)")
         self.get_logger().info("  magician_vision_classifier/set_step (SetInt64)")
         self.get_logger().info("  magician_vision_classifier/set_threshold (SetFloat64)")
@@ -268,6 +322,10 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/set_frame_limiter (SetBool)")
         #self.get_logger().info("  magician_vision_classifier/set_model (SetString)")
         self.get_logger().info("  magician_vision_classifier/set_majority_voting (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/set_majority_window (SetInt64, odd >=1; side of the square tile window majority voting uses)")
+        self.get_logger().info("  magician_vision_classifier/locate_pattern (LocatePattern; "
+                               "marker-free camera pose vs. a prebuilt map, see "
+                               "analysis/extrinsics_from_pattern.py)")
 
 
         if USE_LASERS and self.publisher_m is not None:
@@ -283,6 +341,7 @@ class DefectPublisher(Node):
         """
         rt = preset.get("runtime") or {}
         gate = preset.get("gate") or {}
+        cascade = preset.get("cascade") or {}
         with self._lock:
             self._step_size          = int(rt.get("step", self._step_size))
             self._target_fps         = float(rt.get("target_fps", self._target_fps))
@@ -293,12 +352,19 @@ class DefectPublisher(Node):
             self._two_stage_enabled  = bool(rt.get("two_stage", self._two_stage_enabled))
             if gate.get("threshold") is not None:
                 self._threshold = float(gate["threshold"])
+            self._cascade_enabled = bool(cascade.get("enabled", False))
+            self._cascade_stages  = list(cascade.get("stages") or [])
         m = preset.get("measured") or {}
         self.get_logger().info(
             f"Preset '{preset.get('name','?')}': model={preset.get('model')} "
             f"gate={gate.get('mode')}@{gate.get('threshold')} step={self._step_size} "
             f"fps={self._target_fps} erosion_kernel={self._erosion_kernel} "
             f"min_votes={self._min_votes} majority_voting={self._majority_voting}")
+        if self._cascade_enabled:
+            chain = " -> ".join(f"{s.get('model')}(step={s.get('step')}, "
+                                f"thr={(s.get('gate') or {}).get('threshold')})"
+                                for s in self._cascade_stages)
+            self.get_logger().info(f"  cascade ENABLED: {chain}")
         if preset.get("description"):
             self.get_logger().info(f"  {preset['description']}")
         if "detected" in m and "false_alarm" in m:
@@ -348,6 +414,17 @@ class DefectPublisher(Node):
             self._two_stage_enabled = bool(request.data)
         response.success = True
         response.message = ("Two-stage execution ENABLED" if request.data else "Two-stage execution DISABLED")
+        self.get_logger().info(response.message)
+        return response
+
+    def _set_cascade_cb(self, request, response):
+        """Service callback to toggle cascade mode on/off. Only takes effect if the active
+        preset defined a stage list at startup -- this does not build a cascade out of thin
+        air. See CascadeClassifierPnm."""
+        with self._lock:
+            self._cascade_enabled = bool(request.data)
+        response.success = True
+        response.message = ("Cascade execution ENABLED" if request.data else "Cascade execution DISABLED")
         self.get_logger().info(response.message)
         return response
  
@@ -556,6 +633,20 @@ class DefectPublisher(Node):
         self.get_logger().info(response.message)
         return response
 
+    def _set_majority_window_cb(self, request, response):
+        """Set the side of the square tile window majority voting takes the mode over (odd, >=1)."""
+        w = int(request.data)
+        if w < 1 or w % 2 == 0:
+            response.success = False
+            response.message = f"Majority window must be an odd number >= 1 (got {w})"
+        else:
+            with self._lock:
+                self._majority_window = w
+            response.success = True
+            response.message = f"Majority window set to {w}x{w} tiles"
+        self.get_logger().info(response.message)
+        return response
+
     def _set_model_cb(self, request, response):
         """Service callback to hot-swap the single classifier model at runtime."""
         name = request.data.strip()
@@ -651,6 +742,11 @@ class DefectPublisher(Node):
         with self._lock:
             return self._min_votes
 
+    def get_majority_window(self):
+        """Thread-safe getter for the majority voting window side."""
+        with self._lock:
+            return self._majority_window
+
     def get_target_fps(self):
         """Thread-safe getter for the target FPS limit."""
         with self._lock:
@@ -670,6 +766,16 @@ class DefectPublisher(Node):
         """Thread-safe getter for the two-stage ensemble mode."""
         with self._lock:
             return self._two_stage_enabled
+
+    def cascade_enabled(self):
+        """Thread-safe getter for the cascade mode."""
+        with self._lock:
+            return self._cascade_enabled
+
+    def get_cascade_stages(self):
+        """Thread-safe getter for the active preset's ordered stage list."""
+        with self._lock:
+            return list(self._cascade_stages)
 
     def autosave_defect_snapshots_enabled(self):
         """Thread-safe getter for the autosave defect snapshots toggle."""
@@ -793,6 +899,153 @@ class DefectPublisher(Node):
         #     print("[Markers] No chessboard found.")
         self.get_logger().debug("Marker scan complete.")
 
+    # -------------------------
+    # Pattern-based extrinsics (analysis/extrinsics_from_pattern.py)
+    # -------------------------
+    @staticmethod
+    def _frame_to_mono(frame):
+        """Same pixel conversion as extrinsics_from_markers.png_mono, applied to an
+        in-memory frame instead of a file path: plain mean of the raw channels, NEVER a
+        BGR-luma cv2.cvtColor conversion. This has to match, not just resemble, how the
+        map was built -- extrinsics_from_pattern.py's own docstring is explicit that
+        matching must not depend on which channels a luma weighting favours, and a map
+        built from png_mono-processed frames would silently sit in a different
+        photometric domain than live descriptors taken through a different conversion."""
+        if frame.ndim == 2:
+            return frame
+        return frame.astype(np.float32).mean(axis=2).astype(np.uint8)
+
+    def _load_extrinsics_map(self, map_path):
+        """(points, descriptors, reference_marker) for `map_path`, cached after first
+        load -- a map can hold tens of thousands of points, not something to reload every
+        service call. Returns None if the file does not exist (not yet built)."""
+        if map_path in self._extrinsics_map_cache:
+            return self._extrinsics_map_cache[map_path]
+        if not os.path.isfile(map_path):
+            return None
+        data = np.load(map_path, allow_pickle=False)
+        entry = (data["points"].astype(np.float64), data["descriptors"].astype(np.float32),
+                 int(data["reference_marker"]))
+        self._extrinsics_map_cache[map_path] = entry
+        return entry
+
+    def _load_extrinsics_intrinsics(self, intrinsics_path):
+        """(K, dist) for `intrinsics_path`, cached after first load. Returns None if the
+        file does not exist. Deliberately NOT _get_camera_matrix's approximate
+        make_approx_camera_matrix(w, h) -- that is a resolution-only guess used for the
+        ArUco marker path above; a SIFT-map pose needs the real calibration
+        extrinsics_from_markers.py's own `calibrate` mode produces."""
+        if intrinsics_path in self._extrinsics_intrinsics_cache:
+            return self._extrinsics_intrinsics_cache[intrinsics_path]
+        if not os.path.isfile(intrinsics_path):
+            return None
+        entry = load_intrinsics(intrinsics_path)
+        self._extrinsics_intrinsics_cache[intrinsics_path] = entry
+        return entry
+
+    def _locate_pattern_cb(self, request, response):
+        """Marker-FREE camera pose against a prebuilt surface-pattern map.
+
+        Distinct from scan_markers/scan_and_publish_markers (ArUco-direct pose, needs a
+        marker visible in THIS frame, every time): this is analysis/extrinsics_from_pattern.py's
+        whole reason to exist -- "nobody will glue markers to customer vehicles" (its own
+        docstring) -- so no marker detection runs on the live frame at all here
+        (locate_single_frame is called with detector=None). A marker is only ever needed
+        OFFLINE, once, to bootstrap the map's coordinate frame during `build`.
+
+        Returns the pose in that REFERENCE MARKER's frame -- both extrinsics tools'
+        established convention in this codebase for "a fixed point on the car" (the
+        marker used to BUILD the map, baked into map.npz, not re-detected here; see
+        analysis/extrinsics_from_pattern.py's and extrinsics_from_markers.py's own
+        docstrings), since neither tool computes or stores a further offset to some
+        separately-defined chassis origin. response.message says this explicitly so a
+        caller does not assume a calibration step happened here that did not.
+
+        The map (map.npz) and a real camera calibration (intrinsics.json) must already
+        exist -- both are built OFFLINE, once per car/rig, via
+        `python analysis/extrinsics_from_pattern.py build ...` and
+        `extrinsics_from_markers.py calibrate`. This service does not build either, but
+        when the DEFAULT rig's paths are in use (map_path/intrinsics_path left empty) it
+        WILL auto-download them from the same server the model checkpoints live on if
+        they are not already present locally -- mirrors ClassifierPnm's own
+        ensure_model auto-fetch (see mvc.inference.extrinsics_download). An explicit
+        map_path/intrinsics_path is taken as a local file the caller already has and is
+        not auto-fetched.
+        """
+        using_default = not request.map_path and not request.intrinsics_path
+        if using_default:
+            # Best-effort: a fetch failure still falls through to the "no map" message
+            # below with a clear next step, rather than being surfaced as its own error.
+            ensure_extrinsics(_EXTRINSICS_DEFAULT_RIG)
+        map_path = request.map_path or DEFAULT_EXTRINSICS_MAP
+        intrinsics_path = request.intrinsics_path or DEFAULT_EXTRINSICS_INTRINSICS
+
+        with self._lock:
+            frame = self._last_frame
+
+        if frame is None:
+            response.success = False
+            response.message = "No frame available yet."
+            return response
+
+        map_data = self._load_extrinsics_map(map_path)
+        if map_data is None:
+            response.success = False
+            response.message = (f"No map at {map_path} (and none fetchable from the "
+                                f"server) -- build one first: "
+                                f"python analysis/extrinsics_from_pattern.py build "
+                                f"--folder <recording> --intrinsics <intrinsics.json> "
+                                f"--out {map_path}, then "
+                                f"scripts/uploadExtrinsics.sh to publish it.")
+            return response
+        map_points, map_desc, reference_marker = map_data
+
+        intrinsics = self._load_extrinsics_intrinsics(intrinsics_path)
+        if intrinsics is None:
+            response.success = False
+            response.message = (f"No camera calibration at {intrinsics_path} -- see "
+                                f"analysis/extrinsics_from_markers.py's calibrate mode.")
+            return response
+        K, dist = intrinsics
+
+        mono = self._frame_to_mono(frame)
+        # detector=None deliberately: this path must not depend on a marker being visible
+        # on the car (see locate_single_frame's docstring) -- that dependency belongs to
+        # scan_and_publish_markers/extrinsics_from_markers.py's ArUco-direct pose only.
+        result = locate_single_frame(
+            mono, K, dist, map_points, map_desc,
+            self._extrinsics_sift, self._extrinsics_matcher,
+            self._extrinsics_obj, reference_marker,
+            marker_length=EXTRINSICS_MARKER_LENGTH_M)
+
+        if result is None:
+            response.success = False
+            response.message = "Localisation failed (too few matches or RANSAC inliers this frame)."
+            return response
+
+        qx, qy, qz, qw = rvec_to_quaternion(result["rvec"])
+        tvec = result["tvec"].ravel()
+        pose = Pose()
+        pose.position.x = float(tvec[0])
+        pose.position.y = float(tvec[1])
+        pose.position.z = float(tvec[2])
+        pose.orientation.x = qx
+        pose.orientation.y = qy
+        pose.orientation.z = qz
+        pose.orientation.w = qw
+
+        response.success = True
+        response.pose = pose
+        response.inliers = int(result["inliers"])
+        response.reproj_rms_px = float(result["reproj_rms_px"])
+        response.message = (
+            f"Pose is w.r.t. reference marker {reference_marker}'s frame (this "
+            f"codebase's convention for \"a fixed point on the car\", not a separately "
+            f"calibrated chassis origin -- see analysis/extrinsics_from_pattern.py). "
+            f"inliers={response.inliers} reproj_rms_px={response.reproj_rms_px:.2f}")
+        self.get_logger().info(response.message)
+        return response
+
     def publish_detection(self, x, y, w, h, det_type, det_class, probability, depth_z=0.0, ts=0):
         """Publish a Detection message with 2D box, type, class, and optional depth.
 
@@ -892,6 +1145,9 @@ def main():
         i = sys.argv.index("--model-config")
         if i + 1 < len(sys.argv):
             model_config_path = sys.argv[i + 1]
+    # --perf-log appends every frame's inference timing to perf.csv (off by default --
+    # the file grows unbounded otherwise)
+    perf_log = "--perf-log" in sys.argv
     preset = load_recommended_configuration(preset_name)
     model_name = preset["model"]
     ros_node.apply_preset(preset)
@@ -921,9 +1177,12 @@ def main():
             rclpy.shutdown()
             return
 
+        # Autotuned for the same reason as live_torch.py's copy: this path runs one
+        # constant batch per frame. See ClassifierPnm._load_model()'s compile_mode comment.
         single_classifier = ClassifierPnm(
             model_path=os.path.join(PATH, f"{model_name}.pth"),
             cfg_path=os.path.join(PATH, f"{model_name}.json"),
+            compile_mode="max-autotune-no-cudagraphs",
         )
     # The preset's gate wins over the model json's own calibration, since the preset is
     # the deployment decision. Mode too -- a threshold means nothing without its mode.
@@ -966,6 +1225,45 @@ def main():
             ros_node.get_logger().warning(f"Two-stage ensemble DISABLED — build failed: {e!r}")
             ensemble_classifier = None
 
+    # Cascade is OPTIONAL, same non-fatal-missing-model pattern as the ensemble above.
+    cascade_classifier = None
+    _cascade_stages_cfg = ros_node.get_cascade_stages()
+    if ros_node.cascade_enabled():
+        if len(_cascade_stages_cfg) < 2:
+            ros_node.get_logger().warning(
+                f"Cascade requested but the active preset defines "
+                f"{len(_cascade_stages_cfg)} stage(s) (need >= 2) — cascade DISABLED")
+        else:
+            _cascade_needed = [s["model"] for s in _cascade_stages_cfg]
+            _cascade_missing = [m for m in _cascade_needed
+                                if not (os.path.isfile(os.path.join(PATH, m + ".pth"))
+                                        and os.path.isfile(os.path.join(PATH, m + ".json")))]
+            if _cascade_missing:
+                ros_node.get_logger().warning(
+                    f"Cascade DISABLED — missing models: {_cascade_missing}. "
+                    f"Fetch them with: python3 -m mvc.inference.model_download "
+                    f"{' '.join(_cascade_missing)}")
+            else:
+                try:
+                    cascade_classifier = CascadeClassifierPnm(stage_cfgs=[
+                        dict(model_path=os.path.join(PATH, s["model"] + ".pth"),
+                             cfg_path=os.path.join(PATH, s["model"] + ".json"),
+                             step=int(s.get("step", 16)),
+                             threshold=float((s.get("gate") or {}).get("threshold", 0.0)),
+                             gate_mode=(s.get("gate") or {}).get("mode", GATE_DEFECT_MASS),
+                             assign_best_defect_class=bool(
+                                 (s.get("gate") or {}).get("assign_best_defect_class", True)))
+                        for s in _cascade_stages_cfg
+                    ])
+                    ros_node.get_logger().info(
+                        "Cascade built: " + " -> ".join(
+                            f"{s['model']}(step={s.get('step', 16)}, "
+                            f"thr={(s.get('gate') or {}).get('threshold', 0.0)})"
+                            for s in _cascade_stages_cfg))
+                except Exception as e:
+                    ros_node.get_logger().warning(f"Cascade DISABLED — build failed: {e!r}")
+                    cascade_classifier = None
+
     tile_size = 0  # updated inside the inference block each iteration
 
     # Shared memory frame source
@@ -979,6 +1277,8 @@ def main():
 
     last_processed_timestamp = None
     _warned_no_ensemble = False   # log the two-stage fallback once, not every frame
+    _warned_no_cascade = False    # log the cascade fallback once, not every frame
+    _warned_no_frame = False      # log a missing frame once per outage, not every 100 ms
 
     try:
         while True:
@@ -995,16 +1295,20 @@ def main():
 
             # Get image to work on
             if frame is None or smm.frame_size == 0:
-                ros_node.get_logger().warning("Couldn't read frame from Shared Memory")
+                if not _warned_no_frame:
+                    ros_node.get_logger().warning("Couldn't read frame from Shared Memory")
+                    _warned_no_frame = True
                 time.sleep(0.1)
                 continue
+            _warned_no_frame = False   # warn again the next time frames stop
 
             if ros_node.frame_limiter_enabled() and frameTimestamp == last_processed_timestamp:
                 time.sleep(0.001)
                 continue
             last_processed_timestamp = frameTimestamp
 
-            ros_node._last_frame = frame.copy()
+            # read_from_shared_memory() already returned a private copy, and nothing below writes to it
+            ros_node._last_frame = frame
             ros_node._last_frame_timestamp = frameTimestamp
 
             # Marker scanning (runs regardless of inference pause state)
@@ -1019,6 +1323,13 @@ def main():
             # Run the neural network
             majority_voting = ros_node.majority_voting_enabled()
             with torch.inference_mode():
+                if ros_node.cascade_enabled() and cascade_classifier is None:
+                    if not _warned_no_cascade:
+                        ros_node.get_logger().warning(
+                            "cascade requested but unavailable (see the DISABLED warning "
+                            "at startup) — falling back to two-stage/single classifier")
+                        _warned_no_cascade = True
+
                 if ros_node.two_stage_enabled() and ensemble_classifier is None:
                     if not _warned_no_ensemble:
                         ros_node.get_logger().warning(
@@ -1026,7 +1337,17 @@ def main():
                             "falling back to the single classifier")
                         _warned_no_ensemble = True
 
-                if ros_node.two_stage_enabled() and ensemble_classifier is not None:
+                if ros_node.cascade_enabled() and cascade_classifier is not None:
+                    # No per-frame step/threshold push here, unlike the two branches below
+                    # -- a cascade's per-stage step/threshold are jointly tuned offline;
+                    # retuning means switching presets. See live_torch.py's identical branch.
+                    with ros_node._model_lock:
+                        tile_size = cascade_classifier.stages[-1].tile_size
+                        heatmap, occupancy, responses = cascade_classifier.forward(
+                            frame, legend=True, log=perf_log,
+                            erosion_kernel=ros_node.get_erosion_kernel(),
+                            erosion_threshold=ros_node.get_min_votes())
+                elif ros_node.two_stage_enabled() and ensemble_classifier is not None:
                     with ros_node._model_lock:
                         ensemble_classifier.step = ros_node.get_step_size()
                         thr = ros_node.get_max_probability_threshold()
@@ -1039,6 +1360,10 @@ def main():
                             majorityVote=majority_voting,
                             parallel=True,
                             multimodel=True,
+                            log=perf_log,
+                            erosion_kernel=ros_node.get_erosion_kernel(),
+                            erosion_threshold=ros_node.get_min_votes(),
+                            majority_window=ros_node.get_majority_window(),
                         )
                 else:
                     with ros_node._model_lock:
@@ -1058,6 +1383,8 @@ def main():
                             majorityVote=majority_voting,
                             erosion_kernel=ros_node.get_erosion_kernel(),
                             erosion_threshold=ros_node.get_min_votes(),
+                            log=perf_log,
+                            majority_window=ros_node.get_majority_window(),
                         )
 
             # Snapshot responses for _save_current_frame sidecar JSON

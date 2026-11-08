@@ -9,7 +9,7 @@ from mvc.inference.live_torch import (
     readPolarPNMToRGBALive,
     tile_and_cast_data_torch,
     classify_tiles,
-    generate_heatmap,
+    render_predictions,
     runSingle,
     log_performance,
     gate_tiles,
@@ -149,8 +149,8 @@ def classify_selected_tiles(name,
                                              assignBestDefectClass=assignBestDefectClass)
             low_activations += forced
 
-    print(f"Low-confidence tiles reassigned: {low_activations}")
-    print(f"classify_selected_tiles ({name}) done in {time.time() - start:.2f}s, on {len(predictions)} selected tiles")
+    #print(f"Low-confidence tiles reassigned: {low_activations}")
+    #print(f"classify_selected_tiles ({name}) done in {time.time() - start:.2f}s, on {len(predictions)} selected tiles")
 
     if return_torch:
         return predictions, max_probs
@@ -205,19 +205,55 @@ def majority_vote_final(predictions, confidences, tilesW, tilesH, window_size=3)
     return smooth_preds.flatten().numpy(), smooth_confs.flatten().numpy()
 
 # -------------------------------------------------------------------------------------
+# Fixed batch-size buckets for the ensemble's stage-2 models
+# -------------------------------------------------------------------------------------
+# ClassifierPnm.compile()s every model (classifier_pnm.py), and live_torch.py turns on
+# torch.backends.cudnn.benchmark -- both assume a STABLE input shape and pay a one-off
+# multi-second re-trace/re-autotune cost the first time they see a new one. That's fine
+# for the single-classifier and stage-1 paths, which always batch the full, constant
+# tile grid (e.g. 5950 tiles). It is NOT fine for the stage-2 ensemble members: they only
+# run on the non_clean_indices subset, whose size is scene-dependent and changes on
+# nearly every frame, so nearly every frame paid that one-off cost -- measured at
+# 11-16s/call with a synthetic random-size repro (mirrored in production: 3-6 frames
+# processed in 45-60s instead of a steady ~12-23Hz). Rounding the batch up to the
+# nearest of a handful of fixed sizes below means only ~7 distinct shapes are ever
+# seen (well under torch._dynamo's default recompile_limit of 8), so the compile/
+# autotune cost is paid at most once per bucket instead of once per frame.
+_TILE_BATCH_BUCKETS = (64, 128, 256, 512, 1024, 2048, 4096)
+
+
+def _bucketed_batch_size(n, max_n):
+    """Round n up to the next fixed bucket in _TILE_BATCH_BUCKETS, or max_n if n is
+    larger than every bucket. max_n should be the total tile count available to pad
+    from (the full per-frame tile grid), which is also the shape the stage-1 model
+    already runs at every frame, so its compile/autotune cache is warm too."""
+    for b in _TILE_BATCH_BUCKETS:
+        if n <= b:
+            return min(b, max_n)
+    return max_n
+
+
+# -------------------------------------------------------------------------------------
 # Async multi-model helpers
 # -------------------------------------------------------------------------------------
-def run_models_async(models, x):
+def run_models_async(models, x, streams):
     """
-    Run all models in *models* concurrently on separate CUDA streams.
+    Run all models in *models* concurrently on the given *streams* (one per model).
+
+    *streams* must be persistent torch.cuda.Stream objects created once by the caller
+    (e.g. EnsembleClassifierPnm keeps one per model for its whole lifetime) and reused
+    across calls. Allocating a fresh torch.cuda.Stream() on every frame -- the previous
+    version of this function did -- let per-stream caching-allocator bookkeeping pile up
+    call after call: the per-call Hz timer (wall clock of just this function) stayed
+    fast, but the process as a whole showed multi-second, GPU-idle (0% utilization)
+    stalls between frames -- 6 frames processed in 60s instead of the ~700-1400 a
+    steady ~12-23Hz would give. Reusing the same streams every call removes that growth.
 
     Input *x* is converted to channels_last memory format (zero-copy stride update)
     before fanning out to streams. Uses FP16 autocast. Requires CUDA.
     """
     assert torch.cuda.is_available(), "CUDA required for async inference"
-    device = next(models[0].parameters()).device
-
-    streams = [torch.cuda.Stream(device=device) for _ in models]
+    assert len(streams) == len(models), "run_models_async needs one persistent stream per model"
     results = [None] * len(models)
 
     # Convert input once to channels-last before fanning out to streams.
@@ -230,11 +266,15 @@ def run_models_async(models, x):
             with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 results[i] = model(x)   # read-only input, no clone needed
 
-    torch.cuda.synchronize()
+    # Wait only on the streams this call actually used, not a whole-device
+    # torch.cuda.synchronize() (which also blocks on unrelated queued work).
+    for stream in streams:
+        stream.synchronize()
     return results
 # -------------------------------------------------------------------------------------
 # -------------------------------------------------------------------------------------
-def parallel_classify_tiles(classifiers, rgba_image, tile_size, step, majorityVote=False, max_workers=None):
+def parallel_classify_tiles(classifiers, rgba_image, tile_size, step, majorityVote=False, max_workers=None,
+                            majority_window=3):
     """
     Run classify_tiles() for each model in parallel CPU threads.
 
@@ -252,6 +292,7 @@ def parallel_classify_tiles(classifiers, rgba_image, tile_size, step, majorityVo
                 tile_size=tile_size,
                 step=step,
                 majorityVote=majorityVote,
+                majority_window=majority_window,
             ): i
             for i, clf in enumerate(classifiers)
         }
@@ -317,6 +358,17 @@ class EnsembleClassifierPnm:
         self.classes      = self._all_classifiers[0].classes
         self.class_colors = self._all_classifiers[0].class_colors
         self.device       = self._all_classifiers[0].device
+
+        # One persistent CUDA stream per ensemble model, created once here and reused by
+        # run_models_async() on every forward() call -- see that function's docstring for
+        # why creating fresh streams per-frame is not just wasteful but actively harmful.
+        # Keyed by name (not list position) so a later apply_min_hz() re-filter can look
+        # streams up for whatever subset is active without recreating anything.
+        self._streams_by_name = {}
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            self._streams_by_name = {
+                clf.name: torch.cuda.Stream(device=self.device) for clf in self._all_classifiers
+            }
 
         # Precompute clean class ID once
         def find_clean_id(cls_list):
@@ -456,7 +508,8 @@ class EnsembleClassifierPnm:
 
     # -------------------------------------------------------------------------
     @torch.no_grad()
-    def forward(self, image, majorityVote=False, legend=True, strict=True, parallel=False, multimodel=True , debugExecuteSecondStage=False, log=True):
+    def forward(self, image, majorityVote=False, legend=True, strict=True, parallel=False, multimodel=True , debugExecuteSecondStage=False, log=True,
+                erosion_kernel=0, erosion_threshold=0, majority_window=3):
         """
         Two-stage ensemble inference: prefilter (binary clean/non-clean) then ensemble voting.
 
@@ -467,7 +520,9 @@ class EnsembleClassifierPnm:
              Supports three execution modes: async CUDA streams (multimodel=True, default),
              CPU thread pool (parallel=True), or serial (multimodel=False, parallel=False).
           4. Majority-vote across ensemble predictions and scatter into full-grid output.
-          5. Optionally apply spatial majority-vote smoothing and generate a heatmap.
+          5. Optionally apply spatial majority-vote smoothing (majority_window x majority_window)
+             and generate a heatmap, keeping only tiles that pass the neighbourhood vote
+             (erosion_kernel/erosion_threshold, same rule as ClassifierPnm.forward).
         """
         start = time.time()
 
@@ -499,6 +554,7 @@ class EnsembleClassifierPnm:
                                                           gateMode=self.gateMode,
                                                           assignBestDefectClass=self.assignBestDefectClass,
                                                           return_tiles=True,
+                                                          majority_window=majority_window,
                                                          )
             base_preds       = torch.tensor(base_preds_np, device=self.device, dtype=torch.int32)
             base_confidences = torch.tensor(base_confs_np, device=self.device, dtype=torch.float32)
@@ -522,11 +578,11 @@ class EnsembleClassifierPnm:
         # --- Identify non-clean tiles ---
         non_clean_indices = (base_preds != self.firstCleanClassID).nonzero(as_tuple=True)[0]
         if len(non_clean_indices) == 0:
-            print("All tiles are clean — no ensemble voting needed!")
+            #print("All tiles are clean — no ensemble voting needed!")
             final_predictions = base_preds
             final_confidences = base_confidences
         else:
-            print(f"{len(non_clean_indices)} non-clean tiles for ensemble voting")
+            #print(f"{len(non_clean_indices)} non-clean tiles for ensemble voting")
 
             # --- Step 3: Ensemble inference ---
             # Reuse all_tiles from stage 1 — no second unfold over the full image
@@ -547,8 +603,22 @@ class EnsembleClassifierPnm:
             #     Serial execution of the nets is the fallback especially on low VRAM machines
             #===========================================================================================
             if multimodel:
-                print("Running ensemble via async CUDA streams")
-                outputs = run_models_async([clf.model for clf in self.classifiers], npTiles)
+                #print("Running ensemble via async CUDA streams")
+                # Pad the selected-tile batch up to a fixed bucket size -- see
+                # _bucketed_batch_size()'s docstring for why a raw, scene-dependent
+                # batch size stalls torch.compile/cudnn.benchmark for 11-16s/frame.
+                n_selected = npTiles.shape[0]
+                bucket_n = _bucketed_batch_size(n_selected, all_tiles.shape[0])
+                if bucket_n > n_selected:
+                    pad_tiles = npTiles[:1].repeat(bucket_n - n_selected, 1, 1, 1)
+                    npTiles_batch = torch.cat([npTiles, pad_tiles], dim=0)
+                else:
+                    npTiles_batch = npTiles
+
+                streams = [self._streams_by_name[clf.name] for clf in self.classifiers]
+                outputs = run_models_async([clf.model for clf in self.classifiers], npTiles_batch, streams)
+                # Drop the padding rows before voting -- they were never real tiles.
+                outputs = [o[:n_selected] for o in outputs]
                 # Models may have different class counts — process each separately
                 for o in outputs:
                     probs = torch.nn.functional.softmax(o.float(), dim=1)
@@ -557,14 +627,15 @@ class EnsembleClassifierPnm:
                     conf_list.append(max_probs)
             elif parallel:
             #===========================================================================================
-                print("Running ensemble via CPU thread pool ( This runs all tiles, not just selected btw ) ")
-                ensemble_results = parallel_classify_tiles(self.classifiers, rgba_image, self.tile_size, self.step, majorityVote)
+                #print("Running ensemble via CPU thread pool ( This runs all tiles, not just selected btw ) ")
+                ensemble_results = parallel_classify_tiles(self.classifiers, rgba_image, self.tile_size, self.step, majorityVote,
+                                                           majority_window=majority_window)
                 for preds, confs in ensemble_results:
                      preds_list.append(torch.tensor(preds, device=self.device))
                      conf_list.append(torch.tensor(confs, device=self.device))
             else:
             #===========================================================================================
-                print("Running ensemble serially")
+                #print("Running ensemble serially")
                 for clf in self.classifiers:
                     _t0 = time.time()
                     if (debugExecuteSecondStage):
@@ -579,6 +650,7 @@ class EnsembleClassifierPnm:
                                                      gateMode=self.gateMode,
                                                      assignBestDefectClass=self.assignBestDefectClass,
                                                      return_torch=not majorityVote,
+                                                     majority_window=majority_window,
                                                     )
                        if majorityVote:  # numpy path — wrap back
                            preds = torch.tensor(preds, device=self.device)
@@ -625,14 +697,18 @@ class EnsembleClassifierPnm:
         final_confidences = final_confidences.cpu().numpy()
 
         if (majorityVote):
-           # Compute tile grid dimensions — must match majority_vote_2d_pytorch
-           # which uses (dim - tile_size) // step (no +1), truncating raw unfold output.
+           # Compute tile grid dimensions — must match the unfold-based grid every
+           # other tile count in this pipeline uses (classify_tiles, generate_heatmap):
+           # (dim - tile_size) // step + 1. Omitting the +1 here used to undercount the
+           # grid by one row/column, so majority_vote_final() silently truncated
+           # final_predictions/final_confidences (~154 tiles on a 2048x2448 frame),
+           # dropping real tiles from the ensemble vote every frame.
            height, width, _ = rgba_image.shape
-           tilesW = (width  - self.tile_size) // self.step
-           tilesH = (height - self.tile_size) // self.step
+           tilesW = (width  - self.tile_size) // self.step + 1
+           tilesH = (height - self.tile_size) // self.step + 1
 
            # Apply majority vote smoothing
-           final_predictions, final_confidences = majority_vote_final(final_predictions, final_confidences, tilesW, tilesH, window_size=3)
+           final_predictions, final_confidences = majority_vote_final(final_predictions, final_confidences, tilesW, tilesH, window_size=majority_window)
 
         # final_predictions should now be mostly 'self.cleanClassID' (e.g. 7),
         # with other ensemble class IDs only on non-clean tiles.
@@ -640,15 +716,17 @@ class EnsembleClassifierPnm:
         #global_votes = global_votes.cpu().numpy()  # (optional debugging)
 
         # --- Step 5: Generate heatmap using final voted results ---
-        heatmap, occupancy, responses = generate_heatmap(
+        heatmap, occupancy, responses = render_predictions(
                                                          final_predictions,
                                                          final_confidences,
                                                          self.classes,
                                                          self.class_id_to_color,
                                                          self.cleanClassID,
                                                          rgba_image,  # uint8, no scaling needed
-                                                         tile_size=self.tile_size,
-                                                         step=self.step,
+                                                         self.tile_size,
+                                                         self.step,
+                                                         erosion_kernel=erosion_kernel,
+                                                         erosion_threshold=erosion_threshold,
                                                         )
 
         if legend:
@@ -659,7 +737,11 @@ class EnsembleClassifierPnm:
         self._last_tile_count = len(final_predictions)
         self._last_elapsed    = elapsed
 
-        self.print_perf()
+        # print_perf() is an on-demand diagnostic, not per-frame output. Calling it here
+        # printed a block every frame -- and since model_perf is only ever filled by the
+        # SERIAL branch, in the default async path that block was the literal line
+        # "[Ensemble] No performance data yet." at 20+ Hz. It also scrolled the live status
+        # line away. The same numbers now reach the status line through infer_stats.
 
         if (log):
           runid="ensemble"
@@ -668,5 +750,270 @@ class EnsembleClassifierPnm:
           if multimodel:
              runid="%s-multimodel" % runid
           log_performance("perf.csv", runid, self.step, self.tile_size, majorityVote, self.maxProbabilityThreshold, len(non_clean_indices), self.hz)
+        return heatmap, occupancy, responses
+
+
+# =======================================================================================
+# Cascade classifier: an ORDERED chain of stages, each with its own tiling step and gate
+# threshold, replacing EnsembleClassifierPnm's fixed "one screen + N-way majority vote"
+# shape with a genuine screen-then-recheck-then-recheck... pipeline.
+#
+# analysis/eval/eval_cascade_step_sweep.py measured this exact mechanism OFFLINE, from
+# cached per-frame scores, before any live code existed to run it -- the containment-
+# matrix geometry below is a direct port of that script's containment_matrix/
+# eligible_mask (same derivation: the tile grid is separable, square tiles, uniform
+# steps per axis, so "which target cells overlap a promoted source cell" is two matrix
+# multiplies, not a pixel raster), adapted from per-frame numpy arrays swept across many
+# cached frames offline to GPU torch tensors computed once per live frame.
+# =======================================================================================
+@torch.no_grad()
+def containment_matrix_torch(step_from, step_to, size, tile_size, device):
+    """(n_from, n_to) bool, ONE axis: does tile `f` of step_from contain the CENTER of
+    tile `t` of step_to? Geometry only -- independent of frame content and threshold, so
+    the caller should compute this once per (step_from, step_to, size, tile_size) and
+    reuse it for every frame that pair of stages ever processes (see
+    CascadeClassifierPnm._containment).
+
+    Mirrors tile_and_cast_data_torch's unfold convention exactly: tile origins at
+    0, step, 2*step, ... while the tile still fits (`torch.arange(0, size-tile+1, step)`,
+    the same formula grid_origins() in analysis/eval/eval_step_curve.py uses) -- any
+    independent formula here would silently drift from what the tiler actually produces.
+    """
+    xs_from = torch.arange(0, size - tile_size + 1, step_from, device=device)
+    xs_to   = torch.arange(0, size - tile_size + 1, step_to,   device=device)
+    centers_to = xs_to + tile_size // 2
+    return ((xs_from[:, None] <= centers_to[None, :]) &
+            (centers_to[None, :] < xs_from[:, None] + tile_size))
+
+
+@torch.no_grad()
+def eligible_mask_torch(promoted2d, y_contain, x_contain):
+    """(ny_to, nx_to) bool: which of the TARGET grid's cells overlap a promoted cell of
+    the SOURCE grid.
+
+        eligible[y2,x2] = OR over (y1,x1) promoted[y1,x1] AND y_contain[y1,y2] AND x_contain[x1,x2]
+                         = (y_contain.T @ promoted @ x_contain) > 0
+
+    See eval_cascade_step_sweep.py's docstring for the full derivation.
+
+    dtype note: the numpy original (eval_cascade_step_sweep.py) does this matmul in
+    int8/int32, which numpy's CPU BLAS handles fine. cuBLAS does NOT implement integer
+    GEMM ("addmm_cuda not implemented for 'Int'", caught live on GPU) -- so this uses
+    float32 instead. Every product/sum here is exactly 0 or a small positive integer
+    representable exactly in float32, so `> 0.5` is an exact, not approximate, test."""
+    promoted = promoted2d.to(torch.float32)
+    result = (y_contain.t().to(torch.float32) @ promoted) @ x_contain.to(torch.float32)
+    return result > 0.5
+
+
+class CascadeStage:
+    """One stage of a CascadeClassifierPnm: a model plus its own tiling step and gate."""
+
+    def __init__(self, model_path, cfg_path, tile_size=48, step=16, threshold=0.0,
+                 gate_mode=GATE_DEFECT_MASS, assign_best_defect_class=True, precache=False):
+        self.clf = ClassifierPnm(model_path=model_path, cfg_path=cfg_path,
+                                 tile_size=tile_size, step=step, precache=precache)
+        # ClassifierPnm overwrites tile_size from the model's own cfg["hparams"]["tile_size"]
+        # -- read it back rather than trust the constructor argument, so a stage's
+        # geometry always matches what its model actually expects.
+        self.tile_size = self.clf.tile_size
+        self.step = step
+        self.threshold = threshold
+        self.gate_mode = gate_mode
+        self.assign_best_defect_class = assign_best_defect_class
+
+    @property
+    def model(self):
+        return self.clf.model
+
+    @property
+    def classes(self):
+        return self.clf.classes
+
+    @property
+    def name(self):
+        return self.clf.name
+
+
+class CascadeClassifierPnm:
+    """Ordered screen-then-recheck cascade over N stages, each free to use its own
+    tiling step and gate threshold -- the live counterpart to
+    analysis/eval/eval_cascade_step_sweep.py, which measured this mechanism offline
+    before it existed to run here.
+
+    THE CHAIN, not a vote (unlike EnsembleClassifierPnm): stage 0 classifies every tile
+    of the full frame at its OWN step. A tile is "promoted" if stage 0's gate flags it
+    non-clean. Stage 1 then re-tiles ONLY the region stage 0 promoted, at stage 1's OWN
+    (possibly different) step, and re-classifies just that subset -- everything stage 0
+    locked clean never reaches stage 1 at all. This repeats for every later stage. The
+    FINAL stage's decision on a promoted tile is the frame's answer for that tile; a tile
+    no stage ever promotes stays clean by construction.
+
+    Because two consecutive stages can tile at different steps, mapping "stage i-1
+    promoted these grid cells" onto "these are the flat indices stage i's own grid
+    should classify" needs a geometric correspondence between two different regular
+    grids over the same frame -- containment_matrix_torch/eligible_mask_torch above.
+
+    CAVEAT carried over from the eval tool: the containment geometry assumes every stage
+    uses the SAME tile_size (48px, the one deployment geometry this repo trains against
+    -- see analysis/sweeps/bench_inference.py). A stage whose model was trained at a
+    different tile_size would need the containment math generalised; nothing in this
+    repo currently is.
+
+    STATUS: this is the ported geometry + a working forward() implementation, NOT yet
+    wired into live_torch.py/live_torch_ros.py's construction or recommended_
+    configuration.json's schema (both still only know EnsembleClassifierPnm's fixed
+    screen+vote shape) -- that wiring, and real-hardware Hz validation, are separate,
+    deliberately not-yet-done next steps.
+    """
+
+    def __init__(self, stage_cfgs, precache=False):
+        """stage_cfgs: ORDERED list of dicts, each at minimum
+            {'model_path': ..., 'cfg_path': ..., 'step': ..., 'threshold': ...}
+        and optionally 'tile_size', 'gate_mode', 'assign_best_defect_class'.
+        stage_cfgs[0] is the first screen; stage_cfgs[-1] makes the final decision.
+        """
+        assert len(stage_cfgs) >= 2, ("CascadeClassifierPnm needs at least 2 stages -- "
+                                      "use ClassifierPnm directly for a single model.")
+        self.stages = [CascadeStage(precache=precache, **sc) for sc in stage_cfgs]
+        self.name = "CascadeClassifier"
+        self.device = self.stages[0].clf.device
+
+        # The final stage's label space is what the frame is ultimately reported in --
+        # mirrors eval_cascade_step_sweep.py's convention (its "frames2" argument, whose
+        # classes/clean_id drive every macro/FA number).
+        self.classes = self.stages[-1].classes
+        self.class_colors = self.stages[-1].clf.class_colors
+        self.class_id_to_color = [torch.tensor(c, dtype=torch.uint8) for c in self.class_colors]
+
+        def find_clean_id(cls_list):
+            for i, c in enumerate(cls_list):
+                if c.lower() in ("class_clean", "clean"):
+                    return i
+            return None
+
+        self.clean_ids = [find_clean_id(s.classes) for s in self.stages]
+        if any(c is None for c in self.clean_ids):
+            raise ValueError("Could not find 'class_clean' in every stage's class list")
+
+        self._containment_cache = {}   # (step_from, step_to, H, W, tile_size) -> (y_c, x_c)
+        self.hz = 0.0
+        self.model_perf = {}
+
+        print(f"Initialized CascadeClassifierPnm with {len(self.stages)} stages: "
+              f"{[s.name for s in self.stages]} "
+              f"(steps={[s.step for s in self.stages]}, "
+              f"thresholds={[s.threshold for s in self.stages]})")
+
+    def _containment(self, step_from, step_to, h, w, tile_size):
+        key = (step_from, step_to, h, w, tile_size)
+        cached = self._containment_cache.get(key)
+        if cached is None:
+            y_c = containment_matrix_torch(step_from, step_to, h, tile_size, self.device)
+            x_c = containment_matrix_torch(step_from, step_to, w, tile_size, self.device)
+            cached = (y_c, x_c)
+            self._containment_cache[key] = cached
+        return cached
+
+    @staticmethod
+    def _grid_dims(size, tile_size, step):
+        return (size - tile_size) // step + 1   # matches unfold's window count exactly
+
+    @torch.no_grad()
+    def forward(self, image, legend=True, log=True, erosion_kernel=0, erosion_threshold=0):
+        """One frame through the full chain. Returns (heatmap, occupancy, responses),
+        the same triple ClassifierPnm.forward()/EnsembleClassifierPnm.forward() return.
+        erosion_kernel/erosion_threshold apply the neighbourhood vote to the FINAL stage's
+        grid, same rule as ClassifierPnm.forward.
+        """
+        start = time.time()
+
+        rgba_image = readPolarPNMToRGBALive(image)
+        rgba_image = cv2.cvtColor(rgba_image, cv2.COLOR_RGBA2BGRA)
+        rgba_image = torch.as_tensor(rgba_image, device=self.device, dtype=torch.uint8)
+        h, w = rgba_image.shape[:2]
+
+        # --- Stage 0: classify every tile of the full frame at its own step ---
+        stage0 = self.stages[0]
+        preds, confs, _tiles0 = classify_tiles(
+            stage0.model, rgba_image, tile_size=stage0.tile_size, step=stage0.step,
+            majorityVote=False, thresholdMaxProbability=stage0.threshold,
+            forceLowMaxProbToThisClass=self.clean_ids[0], gateMode=stage0.gate_mode,
+            assignBestDefectClass=stage0.assign_best_defect_class,
+            return_torch=True, return_tiles=True)
+
+        ny0 = self._grid_dims(h, stage0.tile_size, stage0.step)
+        nx0 = self._grid_dims(w, stage0.tile_size, stage0.step)
+        promoted2d = (preds.to(torch.int32) != self.clean_ids[0]).view(ny0, nx0)
+
+        final_predictions = final_confidences = None
+        final_ny, final_nx = ny0, nx0
+        prev_step, prev_tile_size = stage0.step, stage0.tile_size
+
+        # --- Stages 1..N-1: re-tile only what the PREVIOUS stage promoted, at THIS
+        #     stage's own step, and re-classify just that subset ---
+        for i in range(1, len(self.stages)):
+            stage = self.stages[i]
+            ny = self._grid_dims(h, stage.tile_size, stage.step)
+            nx = self._grid_dims(w, stage.tile_size, stage.step)
+
+            y_c, x_c = self._containment(prev_step, stage.step, h, w, prev_tile_size)
+            eligible2d = eligible_mask_torch(promoted2d, y_c, x_c)
+            selected_indices = eligible2d.flatten().nonzero(as_tuple=True)[0]
+
+            # Default every cell to THIS stage's clean class -- a tile the previous
+            # stage didn't promote never reaches this stage at all, and stays clean.
+            final_predictions = torch.full((ny * nx,), self.clean_ids[i],
+                                           dtype=torch.int32, device=self.device)
+            final_confidences = torch.zeros((ny * nx,), dtype=torch.float32, device=self.device)
+
+            if len(selected_indices) > 0:
+                _t0 = time.time()
+                sel_tiles = tile_and_cast_selected_tiles_torch(
+                    rgba_image, selected_indices, tile_size=stage.tile_size, step=stage.step)
+                # (N, tile, tile, C) -> (N, C, tile, tile): tile_and_cast_selected_tiles_torch
+                # does NOT do this permute itself (unlike tile_and_cast_data_torch inside
+                # classify_tiles, whose return_tiles=True output already has it applied).
+                sel_tiles = sel_tiles.permute(0, 3, 1, 2).contiguous()
+
+                sel_preds, sel_confs = classify_selected_tiles(
+                    stage.name, stage.model, rgba_image, sel_tiles,
+                    tile_size=stage.tile_size, step=stage.step,
+                    thresholdMaxProbability=stage.threshold,
+                    forceLowMaxProbToThisClass=self.clean_ids[i],
+                    gateMode=stage.gate_mode,
+                    assignBestDefectClass=stage.assign_best_defect_class,
+                    return_torch=True)
+
+                final_predictions[selected_indices] = sel_preds.to(torch.int32)
+                final_confidences[selected_indices] = sel_confs.to(torch.float32)
+                self.model_perf[stage.name] = 1.0 / (time.time() - _t0 + 1e-9)
+
+            promoted2d = (final_predictions != self.clean_ids[i]).view(ny, nx)
+            prev_step, prev_tile_size = stage.step, stage.tile_size
+            final_ny, final_nx = ny, nx
+
+        final_predictions_np = final_predictions.cpu().numpy()
+        final_confidences_np = final_confidences.cpu().numpy()
+
+        heatmap, occupancy, responses = render_predictions(
+            final_predictions_np, final_confidences_np, self.classes, self.class_id_to_color,
+            self.clean_ids[-1], rgba_image,
+            self.stages[-1].tile_size, self.stages[-1].step,
+            erosion_kernel=erosion_kernel, erosion_threshold=erosion_threshold)
+
+        if legend:
+            heatmap = self.stages[0].clf.add_legend(heatmap)
+
+        elapsed = time.time() - start + 1e-4
+        self.hz = 1.0 / elapsed
+        self._last_tile_count = final_ny * final_nx
+        self._last_elapsed = elapsed
+
+        if log:
+            log_performance("perf.csv", "cascade", self.stages[-1].step,
+                            self.stages[-1].tile_size, False, self.stages[-1].threshold,
+                            int(promoted2d.sum().item()), self.hz)
+
         return heatmap, occupancy, responses
 

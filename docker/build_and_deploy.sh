@@ -27,12 +27,15 @@ docker rm -f ${NAME}-container 2>/dev/null || true
 
 # --network host  : ROS2 DDS (multicast/unicast) works transparently with the host
 # --ipc host      : shared memory segments (SharedMemoryManager) are shared with the host
+# --pid host      : the shared memory library tells live processes from dead ones by PID, so every
+#                   process sharing those segments must see the same PIDs
 docker run -d \
     --gpus all \
     --shm-size 32G \
     --cap-add=SYS_NICE \
     --network host \
     --ipc host \
+    --pid host \
     --mount type=tmpfs,destination=/home/user/ram,tmpfs-mode=1777 \
     -it \
     --name ${NAME}-container \

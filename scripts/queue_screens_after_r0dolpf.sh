@@ -31,6 +31,7 @@ for cfg in mix_r0da_custom.json mix_r0dws_custom.json; do
     log=/storage/ammarkov/logs/${name}_$(TZ=UTC date +%Y%m%d_%H%M).log
     echo "=== $(TZ=UTC date -Is) launching $cfg -> $log"
     CUDA_VISIBLE_DEVICES=2 python -u -m mvc.train "$cfg" > "$log" 2>&1
-    echo "=== $(TZ=UTC date -Is) $cfg exited rc=$?"
+    rc=$?
+    echo "=== $(TZ=UTC date -Is) $cfg exited rc=$rc"
 done
 echo "=== $(TZ=UTC date -Is) all queued screens done"
