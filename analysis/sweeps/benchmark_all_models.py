@@ -6,6 +6,9 @@ Usage:
     python3 benchmarkAllModels.py --frames 100 --step 15 20 --from /path/to/frames
     python3 benchmarkAllModels.py --frames 100 --step 15 20 --from /path/to/frames --models .
 
+    # Every archive listed in a text file (one URL per line), downloaded as needed:
+    python3 -m analysis.sweeps.benchmark_all_models --from /path/to/frames --sources sources.txt
+
 Outputs:
     benchmark_results.csv  — per-model, per-step FPS results
     benchmark_results.png  — grouped bar chart
@@ -14,6 +17,7 @@ Outputs:
 import argparse
 import csv
 import os
+import re
 import sys
 import time
 import zipfile
@@ -29,6 +33,8 @@ from mvc.core.read_data import readPolarPNMToRGBA
 from mvc.inference.classifier_pnm import tile_and_cast_data_torch
 from mvc.core.lit_classifier import Classifier
 from mvc.core.config import load_hyperparameters
+from mvc.core.model_zoo import REPARAM_BACKBONES
+from mvc.inference.model_download import BASE_URL, download_model
 from mvc.paths import repo_root
 
 
@@ -87,6 +93,30 @@ def discover_models(models_dir: str):
     return pairs
 
 
+def fetch_sources(sources_path: str, dest: str):
+    """Download whatever is missing from `dest`; return (pth_path, cfg_path) in file order.
+
+    Each non-blank, non-# line is an archive URL, or a bare archive name on the model
+    server. Exits if any model is unavailable: a partial run must not be mistaken for
+    the full table.
+    """
+    with open(sources_path) as f:
+        sources = [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+
+    pairs = []
+    for i, source in enumerate(sources, 1):
+        base, _, zip_name = source.rpartition("/")
+        run = re.sub(r"_\d{8}_\d{6}\.zip$", "", zip_name)
+        pth, cfg = os.path.join(dest, f"{run}.pth"), os.path.join(dest, f"{run}.json")
+        if not (os.path.isfile(cfg) and zipfile.is_zipfile(pth)):
+            print(f"[{i}/{len(sources)}] downloading {zip_name}")
+            download_model(zip_name, dest, base_url=f"{base}/" if base else BASE_URL)
+        if not (os.path.isfile(cfg) and zipfile.is_zipfile(pth)):
+            sys.exit(f"{zip_name} did not yield {run}.pth + {run}.json")
+        pairs.append((pth, cfg))
+    return pairs
+
+
 def discover_frames(frames_dir: str, max_frames: int):
     """Return sorted list of PNM/PNG frame paths, capped at max_frames."""
     frames = sorted(
@@ -95,6 +125,53 @@ def discover_frames(frames_dir: str, max_frames: int):
         if f.lower().endswith(".pnm") or f.lower().endswith(".png")
     )
     return frames[:max_frames]
+
+
+# ---------------------------------------------------------------------------
+# Progress
+# ---------------------------------------------------------------------------
+
+def _hms(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+class Progress:
+    """Single-line \\r progress bar with elapsed time and ETA over all model/step combos."""
+
+    WIDTH = 30
+    MIN_INTERVAL_S = 0.5    # throttled: this also runs inside the timed loop
+
+    def __init__(self, total: int):
+        self.total = total
+        self.done = 0
+        self.label = ""
+        self.start = time.perf_counter()
+        self.last_draw = 0.0
+
+    def draw(self, partial: float = 0.0, force: bool = True):
+        """Redraw; `partial` is the fraction completed of the current combo."""
+        now = time.perf_counter()
+        if not force and now - self.last_draw < self.MIN_INTERVAL_S:
+            return
+        self.last_draw = now
+        frac = (self.done + partial) / self.total
+        elapsed = now - self.start
+        eta = _hms(elapsed * (1 - frac) / frac) if frac > 0 else "--:--:--"
+        filled = int(frac * self.WIDTH)
+        bar = "#" * filled + "-" * (self.WIDTH - filled)
+        sys.stdout.write(f"\r[{bar}] {self.done}/{self.total} {frac * 100:5.1f}% "
+                         f"elapsed {_hms(elapsed)} eta {eta}  {self.label}\033[K")
+        sys.stdout.flush()
+
+    def log(self, message: str):
+        """Print a permanent line above the bar."""
+        sys.stdout.write(f"\r\033[K{message}\n")
+        self.draw()
+
+    def advance(self):
+        self.done += 1
+        self.draw()
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +206,10 @@ def load_model(pth_path: str, cfg_path: str, device: str):
     clf.load_state_dict(_load_state_dict(pth_path, device), strict=False)
     clf.to(device)
     clf.eval()
+    if cfg.get("model") in REPARAM_BACKBONES:
+        # Deployment runs the fused graph, 4-8x faster than the multi-branch one.
+        import timm.utils
+        clf = timm.utils.reparameterize_model(clf)
 
     model_name = os.path.splitext(os.path.basename(pth_path))[0]
     return clf, tile_size, model_name
@@ -184,11 +265,13 @@ def benchmark_model_step(
     tile_size: int,
     step: int,
     device: str,
+    on_frame=None,
 ) -> dict:
     """
     Measure end-to-end fps (tile + forward) over all frames for one step size.
 
     Returns a dict with fps, batch_size, num_tiles, time_per_frame_ms.
+    `on_frame(fraction_done)` is called after each timed frame, if given.
     """
     if not frames_rgba:
         return {"fps": 0.0, "batch_size": 0, "num_tiles": 0, "time_per_frame_ms": 0.0}
@@ -218,8 +301,10 @@ def benchmark_model_step(
 
     # Timed run
     t0 = time.perf_counter()
-    for rgba in frames_rgba:
+    for i, rgba in enumerate(frames_rgba, 1):
         _infer_frame(rgba)
+        if on_frame:
+            on_frame(i / len(frames_rgba))
     if device == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
@@ -308,11 +393,14 @@ def main():
     ap.add_argument("--frames",  type=int,     default=100,       help="Number of frames to benchmark (default: 100)")
     ap.add_argument("--step",    type=int,     nargs="+",         help="Tile step size(s) (e.g. --step 15 20)")
     ap.add_argument("--from",    dest="frames_dir", required=True, help="Directory containing colorFrame_*.pnm files")
-    ap.add_argument("--models",  default=repo_root(),             help="Directory with allclass_*.pth models (default: repo root)")
+    ap.add_argument("--models",  default=None,                    help="Directory with models (default: repo root, or zoo_models with --sources)")
+    ap.add_argument("--sources", default=None,                    help="Text file with one model archive URL per line; missing ones are downloaded into --models")
     ap.add_argument("--out",     default="benchmark_results",     help="Output file stem (default: benchmark_results)")
     args = ap.parse_args()
 
-    step_sizes = args.step if args.step else [15, 20]
+    if args.models is None:
+        args.models = "zoo_models" if args.sources else repo_root()
+    step_sizes = args.step if args.step else ([16] if args.sources else [15, 20])
 
     print(f"Device     : {DEVICE}")
     print(f"Frames     : {args.frames}")
@@ -331,45 +419,44 @@ def main():
         print("No frames loaded.")
         sys.exit(1)
 
-    model_pairs = discover_models(args.models)
+    model_pairs = fetch_sources(args.sources, args.models) if args.sources else discover_models(args.models)
     if not model_pairs:
         print(f"No allclass_*.pth models found in: {args.models}")
         sys.exit(1)
     print(f"Found {len(model_pairs)} models\n")
 
     results = []
-    total_combos = len(model_pairs) * len(step_sizes)
-    pbar = tqdm(total=total_combos, unit="combo", dynamic_ncols=True,
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}")
+    progress = Progress(len(model_pairs) * len(step_sizes))
 
     for pth, cfg in model_pairs:
         model_name = os.path.splitext(os.path.basename(pth))[0]
         short_name = model_name.replace("allclass_", "")
-        pbar.set_postfix_str(f"loading {short_name}")
+        progress.label = f"loading {short_name}"
+        progress.draw()
         try:
             clf, tile_size, _ = load_model(pth, cfg, DEVICE)
         except Exception as exc:
-            tqdm.write(f"[skip] {model_name}: load failed: {exc}")
+            progress.log(f"[skip] {model_name}: load failed: {exc}")
             for step in step_sizes:
                 results.append({
                     "model": model_name, "step": step, "tile_size": 0,
                     "batch_size": 0, "fps": 0.0,
                     "num_tiles_per_frame": 0, "time_per_frame_ms": 0.0,
                 })
-                pbar.update(1)
+                progress.advance()
             continue
 
         for step in step_sizes:
-            pbar.set_description(f"{short_name} / step={step}")
-            pbar.set_postfix_str("running...")
+            progress.label = f"{short_name} step={step}"
+            progress.draw()
             try:
-                r = benchmark_model_step(clf, frames_rgba, tile_size, step, DEVICE)
-                tqdm.write(
+                r = benchmark_model_step(clf, frames_rgba, tile_size, step, DEVICE,
+                                         on_frame=lambda f: progress.draw(f, force=False))
+                progress.log(
                     f"  {short_name:<30}  step={step:3d}  tiles={r['num_tiles']:5d}  "
                     f"batch={r['batch_size']:5d}  fps={r['fps']:7.2f}  "
                     f"t/frame={r['time_per_frame_ms']:.1f}ms"
                 )
-                pbar.set_postfix_str(f"fps={r['fps']:.2f}")
                 results.append({
                     "model":               model_name,
                     "step":                step,
@@ -380,20 +467,19 @@ def main():
                     "time_per_frame_ms":   round(r["time_per_frame_ms"], 2),
                 })
             except Exception as exc:
-                tqdm.write(f"  {short_name}  step={step}  [error] {exc}")
-                pbar.set_postfix_str("error")
+                progress.log(f"  {short_name}  step={step}  [error] {exc}")
                 results.append({
                     "model": model_name, "step": step, "tile_size": tile_size,
                     "batch_size": 0, "fps": 0.0,
                     "num_tiles_per_frame": 0, "time_per_frame_ms": 0.0,
                 })
-            pbar.update(1)
+            progress.advance()
 
         del clf
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
-    pbar.close()
+    print()
 
     if not results:
         print("No results collected.")
