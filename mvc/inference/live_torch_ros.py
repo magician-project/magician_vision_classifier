@@ -33,6 +33,7 @@ from mvc.inference.live_torch import (
     resize_to_fit_screen, filter_type, class_to_severity,
 )
 from mvc.inference.ensemble_classifier import EnsembleClassifierPnm, CascadeClassifierPnm
+from mvc.inference.recorder import SessionRecorder, CONTROLLER_COLUMNS
 from mvc.core.shared_memory import SharedMemoryManager
 from mvc.paths import repo_root
 
@@ -134,6 +135,21 @@ LASER_TOPICS = [
 # LASER_IDW_POWER are imported from liveClassifierTorch so both runners fuse depth
 # identically; only the ROS topics that feed them are node-specific.
 
+# Sources of each controller.csv column while recording. Button2 is not published by
+# the grabber, so it has no topic and is recorded as 0.
+RECORDING_CONTROLLER_TOPICS = {
+    "Button1":   "magician_grabber/button",
+    "Distance1": "magician_grabber/distance1",
+    "Distance2": "magician_grabber/distance2",
+    "Distance3": "magician_grabber/distance3",
+    "Light1":    "magician_grabber/light1",
+    "Light2":    "magician_grabber/light2",
+    "Light3":    "magician_grabber/light3",
+    "Light4":    "magician_grabber/light4",
+    "Light5":    "magician_grabber/light5",
+    "Light6":    "magician_grabber/light6",
+}
+
 
 # ========================================================
 # Pattern-based extrinsics (analysis/extrinsics_from_pattern.py)
@@ -194,6 +210,12 @@ class DefectPublisher(Node):
         os.makedirs(self._output_path, exist_ok=True)
         self._snapshot_path = "./snapshots"
         os.makedirs(self._snapshot_path, exist_ok=True)
+
+        # Dataset recording (record_start / record_stop), see mvc/inference/recorder.py
+        self._recordings_path = "./recordings"
+        self._recorder = None
+        self._controller_state = {column: 0.0 for column in CONTROLLER_COLUMNS}
+        self._setup_controller_subscriptions()
 
         # Internal execution state
         self._visualization_enabled = False
@@ -300,6 +322,8 @@ class DefectPublisher(Node):
         self.create_service(SetBool,    "magician_vision_classifier/set_majority_voting", self._set_majority_voting_cb)
         self.create_service(SetInt64,   "magician_vision_classifier/set_majority_window", self._set_majority_window_cb)
         self.create_service(LocatePattern, "magician_vision_classifier/locate_pattern", self._locate_pattern_cb)
+        self.create_service(Trigger,    "magician_vision_classifier/record_start", self._record_start_cb)
+        self.create_service(Trigger,    "magician_vision_classifier/record_stop", self._record_stop_cb)
 
         # ------------------------------------------------
         # Services (NEW): runtime tuning
@@ -326,6 +350,9 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/locate_pattern (LocatePattern; "
                                "marker-free camera pose vs. a prebuilt map, see "
                                "analysis/extrinsics_from_pattern.py)")
+        self.get_logger().info("  magician_vision_classifier/record_start (Trigger; dumps frames, "
+                               "classifications and desktop screenshots as a dataset)")
+        self.get_logger().info("  magician_vision_classifier/record_stop (Trigger)")
 
 
         if USE_LASERS and self.publisher_m is not None:
@@ -386,6 +413,18 @@ class DefectPublisher(Node):
         self.create_subscription(Float32, LASER_TOPICS[0], make_cb(0), 10)
         self.create_subscription(Float32, LASER_TOPICS[1], make_cb(1), 10)
         self.create_subscription(Float32, LASER_TOPICS[2], make_cb(2), 10)
+
+    def _setup_controller_subscriptions(self):
+        """Keep the latest value of every controller topic for controller.csv. Independent
+        of USE_LASERS, which only controls whether depth is fused into detections."""
+        def make_cb(column):
+            def _cb(msg: Float32):
+                with self._lock:
+                    self._controller_state[column] = float(msg.data)
+            return _cb
+
+        for column, topic in RECORDING_CONTROLLER_TOPICS.items():
+            self.create_subscription(Float32, topic, make_cb(column), 10)
 
     # -------------------------
     # Service callbacks  
@@ -614,6 +653,58 @@ class DefectPublisher(Node):
         response.message = ("Autosave defect snapshots ENABLED" if request.data else "Autosave defect snapshots DISABLED")
         self.get_logger().info(response.message)
         return response
+
+    def _record_start_cb(self, request, response):
+        """Service callback to start dumping the session as a new dataset directory."""
+        with self._lock:
+            already_recording = self._recorder is not None
+            target_fps = self._target_fps
+        if already_recording:
+            response.success = False
+            response.message = "Already recording, call record_stop first."
+            self.get_logger().warning(response.message)
+            return response
+
+        directory = os.path.join(self._recordings_path, self._make_timestamped_basename("record"))
+        try:
+            recorder = SessionRecorder(directory, target_fps=target_fps, logger=self.get_logger())
+        except Exception as e:
+            response.success = False
+            response.message = f"Could not start recording in {directory}: {e!r}"
+            self.get_logger().error(response.message)
+            return response
+
+        with self._lock:
+            self._recorder = recorder
+        response.success = True
+        response.message = f"Recording to {directory}"
+        self.get_logger().info(response.message)
+        return response
+
+    def _record_stop_cb(self, request, response):
+        """Service callback to stop recording. Replies once everything queued is on disk."""
+        message = self.stop_recording()
+        response.success = message is not None
+        response.message = (f"Recording finished: {message}" if message is not None
+                            else "Not recording.")
+        self.get_logger().info(response.message)
+        return response
+
+    def stop_recording(self):
+        """Stop the active recording and return its summary, or None if there is none."""
+        with self._lock:
+            recorder, self._recorder = self._recorder, None
+        return recorder.stop() if recorder is not None else None
+
+    def record_frame(self, frame, frame_ts_ns, responses, tile_size):
+        """Hand one frame to the active recording, if any. `responses` is None when
+        inference did not run on this frame."""
+        with self._lock:
+            recorder = self._recorder
+            lasers = list(self._laser_depths)
+            controller = [self._controller_state[c] for c in CONTROLLER_COLUMNS]
+        if recorder is not None:
+            recorder.add_frame(frame, frame_ts_ns, responses, tile_size, lasers, controller)
 
     def _set_frame_limiter_cb(self, request, response):
         """Service callback to enable/disable the duplicate-frame limiter (False = unlimited framerate)."""
@@ -1317,6 +1408,7 @@ def main():
 
             # Pause inference
             if ros_node.inference_paused():
+                ros_node.record_frame(frame, frameTimestamp, None, tile_size)
                 time.sleep(0.01)
                 continue
 
@@ -1391,6 +1483,8 @@ def main():
             ros_node._last_responses = responses
             ros_node._last_tile_size = tile_size
 
+            ros_node.record_frame(frame, frameTimestamp, responses, tile_size)
+
             # Publish detections
             points      = responses.get("points",      [])
             classes     = responses.get("classes",     [])
@@ -1464,6 +1558,7 @@ def main():
         ros_node.get_logger().info("Interrupted by user.")
 
     finally:
+        ros_node.stop_recording()
         ros_node.destroy_node()
         rclpy.shutdown()
         cv2.destroyAllWindows()
