@@ -51,6 +51,15 @@ ROS_COMPILE_MODE = "max-autotune-no-cudagraphs"
 ROS_MAJORITY_WINDOW = 3
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Every historical throughput number in this repo (zoo_inference_bench.json,
+# phase4_inference_bench.json, this script's own earlier runs) was measured on a shared
+# NVIDIA RTX A6000 and reported as a x1.6 projection onto an RTX 5090 (see
+# full_zoo_sweep.py's GPU_SCALE constant) -- the 5090 itself was never actually
+# benchmarked. DEVICE_NAME makes a REAL run self-documenting (in the printed banner, the
+# CSV, and the plot title) so a result produced on real 5090 hardware is distinguishable
+# at a glance from every prior projected number, without relying on whoever ran it to
+# remember to say so separately.
+DEVICE_NAME = torch.cuda.get_device_name(0) if DEVICE == "cuda" else "cpu"
 _WARMUP_FRAMES = 3
 
 
@@ -266,11 +275,11 @@ def benchmark_model_step(clf, frames: list, preset: dict, device: str, on_frame=
 
 def save_csv(results: list, out_path: str):
     fields = ["model", "step", "tile_size", "batch_size", "fps",
-              "num_tiles_per_frame", "time_per_frame_ms"]
+              "num_tiles_per_frame", "time_per_frame_ms", "device"]
     with open(out_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        w.writerows(results)
+        w.writerows({**r, "device": DEVICE_NAME} for r in results)
     print(f"Saved CSV  : {out_path}")
 
 
@@ -311,7 +320,7 @@ def plot_results(results: list, out_path: str):
     ax.set_xticklabels(short_names, rotation=45, ha="right", fontsize=8)
     ax.set_xlabel("Model")
     ax.set_ylabel("Frames per second (Hz)")
-    ax.set_title("Inference throughput — all models")
+    ax.set_title(f"Inference throughput — all models ({DEVICE_NAME})")
     ax.legend(title="Tile step")
     ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
@@ -346,7 +355,7 @@ def main():
     torch.backends.cudnn.benchmark = True
     preset = load_recommended_configuration()
 
-    print(f"Device     : {DEVICE}")
+    print(f"Device     : {DEVICE} ({DEVICE_NAME})")
     print(f"Preset     : {preset.get('name')}")
     print(f"Frames     : {args.frames}")
     print(f"Step sizes : {step_sizes}")

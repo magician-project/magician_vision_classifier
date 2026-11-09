@@ -154,7 +154,43 @@ def _dataset_source_frames(dataset):
         inner = getattr(dataset, "_dataset", None)
         if inner is not None:
             dataset = inner
+    def _cached_h5_frames(ds):
+        """Fast path via analysis/datasets/build_coverage_val.py's
+        coverage_extract_cache.npz (same repo-root convention that script already
+        uses): a precomputed tile -> frame-string lookup for the Aug26_78K/train H5,
+        built once by that script's own `extract()` specifically because this same
+        full-metadata-column read is a multi-GB JSON-parse pass -- "minutes, not
+        seconds" even on an idle box, and under shared-storage contention (observed
+        2026-11-09: a single `ds.file['metadata'][:]` read stalled for 45+ minutes
+        with the box under other users' load) effectively unusable. Returns None if
+        the cache is missing or doesn't verifiably match this exact H5 (safety: the
+        cache embeds its own source `labels` array, which HDF5Dataset already holds
+        as `.targets` from construction at near-zero extra cost -- comparing those
+        sequences is the integrity check that lets this be trusted without
+        re-deriving it from the slow path it exists to avoid).
+        """
+        import os as _os
+        cache_path = _os.path.join(_os.getcwd(), 'coverage_extract_cache.npz')
+        if not _os.path.exists(cache_path):
+            return None
+        try:
+            z = np.load(cache_path, allow_pickle=True)
+            cached_labels = z['labels']
+            if len(cached_labels) != len(ds.targets):
+                return None
+            if not np.array_equal(cached_labels, np.asarray(ds.targets, dtype=cached_labels.dtype)):
+                return None
+            frame_names = z['frame_names']
+            frame_id = z['frame_id']
+        except Exception:
+            return None
+        rows = ds.indices if getattr(ds, "indices", None) is not None else range(len(ds))
+        return [str(frame_names[frame_id[int(r)]]) for r in rows]
+
     def _h5_frames(ds):
+        cached = _cached_h5_frames(ds)
+        if cached is not None:
+            return cached
         raw = ds.file["metadata"][:]
         rows = ds.indices if getattr(ds, "indices", None) is not None else range(len(ds))
         out = []
