@@ -2,6 +2,15 @@
 """
 Benchmark inference throughput for all allclass_*.pth models on raw PNM frames.
 
+Times the same code the ROS node runs per frame: ClassifierPnm.forward() on a raw frame
+(debayer, whole-grid fp16 forward, gate, majority vote, voting, heatmap), with the node's
+compile mode, global torch settings and recommended_configuration.json preset. Not
+timed: shared-memory reads, ROS publishing and the visualization window. Reparameterizable
+backbones run unfused, because ClassifierPnm does not fuse them.
+
+Requires timm; without it every timm-based model fails to load and is reported as 0 fps:
+    pip install timm==1.0.28
+
 Usage:
     python3 benchmarkAllModels.py --frames 100 --step 15 20 --from /path/to/frames
     python3 benchmarkAllModels.py --frames 100 --step 15 20 --from /path/to/frames --models .
@@ -15,13 +24,16 @@ Outputs:
 """
 
 import argparse
+import contextlib
 import csv
+import io
 import os
 import re
 import sys
 import time
 import zipfile
 
+import cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -29,44 +41,16 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from mvc.core.read_data import readPolarPNMToRGBA
-from mvc.inference.classifier_pnm import tile_and_cast_data_torch
-from mvc.core.lit_classifier import Classifier
-from mvc.core.config import load_hyperparameters
-from mvc.core.model_zoo import REPARAM_BACKBONES
+from mvc.inference.classifier_pnm import ClassifierPnm, load_recommended_configuration
 from mvc.inference.model_download import BASE_URL, download_model
 from mvc.paths import repo_root
 
 
-def _get_clean_class_id(class_names):
-    for i, name in enumerate(class_names):
-        if name in ("class_clean", "Clean"):
-            return i
-    return 0
-
-
-def _load_state_dict(checkpoint_path: str, device: str):
-    # weights_only=False: torch 2.6+ defaults it to True, which refuses the AttributeDict
-    # that save_hyperparameters() stores under 'hyper_parameters'. See LitClassifier.
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        return ckpt["state_dict"]
-    return ckpt
-
-
-def _build_classifier(cfg: dict, class_names: list) -> Classifier:
-    # Single source of truth: Classifier.from_config reads every knob from
-    # config["hparams"], the nesting the trainer writes. This block used to read
-    # AoLP/DoLP/Unpolarized/Max/Min/RangePolarization from the config TOP LEVEL,
-    # where no config has ever carried them (167 have them under hparams, 0 at the
-    # top), so it silently built a 4-channel model for every 5-channel run. It also
-    # never passed monochrome, custom_channels, custom_res_blocks, pretrained or
-    # timm_stem_stride -- see test_classifier_from_config.py.
-    return Classifier.from_config(cfg, num_classes=len(class_names),
-                                  clean_class=_get_clean_class_id(class_names))
+# The node's ClassifierPnm settings; see live_torch_ros.main() and DefectPublisher.__init__.
+ROS_COMPILE_MODE = "max-autotune-no-cudagraphs"
+ROS_MAJORITY_WINDOW = 3
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-_TRY_BATCH_SIZES = [4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 1]
 _WARMUP_FRAMES = 3
 
 
@@ -179,15 +163,15 @@ class Progress:
 # ---------------------------------------------------------------------------
 
 def load_frames(frame_paths):
-    """Load and debayer PNM frames to RGBA numpy arrays (H, W, 4) uint8."""
+    """Load raw frames as the node receives them; debayering is part of the timed path."""
     loaded = []
     print(f"Pre-loading {len(frame_paths)} frames ...")
     for p in tqdm(frame_paths, unit="frame"):
-        rgba = readPolarPNMToRGBA(p)
-        if rgba is None:
+        frame = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+        if frame is None:
             print(f"  [warn] failed to load {p}")
             continue
-        loaded.append(rgba)
+        loaded.append(frame)
     print(f"  {len(loaded)} frames ready  shape={loaded[0].shape if loaded else 'n/a'}")
     return loaded
 
@@ -196,128 +180,83 @@ def load_frames(frame_paths):
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model(pth_path: str, cfg_path: str, device: str):
-    """Return (classifier, tile_size, model_name) ready for eval."""
-    cfg = load_hyperparameters(cfg_path)
-    class_names = list(cfg["classes"])
-    tile_size = int(cfg["hparams"].get("tile_size", 48))
+def build_runtime_classifier(pth_path: str, cfg_path: str, step: int, preset: dict):
+    """Build a ClassifierPnm configured like the node's; return (classifier, warnings).
 
-    clf = _build_classifier(cfg, class_names)
-    clf.load_state_dict(_load_state_dict(pth_path, device), strict=False)
-    clf.to(device)
-    clf.eval()
-    if cfg.get("model") in REPARAM_BACKBONES:
-        # Deployment runs the fused graph, 4-8x faster than the multi-branch one.
-        import timm.utils
-        clf = timm.utils.reparameterize_model(clf)
+    One instance per model and step: the node compiles for a single constant batch shape,
+    and sharing a compiled model between steps would specialise it for two.
+    """
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+            clf = ClassifierPnm(model_path=pth_path, cfg_path=cfg_path, step=step,
+                                compile_mode=ROS_COMPILE_MODE)
+    except (Exception, SystemExit) as exc:      # ClassifierPnm calls sys.exit on bad files
+        raise RuntimeError(f"{exc!r}; last output: {captured.getvalue()[-300:]}") from exc
 
-    model_name = os.path.splitext(os.path.basename(pth_path))[0]
-    return clf, tile_size, model_name
+    gate = preset["gate"]
+    clf.gateMode = gate.get("mode", clf.gateMode)
+    clf.assignBestDefectClass = bool(gate.get("assign_best_defect_class", clf.assignBestDefectClass))
+    if gate.get("threshold") is not None:
+        clf.maxProbabilityThreshold = float(gate["threshold"])
 
-
-# ---------------------------------------------------------------------------
-# Batch-size probe
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def find_max_batch_size(clf, sample_nchw: torch.Tensor, device: str) -> int:
-    """Find the largest batch size from _TRY_BATCH_SIZES that runs without OOM."""
-    n_tiles = sample_nchw.shape[0]
-    autocast = torch.amp.autocast(device_type=device, dtype=torch.float16, enabled=(device == "cuda"))
-    for bs in _TRY_BATCH_SIZES:
-        if bs > n_tiles:
-            continue
-        try:
-            chunk = sample_nchw[:bs]
-            with autocast:
-                _ = clf(chunk)
-            if device == "cuda":
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-            return bs
-        except RuntimeError as exc:
-            if "out of memory" in str(exc).lower():
-                if device == "cuda":
-                    torch.cuda.empty_cache()
-                continue
-            raise
-    return 1
+    # load_state_dict is non-strict, so a checkpoint that does not fit the built network
+    # loads anyway and would be timed as the wrong model.
+    warnings = [line[:300] for line in captured.getvalue().splitlines()
+                if line.startswith(("Missing keys:", "Unexpected keys:")) and not line.endswith("[]")]
+    return clf, warnings
 
 
 # ---------------------------------------------------------------------------
 # Core benchmark
 # ---------------------------------------------------------------------------
 
-def _tiles_nchw(rgba: np.ndarray, tile_size: int, step: int, device: str) -> torch.Tensor:
-    """Tile one RGBA frame → (N, C, tile_size, tile_size) uint8 on device.
-
-    Kept uint8 to match the live pipeline: the model dequantises internally, so
-    benchmarking float32 tiles would measure a transfer size inference never uses.
-    """
-    tiles = tile_and_cast_data_torch(rgba, tile_size=tile_size, step=step)
-    return tiles.permute(0, 3, 1, 2).contiguous().to(device)
-
-
-@torch.no_grad()
-def benchmark_model_step(
-    clf,
-    frames_rgba: list,
-    tile_size: int,
-    step: int,
-    device: str,
-    on_frame=None,
-) -> dict:
-    """
-    Measure end-to-end fps (tile + forward) over all frames for one step size.
+def benchmark_model_step(clf, frames: list, preset: dict, device: str, on_frame=None) -> dict:
+    """Measure ClassifierPnm.forward() per frame, called exactly as the node calls it.
 
     Returns a dict with fps, batch_size, num_tiles, time_per_frame_ms.
     `on_frame(fraction_done)` is called after each timed frame, if given.
     """
-    if not frames_rgba:
+    if not frames:
         return {"fps": 0.0, "batch_size": 0, "num_tiles": 0, "time_per_frame_ms": 0.0}
 
-    # Determine tile count and find the largest batch that fits in memory
-    sample_tiles = _tiles_nchw(frames_rgba[0], tile_size, step, device)
-    num_tiles = sample_tiles.shape[0]
-    if num_tiles == 0:
-        return {"fps": 0.0, "batch_size": 0, "num_tiles": 0, "time_per_frame_ms": 0.0}
+    runtime = preset["runtime"]
+    stats = {}          # a stats sink also stops runSingle printing a line per frame
 
-    max_bs = find_max_batch_size(clf, sample_tiles, device)
+    def _infer_frame(frame):
+        with torch.inference_mode():
+            clf.forward(frame,
+                        majorityVote=bool(runtime["majority_voting"]),
+                        erosion_kernel=int(runtime["erosion_kernel"]),
+                        erosion_threshold=int(runtime["min_votes"]),
+                        log=False,
+                        stats=stats,
+                        majority_window=ROS_MAJORITY_WINDOW)
 
-    autocast = torch.amp.autocast(device_type=device, dtype=torch.float16, enabled=(device == "cuda"))
-
-    def _infer_frame(rgba):
-        tiles = _tiles_nchw(rgba, tile_size, step, device)
-        for start in range(0, tiles.shape[0], max_bs):
-            with autocast:
-                _ = clf(tiles[start:start + max_bs])
-
-    # Warmup
-    warmup_frames = frames_rgba[:_WARMUP_FRAMES]
-    for rgba in warmup_frames:
-        _infer_frame(rgba)
+    # Warmup: includes the autotuned compile, which the node pays once at startup.
+    # Autotune writes pages of kernel timings to stderr, which would break the progress bar.
+    with contextlib.redirect_stderr(io.StringIO()):
+        for frame in frames[:_WARMUP_FRAMES]:
+            _infer_frame(frame)
     if device == "cuda":
         torch.cuda.synchronize()
 
     # Timed run
     t0 = time.perf_counter()
-    for i, rgba in enumerate(frames_rgba, 1):
-        _infer_frame(rgba)
+    for i, frame in enumerate(frames, 1):
+        _infer_frame(frame)
         if on_frame:
-            on_frame(i / len(frames_rgba))
+            on_frame(i / len(frames))
     if device == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
 
-    n = len(frames_rgba)
-    fps = n / elapsed if elapsed > 0 else 0.0
-    tpf_ms = elapsed / n * 1000.0 if n > 0 else 0.0
-
+    n = len(frames)
     return {
-        "fps": fps,
-        "batch_size": max_bs,
-        "num_tiles": num_tiles,
-        "time_per_frame_ms": tpf_ms,
+        "fps": n / elapsed if elapsed > 0 else 0.0,
+        "batch_size": stats["tiles"],   # the node forwards the whole grid as one batch
+        "num_tiles": stats["tiles"],
+        "time_per_frame_ms": elapsed / n * 1000.0,
     }
 
 
@@ -402,7 +341,13 @@ def main():
         args.models = "zoo_models" if args.sources else repo_root()
     step_sizes = args.step if args.step else ([16] if args.sources else [15, 20])
 
+    # Same global settings as live_torch_ros.main(), before any model is loaded.
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
+    preset = load_recommended_configuration()
+
     print(f"Device     : {DEVICE}")
+    print(f"Preset     : {preset.get('name')}")
     print(f"Frames     : {args.frames}")
     print(f"Step sizes : {step_sizes}")
     print(f"Frames dir : {args.frames_dir}")
@@ -414,8 +359,8 @@ def main():
         sys.exit(1)
     print(f"Found {len(frame_paths)} frames")
 
-    frames_rgba = load_frames(frame_paths)
-    if not frames_rgba:
+    frames = load_frames(frame_paths)
+    if not frames:
         print("No frames loaded.")
         sys.exit(1)
 
@@ -428,39 +373,39 @@ def main():
     results = []
     progress = Progress(len(model_pairs) * len(step_sizes))
 
+    def _failed(model_name, step, tile_size=0):
+        return {"model": model_name, "step": step, "tile_size": tile_size,
+                "batch_size": 0, "fps": 0.0,
+                "num_tiles_per_frame": 0, "time_per_frame_ms": 0.0}
+
     for pth, cfg in model_pairs:
         model_name = os.path.splitext(os.path.basename(pth))[0]
         short_name = model_name.replace("allclass_", "")
-        progress.label = f"loading {short_name}"
-        progress.draw()
-        try:
-            clf, tile_size, _ = load_model(pth, cfg, DEVICE)
-        except Exception as exc:
-            progress.log(f"[skip] {model_name}: load failed: {exc}")
-            for step in step_sizes:
-                results.append({
-                    "model": model_name, "step": step, "tile_size": 0,
-                    "batch_size": 0, "fps": 0.0,
-                    "num_tiles_per_frame": 0, "time_per_frame_ms": 0.0,
-                })
-                progress.advance()
-            continue
 
         for step in step_sizes:
-            progress.label = f"{short_name} step={step}"
+            progress.label = f"{short_name} step={step} compiling"
             progress.draw()
             try:
-                r = benchmark_model_step(clf, frames_rgba, tile_size, step, DEVICE,
+                clf, warnings = build_runtime_classifier(pth, cfg, step, preset)
+            except Exception as exc:
+                progress.log(f"[skip] {model_name}: load failed: {exc}")
+                results.append(_failed(model_name, step))
+                progress.advance()
+                continue
+            for warning in warnings:
+                progress.log(f"[warn] {model_name}: {warning}")
+
+            try:
+                r = benchmark_model_step(clf, frames, preset, DEVICE,
                                          on_frame=lambda f: progress.draw(f, force=False))
                 progress.log(
                     f"  {short_name:<30}  step={step:3d}  tiles={r['num_tiles']:5d}  "
-                    f"batch={r['batch_size']:5d}  fps={r['fps']:7.2f}  "
-                    f"t/frame={r['time_per_frame_ms']:.1f}ms"
+                    f"fps={r['fps']:7.2f}  t/frame={r['time_per_frame_ms']:.1f}ms"
                 )
                 results.append({
                     "model":               model_name,
                     "step":                step,
-                    "tile_size":           tile_size,
+                    "tile_size":           clf.tile_size,
                     "batch_size":          r["batch_size"],
                     "fps":                 round(r["fps"], 4),
                     "num_tiles_per_frame": r["num_tiles"],
@@ -468,16 +413,12 @@ def main():
                 })
             except Exception as exc:
                 progress.log(f"  {short_name}  step={step}  [error] {exc}")
-                results.append({
-                    "model": model_name, "step": step, "tile_size": tile_size,
-                    "batch_size": 0, "fps": 0.0,
-                    "num_tiles_per_frame": 0, "time_per_frame_ms": 0.0,
-                })
+                results.append(_failed(model_name, step, clf.tile_size))
             progress.advance()
 
-        del clf
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
+            del clf
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
 
     print()
 
