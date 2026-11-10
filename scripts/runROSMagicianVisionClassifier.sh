@@ -15,7 +15,7 @@ source src/magician_vision_classifier/venv/bin/activate
 source install/setup.bash 
 
 cd src/magician_vision_classifier
-python3 -m mvc.inference.live_torch_ros --scale 0.5 "${ARGS[@]}"
+python3 -m mvc.inference.live_torch_ros --scale 0.7 "${ARGS[@]}"
 
 
 exit 0
