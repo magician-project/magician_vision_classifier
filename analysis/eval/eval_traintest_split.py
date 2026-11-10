@@ -77,7 +77,8 @@ def main():
     ckpt = sys.argv[2] if len(sys.argv) > 2 else pick_best_checkpoint(cfg)
     print(f'[traintest] scoring {os.path.basename(ckpt)}')
 
-    model = Classifier.from_config(cfg, num_classes=len(class_names), clean_class=cleanID)
+    model = Classifier.from_config(cfg, num_classes=len(class_names), clean_class=cleanID,
+                                   class_names=list(class_names))
     model.load_state_dict(torch.load(ckpt, weights_only=False, map_location='cpu')['state_dict'])
     dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(dev).eval()
