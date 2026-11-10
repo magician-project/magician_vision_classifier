@@ -5,13 +5,17 @@
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$DIR"
 
+#Keep our arguments for the node, the scripts sourced below must not see them
+ARGS=("$@")
+set --
+
 #Let's load a sane virtual environment
 source ~/.bashrc
 source src/magician_vision_classifier/venv/bin/activate
 source install/setup.bash 
 
 cd src/magician_vision_classifier
-python3 -m mvc.inference.live_torch_ros 
+python3 -m mvc.inference.live_torch_ros "${ARGS[@]}"
 
 
 exit 0

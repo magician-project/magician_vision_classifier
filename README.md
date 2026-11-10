@@ -454,6 +454,7 @@ All services are prefixed with `/magician_vision_classifier/`.
 | `set_frame_limiter` | `SetBool` | Skip duplicate frames from shared memory |
 | `set_model` | `SetString` | Hot-swap the single classifier model by name or path stem |
 | `set_autosave_defect_snapshots` | `SetBool` | Automatically save a frame + JSON every time a defect is detected |
+| `set_defect_notifications` | `SetBool` | Flash `doc/defect.jpg` for 3 s when a defect is detected, at most once every 30 s. Off by default, needs `python3-gi` and `gir1.2-gtk-3.0` |
 | `remember_defect` | `std_srvs/Trigger` | Save current frame as a defect sample to `data/` |
 | `remember_clean` | `std_srvs/Trigger` | Save current frame as a clean sample to `data/` |
 | `snapshot` | `std_srvs/Trigger` | Save current frame to `snapshots/` on demand |
@@ -535,8 +536,9 @@ ArUco marker detection uses the `DICT_6X6_250` dictionary. Detected markers are 
 
 | Script | Description |
 |--------|-------------|
-| `scripts/runROSMagicianVisionClassifier.sh` | Launch the inference node |
+| `scripts/runROSMagicianVisionClassifier.sh [--scale 0.5x]` | Launch the inference node, `--scale` multiplies the size of the visualization window |
 | `scripts/visualizationOn.sh` / `scripts/visualizationOff.sh` | Toggle the live display window |
+| `scripts/defectNotificationsOn.sh` / `scripts/defectNotificationsOff.sh` | Toggle the desktop popup on defects |
 | `scripts/setFPS.sh <fps>` | Set the target frame rate |
 | `scripts/setStepSize.sh <step>` | Set the tile stride |
 | `scripts/SetModel.sh <name>` | Hot-swap the single classifier model |

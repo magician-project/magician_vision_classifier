@@ -30,10 +30,12 @@ from mvc.inference.live_torch import (
     MARKER_SCAN_DURATION_S, ARUCO_DICT_NAME, DEFAULT_MARKER_LENGTH_M,
     CHESSBOARD_W, CHESSBOARD_H, CHESSBOARD_SQUARE_M,
     estimatePoseSingleMarkers, make_approx_camera_matrix, rvec_to_quaternion,
-    resize_to_fit_screen, filter_type, class_to_severity,
+    resize_to_fit_screen, scale_window_image, WINDOW_SCALE_MIN, WINDOW_SCALE_MAX,
+    filter_type, class_to_severity,
 )
 from mvc.inference.ensemble_classifier import EnsembleClassifierPnm, CascadeClassifierPnm
 from mvc.inference.recorder import SessionRecorder, CONTROLLER_COLUMNS
+from mvc.inference.defect_popup import DefectPopup, popup_unavailable_reason
 from mvc.core.shared_memory import SharedMemoryManager
 from mvc.paths import repo_root
 
@@ -78,6 +80,15 @@ from magician_vision_classifier.msg import BackgroundActivations # Custom ROS me
 from magician_vision_classifier.msg import Detection             # Custom ROS message
 from magician_vision_classifier.msg import DetectionM            # Custom ROS message (uint8 severity, geometry_msgs/Pose location)
 from magician_vision_classifier.msg import Marker                # Custom ROS message (string id, geometry_msgs/Pose pose)
+
+def parse_window_scale(text):
+    """Value of --scale, as "0.5x" or "0.5", clamped to the limits of the standalone runner.
+    Raises ValueError if it is not a positive finite number."""
+    scale = float(text[:-1] if text.lower().endswith("x") else text)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(text)
+    return max(WINDOW_SCALE_MIN, min(WINDOW_SCALE_MAX, scale))
+
 
 def unix_ns_to_ros_time(ns):
     t = RosTime()
@@ -228,6 +239,7 @@ class DefectPublisher(Node):
         self._cascade_enabled = False
         self._cascade_stages = []
         self._autosave_defect_snapshots = False
+        self._defect_notifications = False
         self._frame_limiter = True
 
         # Runtime tunables (dynamic via services)
@@ -316,6 +328,7 @@ class DefectPublisher(Node):
         self.create_service(Trigger,    "magician_vision_classifier/remember_clean", self._remember_clean_cb)
         self.create_service(Trigger,    "magician_vision_classifier/scan_markers", self._scan_markers_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_autosave_defect_snapshots", self._set_autosave_defect_snapshots_cb)
+        self.create_service(SetBool,    "magician_vision_classifier/set_defect_notifications", self._set_defect_notifications_cb)
         self.create_service(Trigger,    "magician_vision_classifier/snapshot", self._snapshot_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_frame_limiter", self._set_frame_limiter_cb)
         self.create_service(SetString,  "magician_vision_classifier/set_model", self._set_model_cb)
@@ -342,6 +355,7 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/remember_defect (Trigger)")
         self.get_logger().info("  magician_vision_classifier/remember_clean (Trigger)")
         self.get_logger().info("  magician_vision_classifier/set_autosave_defect_snapshots (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/set_defect_notifications (SetBool; desktop popup on defects, default off)")
         self.get_logger().info("  magician_vision_classifier/snapshot (Trigger)")
         self.get_logger().info("  magician_vision_classifier/set_frame_limiter (SetBool)")
         self.get_logger().info("  magician_vision_classifier/set_model (SetString)")
@@ -654,6 +668,21 @@ class DefectPublisher(Node):
         self.get_logger().info(response.message)
         return response
 
+    def _set_defect_notifications_cb(self, request, response):
+        """Service callback to enable/disable the desktop popup shown when a defect is detected."""
+        reason = popup_unavailable_reason() if request.data else None
+        if reason is not None:
+            response.success = False
+            response.message = f"Defect notifications stay DISABLED: {reason}"
+            self.get_logger().warning(response.message)
+            return response
+        with self._lock:
+            self._defect_notifications = bool(request.data)
+        response.success = True
+        response.message = ("Defect notifications ENABLED" if request.data else "Defect notifications DISABLED")
+        self.get_logger().info(response.message)
+        return response
+
     def _record_start_cb(self, request, response):
         """Service callback to start dumping the session as a new dataset directory."""
         with self._lock:
@@ -872,6 +901,11 @@ class DefectPublisher(Node):
         """Thread-safe getter for the autosave defect snapshots toggle."""
         with self._lock:
             return self._autosave_defect_snapshots
+
+    def defect_notifications_enabled(self):
+        """Thread-safe getter for the defect popup toggle."""
+        with self._lock:
+            return self._defect_notifications
 
     def frame_limiter_enabled(self):
         """Thread-safe getter for the frame limiter toggle."""
@@ -1239,6 +1273,16 @@ def main():
     # --perf-log appends every frame's inference timing to perf.csv (off by default --
     # the file grows unbounded otherwise)
     perf_log = "--perf-log" in sys.argv
+    # --scale 0.5x multiplies the size of the visualization window
+    window_scale = 1.0
+    if "--scale" in sys.argv:
+        i = sys.argv.index("--scale")
+        try:
+            window_scale = parse_window_scale(sys.argv[i + 1])
+        except (IndexError, ValueError):
+            ros_node.get_logger().error("--scale needs a positive number, for example --scale 0.5x")
+            rclpy.shutdown()
+            return
     preset = load_recommended_configuration(preset_name)
     model_name = preset["model"]
     ros_node.apply_preset(preset)
@@ -1370,10 +1414,16 @@ def main():
     _warned_no_ensemble = False   # log the two-stage fallback once, not every frame
     _warned_no_cascade = False    # log the cascade fallback once, not every frame
     _warned_no_frame = False      # log a missing frame once per outage, not every 100 ms
+    defect_popup = DefectPopup(ros_node.get_logger())
 
     try:
         while True:
             loop_start = time.perf_counter()
+
+            # Up here so a popup is still cleaned up while paused or without frames
+            if not ros_node.defect_notifications_enabled():
+                defect_popup.close()
+            defect_popup.poll()
 
             if ros_node.frame_limiter_enabled():
                 ts = smm.get_timestamp()
@@ -1533,6 +1583,9 @@ def main():
             if ros_node.autosave_defect_snapshots_enabled() and points:
                 ros_node._save_current_frame("autosaved_defect")
 
+            if ros_node.defect_notifications_enabled() and points:
+                defect_popup.show()
+
             # Publish average background (clean-tile) softmax probability
             ros_node.publish_background_activations(
                 responses.get("background_avg_prob", 0.0),
@@ -1542,6 +1595,7 @@ def main():
             # Visualization
             if ros_node.visualization_enabled():
                 heatmapForAWindow,scale = resize_to_fit_screen(heatmap) 
+                heatmapForAWindow = scale_window_image(heatmapForAWindow, window_scale)
                 cv2.imshow("Classifier Output",heatmapForAWindow)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
@@ -1558,6 +1612,7 @@ def main():
         ros_node.get_logger().info("Interrupted by user.")
 
     finally:
+        defect_popup.close()
         ros_node.stop_recording()
         ros_node.destroy_node()
         rclpy.shutdown()
