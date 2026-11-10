@@ -345,6 +345,31 @@
         "detected": 0.9723,
         "false_alarm": 0.0344
       }
+    },
+
+    {
+      "name": "kbach_pico",
+      "description": "kbachhybpenscjensemaavg1ep_hier_convnext_pico at its calibrated deployment gate.",
+      "model": "kbachhybpenscjensemaavg1ep_hier_convnext_pico",
+      "gate": {
+        "mode": "defect_mass",
+        "threshold": 0.98,
+        "assign_best_defect_class": true
+      },
+      "runtime": {
+        "step": 16,
+        "target_fps": 23.0,
+        "erosion_kernel": 1,
+        "min_votes": 2,
+        "majority_voting": true,
+        "frame_limiter": true,
+        "two_stage": false
+      },
+      "measured": {
+        "source": "kbachhybpenscjensemaavg1ep_hier_convnext_pico.json gate.alternatives.deployment",
+        "detected": 0.7864,
+        "false_alarm": 0.0048
+      }
     }
   ]
 }

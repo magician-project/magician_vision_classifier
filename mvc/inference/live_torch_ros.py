@@ -66,7 +66,7 @@ from datetime import datetime
 #from example_interfaces.srv import SetFloat64
 from magician_vision_classifier.srv import SetInt64
 from magician_vision_classifier.srv import SetFloat64
-#from magician_vision_classifier.srv import SetString
+from magician_vision_classifier.srv import SetString
 from magician_vision_classifier.srv import LocatePattern
 
 
@@ -318,7 +318,7 @@ class DefectPublisher(Node):
         self.create_service(SetBool,    "magician_vision_classifier/set_autosave_defect_snapshots", self._set_autosave_defect_snapshots_cb)
         self.create_service(Trigger,    "magician_vision_classifier/snapshot", self._snapshot_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_frame_limiter", self._set_frame_limiter_cb)
-        #self.create_service(SetString,  "magician_vision_classifier/set_model", self._set_model_cb)
+        self.create_service(SetString,  "magician_vision_classifier/set_model", self._set_model_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_majority_voting", self._set_majority_voting_cb)
         self.create_service(SetInt64,   "magician_vision_classifier/set_majority_window", self._set_majority_window_cb)
         self.create_service(LocatePattern, "magician_vision_classifier/locate_pattern", self._locate_pattern_cb)
@@ -344,7 +344,7 @@ class DefectPublisher(Node):
         self.get_logger().info("  magician_vision_classifier/set_autosave_defect_snapshots (SetBool)")
         self.get_logger().info("  magician_vision_classifier/snapshot (Trigger)")
         self.get_logger().info("  magician_vision_classifier/set_frame_limiter (SetBool)")
-        #self.get_logger().info("  magician_vision_classifier/set_model (SetString)")
+        self.get_logger().info("  magician_vision_classifier/set_model (SetString)")
         self.get_logger().info("  magician_vision_classifier/set_majority_voting (SetBool)")
         self.get_logger().info("  magician_vision_classifier/set_majority_window (SetInt64, odd >=1; side of the square tile window majority voting uses)")
         self.get_logger().info("  magician_vision_classifier/locate_pattern (LocatePattern; "

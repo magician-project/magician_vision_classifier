@@ -10,7 +10,7 @@ Layout of one recording (same files as e.g. Datasets/FORTH_POSC_650):
     controller.csv                one row PER RECORDED FRAME, see add_frame
     colorFrame_0_NNNNN.png        packed polarization (H/2 x W/2 x 4), as in the datasets
     colorFrame_0_NNNNN.json       the classifier's detections, in annotator schema
-    desktop/desktop_NNNNN.png     desktop screenshot. In a SUBDIRECTORY because both the
+    desktop/desktop_NNNNN.jpg     desktop screenshot. In a SUBDIRECTORY because both the
                                   annotator and the folder streamer treat every image
                                   directly inside a dataset as a camera frame
     desktop/desktop.csv           timestamp, unix_ns, frameID, file: the latest camera
@@ -42,7 +42,10 @@ WRITER_THREADS = 3
 # Frames waiting to be encoded, ~5 MB each, so a slow disk costs at most ~320 MB of RAM.
 MAX_QUEUED_FRAMES = 64
 
-DESKTOP_SCREENSHOT_PERIOD_S = 1.0
+# A 4K capture takes ~70 ms as JPEG but ~240 ms as PNG, so JPEG is what makes this rate
+# reachable. If a capture overruns the period, the next one simply starts immediately.
+DESKTOP_SCREENSHOT_PERIOD_S = 0.1
+DESKTOP_JPEG_QUALITY = 80
 DESKTOP_SCREENSHOT_TIMEOUT_S = 5.0
 
 CONTROLLER_COLUMNS = ["Button1", "Button2", "Distance1", "Distance2", "Distance3",
@@ -212,7 +215,7 @@ class SessionRecorder:
             sequence = 0
             while True:
                 started = time.monotonic()
-                name = f"desktop_{sequence:05d}.png"
+                name = f"desktop_{sequence:05d}.jpg"
                 if self._take_screenshot(os.path.join(self._desktop_dir, name)):
                     now = time.time_ns()
                     with self._lock:
@@ -227,7 +230,8 @@ class SessionRecorder:
 
     def _take_screenshot(self, path):
         try:
-            subprocess.run(["scrot", "--silent", path], check=True, capture_output=True,
+            subprocess.run(["scrot", "--silent", "-q", str(DESKTOP_JPEG_QUALITY), path],
+                           check=True, capture_output=True,
                            timeout=DESKTOP_SCREENSHOT_TIMEOUT_S)
             return True
         except (subprocess.SubprocessError, OSError) as e:
