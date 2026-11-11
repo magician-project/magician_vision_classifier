@@ -37,6 +37,8 @@ from mvc.inference.ensemble_classifier import EnsembleClassifierPnm, CascadeClas
 from mvc.inference.recorder import SessionRecorder, CONTROLLER_COLUMNS
 from mvc.inference.defect_popup import DefectPopup, popup_unavailable_reason
 from mvc.core.shared_memory import SharedMemoryManager
+from mvc.inference.visualization_modes import (VISUALIZATION_MODES, DEFAULT_MODE,
+                                               resolve_mode, overlay_detections)
 from mvc.paths import repo_root
 
 # Marker-FREE camera localisation against the car's own surface pattern -- a DIFFERENT
@@ -230,6 +232,7 @@ class DefectPublisher(Node):
 
         # Internal execution state
         self._visualization_enabled = False
+        self._visualization_type = DEFAULT_MODE
         self._inference_paused = False
         self._two_stage_enabled = False
         # Ordered N-stage screen-then-recheck chain (CascadeClassifierPnm) -- a DIFFERENT
@@ -316,6 +319,7 @@ class DefectPublisher(Node):
         # Services (existing)
         # ------------------------------------------------
         self.create_service(SetBool,    "magician_vision_classifier/set_visualization", self._set_visualization_cb)
+        self.create_service(SetString,  "magician_vision_classifier/set_visualization_type", self._set_visualization_type_cb)
         self.create_service(SetBool,    "magician_vision_classifier/pause", self._pause_inference_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_two_stage", self._set_two_stage_cb)
         self.create_service(SetBool,    "magician_vision_classifier/set_cascade", self._set_cascade_cb)
@@ -343,6 +347,8 @@ class DefectPublisher(Node):
         # ------------------------------------------------
         self.get_logger().info("Services ready:")
         self.get_logger().info("  magician_vision_classifier/set_visualization (SetBool)")
+        self.get_logger().info("  magician_vision_classifier/set_visualization_type (SetString; one of: "
+                               + ", ".join(VISUALIZATION_MODES) + ")")
         self.get_logger().info("  magician_vision_classifier/pause (SetBool)")
         self.get_logger().info("  magician_vision_classifier/set_two_stage (SetBool)")
         self.get_logger().info("  magician_vision_classifier/set_cascade (SetBool; needs the "
@@ -451,6 +457,27 @@ class DefectPublisher(Node):
         response.message = ("Visualization ENABLED" if request.data else "Visualization DISABLED")
         self.get_logger().info(response.message)
         return response
+
+    def _set_visualization_type_cb(self, request, response):
+        """Service callback to pick the window's render (DoLP, AoLP, ...; see visualization_modes.py)."""
+        mode = resolve_mode(request.data)
+        if mode is None:
+            response.success = False
+            response.message = (f"Unknown visualization type '{request.data}'. Available: "
+                                + ", ".join(VISUALIZATION_MODES))
+            self.get_logger().error(response.message)
+            return response
+        with self._lock:
+            self._visualization_type = mode
+        response.success = True
+        response.message = f"Visualization type set to {mode}"
+        self.get_logger().info(response.message)
+        return response
+
+    def get_visualization_type(self):
+        """Thread-safe getter for the visualization type."""
+        with self._lock:
+            return self._visualization_type
 
     def _pause_inference_cb(self, request, response):
         """Service callback to pause/resume inference."""
@@ -1594,7 +1621,8 @@ def main():
 
             # Visualization
             if ros_node.visualization_enabled():
-                heatmapForAWindow,scale = resize_to_fit_screen(heatmap) 
+                heatmapForAWindow = overlay_detections(frame, heatmap, ros_node.get_visualization_type())
+                heatmapForAWindow,scale = resize_to_fit_screen(heatmapForAWindow)
                 heatmapForAWindow = scale_window_image(heatmapForAWindow, window_scale)
                 cv2.imshow("Classifier Output",heatmapForAWindow)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
