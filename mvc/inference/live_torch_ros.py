@@ -470,7 +470,8 @@ class DefectPublisher(Node):
         with self._lock:
             self._visualization_type = mode
         response.success = True
-        response.message = f"Visualization type set to {mode}"
+        response.message = (f"Visualization type set to {mode}. Available: "
+                            + ", ".join(VISUALIZATION_MODES))
         self.get_logger().info(response.message)
         return response
 
