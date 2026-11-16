@@ -38,11 +38,18 @@ epoch-0 checkpoint is `step=121322`, the identical step count to the 1-epoch kba
 teachers. It is also the monitored-best of its two checkpoints (val_detect_auroc 0.9792 at
 epoch 0 vs 0.9720 at epoch 1), so the standard rule picks the 1-epoch one on its own.
 
-Dataloader settings stay as the kbach config has them (`cacheAllDataToRAM` False,
-`num_workers` 6) rather than this box's faster cached path: the pol reference was trained
-that way, and a 7.1M-tile RAM preload is ~66 GB, which this box does not reliably have
-free. The comparison is cross-box regardless (different machine, different augmentation
-RNG realisation) -- a seed-level difference, stated in the report rather than papered over.
+Dataloader settings are this box's cached path (`cacheAllDataToRAM` True, `num_workers` 15),
+NOT the kbach config's (False / 6). Measured 2026-11-16: on the kbach settings this run was
+input-starved here -- 2.81 it/s with the GPU at 38% util, an 11.5 h epoch, because 7.1M tiles
+were being read off /storage through 6 workers on a box at load average 89 (32 cores). The
+cached path is what `mondetagnodist` used and it reached 14.6 it/s; the preload is 61 GiB
+against 134 GiB available.
+
+The cost is that more workers means a different augmentation RNG realisation than the pol
+reference. That costs nothing here: the comparison is cross-box regardless (the pol model was
+trained on a different machine), so this adds no new class of difference -- and it makes this
+run's dataloader match `mondetagnodist`, the other mono arm in the report, exactly. It is a
+seed-level difference, stated in the report rather than papered over.
 
 Usage:
     python -m analysis.sweeps.detag_mono_distill_sweep --student  [--dry-run]
@@ -90,6 +97,10 @@ def localise(cfg, name, model):
     cfg['hparams']['monochrome'] = True
     cfg['training_dataset'] = LOCAL_TRAIN
     cfg['validation_dataset'] = LOCAL_VAL
+    # This box's cached path, not the kbach config's uncached one -- see the module
+    # docstring: on 6 uncached workers the run is input-starved here (GPU at 38%).
+    cfg['dataloader']['cacheAllDataToRAM'] = True
+    cfg['dataloader']['num_workers'] = 15
     cfg['name'] = name
     cfg['wandb']['name'] = name
     cfg['checkpoint_dir'] = f'datasets/mix_ckpts/{name}_{model}'
